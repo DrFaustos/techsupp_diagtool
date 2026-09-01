@@ -6,7 +6,8 @@ from diagnostic import (
     web_config_report, site_logs_report,
     disk_memory_report, network_report,
     analyze_access_log, get_domains,
-    search_oom_logs, dns_report, dns_report_local
+    search_oom_logs, dns_report, dns_report_local,
+    dns_resolvers_report
 )
 from ssh_client import ServerChecker
 
