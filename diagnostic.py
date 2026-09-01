@@ -600,3 +600,57 @@ def dns_report(checker, domain, ip=None):
         lines.append("Не удалось получить IP для PTR-запроса.")
 
     return "\n".join(lines)
+def dns_resolvers_report(checker):
+    """
+    Проверяет DNS-резолверы, используемые на сервере.
+    Читает /etc/resolv.conf, проверяет доступность nameserver'ов.
+    Возвращает форматированную строку.
+    """
+    lines = []
+    lines.append("=== DNS-РЕЗОЛВЕРЫ НА СЕРВЕРЕ ===")
+
+    # Читаем /etc/resolv.conf
+    out, _ = checker.exec_command('cat /etc/resolv.conf 2>/dev/null')
+    if not out.strip():
+        lines.append("❌ Не удалось прочитать /etc/resolv.conf")
+        return "\n".join(lines)
+
+    lines.append("Содержимое /etc/resolv.conf:\n" + out)
+
+    # Извлекаем nameserver'ы
+    nameservers = []
+    for line in out.splitlines():
+        if line.strip().startswith('nameserver'):
+            parts = line.split()
+            if len(parts) >= 2:
+                nameservers.append(parts[1])
+
+    if not nameservers:
+        lines.append("❌ В /etc/resolv.conf не найдены nameserver'ы")
+        return "\n".join(lines)
+
+    lines.append(f"\nНайдено DNS-серверов: {len(nameservers)}")
+    lines.append("Проверка доступности:")
+
+    # Проверяем каждый nameserver простым запросом к google.com
+    for ns in nameservers:
+        # Проверяем, отвечает ли DNS-сервер на запрос (например, dig google.com @ns +timeout=2)
+        cmd = f"dig +timeout=2 +tries=1 @{ns} google.com A 2>/dev/null | grep -q 'NOERROR' && echo 'доступен' || echo 'недоступен'"
+        out, _ = checker.exec_command(cmd)
+        status = out.strip() if out.strip() else "недоступен"
+        lines.append(f"  {ns}: {status}")
+
+    # Определяем текущий резолвер, используемый системой
+    # Можно посмотреть через systemd-resolve, если есть
+    out, _ = checker.exec_command('systemd-resolve --status 2>/dev/null | grep "DNS Servers"')
+    if out.strip():
+        lines.append("\nТекущие DNS-серверы (systemd-resolve):")
+        lines.append(out.strip())
+    else:
+        # fallback: проверить через resolvectl
+        out, _ = checker.exec_command('resolvectl status 2>/dev/null | grep "DNS Servers"')
+        if out.strip():
+            lines.append("\nТекущие DNS-серверы (resolvectl):")
+            lines.append(out.strip())
+
+    return "\n".join(lines)
