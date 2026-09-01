@@ -6,7 +6,7 @@ from diagnostic import (
     web_config_report, site_logs_report,
     disk_memory_report, network_report,
     analyze_access_log, get_domains,
-    search_oom_logs
+    search_oom_logs, dns_report, dns_report_local
 )
 from ssh_client import ServerChecker
 
@@ -499,3 +499,53 @@ class DiagnosticApp:
             self.log("STDERR: " + err.strip())
         out, _ = self.checker.exec_command("tail -3 /etc/fstab")
         self.log("Последние строки /etc/fstab:\n" + out)
+    def run_dns_check(self):
+        if not self.checker:
+            return
+
+        domains = get_domains(self.checker, self.panel_type)
+        domain_var = tk.StringVar()
+        if domains:
+            domain_var.set(domains[0])
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("DNS-проверка")
+        dialog.geometry("450x230")
+        dialog.configure(bg=self.bg)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Домен или IP
+        tk.Label(dialog, text="Домен/IP:", bg=self.bg, fg=self.fg).grid(row=0, column=0, sticky='e', padx=5, pady=5)
+        domain_combo = ttk.Combobox(dialog, textvariable=domain_var, values=domains, state='normal')
+        domain_combo.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+        if not domains:
+            domain_combo.set('')
+
+        # Чекбокс "Выполнить локально"
+        local_var = tk.BooleanVar(value=False)
+        cb = tk.Checkbutton(dialog, text="Выполнить локально (A и PTR, NS только с сервера)",
+                            variable=local_var, bg=self.bg, fg=self.fg, selectcolor=self.select_bg)
+        cb.grid(row=1, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+
+        def on_check():
+            domain = domain_var.get().strip()
+            if not domain:
+                messagebox.showerror("Ошибка", "Введите домен или IP")
+                return
+            dialog.destroy()
+            self.log("\n" + "="*60)
+            if local_var.get():
+                # Локальная проверка
+                from diagnostic import dns_report_local
+                result = dns_report_local(domain)
+            else:
+                # Проверка через сервер
+                from diagnostic import dns_report
+                result = dns_report(self.checker, domain)
+            self.log(result)
+
+        tk.Button(dialog, text="Проверить", command=on_check, bg="#4e9a06", fg="white", activebackground="#73d216")\
+            .grid(row=2, column=0, columnspan=2, pady=10)
+
+        dialog.columnconfigure(1, weight=1)

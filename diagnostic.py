@@ -488,3 +488,53 @@ def search_oom_logs(checker):
         report_lines.append("")
 
     return "\n".join(report_lines)
+def dns_report_local(domain):
+    """
+    Выполняет DNS-проверку локально (с ПК, на котором запущена программа).
+    Возвращает форматированную строку с A-записями и PTR.
+    NS-записи не проверяются локально (только через сервер).
+    """
+    import socket
+    lines = []
+    lines.append(f"=== ЛОКАЛЬНАЯ DNS-ПРОВЕРКА ДЛЯ {domain} ===")
+
+    # Определяем, является ли domain IP-адресом
+    import re
+    ip_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+    is_ip = bool(ip_pattern.match(domain))
+
+    if is_ip:
+        # Обратный PTR-запрос для IP
+        try:
+            ptr = socket.gethostbyaddr(domain)[0]
+            lines.append(f"PTR (обратный DNS): {ptr}")
+        except socket.herror:
+            lines.append("PTR-запись не найдена.")
+        except Exception as e:
+            lines.append(f"Ошибка PTR-запроса: {e}")
+        return "\n".join(lines)
+
+    # A-записи (IPv4)
+    try:
+        a_records = socket.getaddrinfo(domain, None, socket.AF_INET)
+        ips = list(set([addr[4][0] for addr in a_records]))
+        if ips:
+            lines.append(f"A-записи: {', '.join(ips)}")
+            # PTR для первого IP
+            try:
+                ptr = socket.gethostbyaddr(ips[0])[0]
+                lines.append(f"PTR для {ips[0]}: {ptr}")
+            except socket.herror:
+                lines.append(f"PTR-запись для {ips[0]} не найдена.")
+            except Exception as e:
+                lines.append(f"Ошибка PTR-запроса: {e}")
+        else:
+            lines.append("A-записи не найдены.")
+    except socket.gaierror:
+        lines.append("Ошибка: домен не разрешается (A-запись отсутствует).")
+    except Exception as e:
+        lines.append(f"Ошибка DNS-запроса: {e}")
+
+    lines.append("(NS-записи доступны только при проверке с сервера)")
+
+    return "\n".join(lines)
