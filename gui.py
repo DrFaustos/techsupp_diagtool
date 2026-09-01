@@ -562,3 +562,10 @@ class DiagnosticApp:
             .grid(row=2, column=0, columnspan=2, pady=10)
 
         dialog.columnconfigure(1, weight=1)
+        
+    def run_dns_resolvers(self):
+        if not self.checker:
+            return
+        self.log("\n" + "="*60)
+        result = dns_resolvers_report(self.checker)
+        self.log(result)    
