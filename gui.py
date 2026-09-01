@@ -1,4 +1,5 @@
 import tkinter as tk
+import re
 from tkinter import messagebox, filedialog, scrolledtext, simpledialog, ttk
 from diagnostic import (
     detect_panel, full_diagnostic_report,
@@ -8,6 +9,8 @@ from diagnostic import (
     analyze_access_log, get_domains,
     search_oom_logs, dns_report, dns_report_local,
     dns_resolvers_report
+    get_current_dns_resolvers,
+    set_dns_resolvers
 )
 from ssh_client import ServerChecker
 
@@ -148,6 +151,10 @@ class DiagnosticApp:
                                     bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.resolv_btn.pack(side=tk.LEFT, padx=5)
 
+        self.edit_dns_btn = tk.Button(btn_frame, text="Изменить DNS", command=self.run_edit_dns, state=tk.DISABLED,
+                              bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.edit_dns_btn.pack(side=tk.LEFT, padx=5)
+
         # Кнопки управления swap (второй ряд)
         swap_frame = tk.Frame(self.root, bg=self.bg)
         swap_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -254,6 +261,7 @@ class DiagnosticApp:
         self.swap_btn.config(state=tk.NORMAL)
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
+        self.edit_dns_btn.config(state=tk.NORMAL)
         self.connect_btn.config(state=tk.DISABLED)
 
         # Фокус на командную строку
@@ -308,6 +316,7 @@ class DiagnosticApp:
         self.swap_btn.config(state=tk.DISABLED)
         self.fstab_btn.config(state=tk.DISABLED)
         self.send_btn.config(state=tk.DISABLED)
+        self.edit_dns_btn.config(state=tk.DISABLED)
         self.connect_btn.config(state=tk.NORMAL)
         self.log("Соединение закрыто.")
 
@@ -562,7 +571,7 @@ class DiagnosticApp:
             .grid(row=2, column=0, columnspan=2, pady=10)
 
         dialog.columnconfigure(1, weight=1)
-        
+
     def run_dns_resolvers(self):
         if not self.checker:
             return
