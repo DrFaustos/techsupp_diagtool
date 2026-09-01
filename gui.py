@@ -108,19 +108,19 @@ class DiagnosticApp:
         self.connect_btn.pack(side=tk.LEFT, padx=5)
 
         self.full_btn = tk.Button(btn_frame, text="Полная диагностика", command=self.run_full, state=tk.DISABLED,
-                                  bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.full_btn.pack(side=tk.LEFT, padx=5)
 
         self.disk_btn = tk.Button(btn_frame, text="Диски и память", command=self.run_disk_memory, state=tk.DISABLED,
-                                  bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.disk_btn.pack(side=tk.LEFT, padx=5)
 
         self.network_btn = tk.Button(btn_frame, text="Сеть", command=self.run_network, state=tk.DISABLED,
-                                     bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.network_btn.pack(side=tk.LEFT, padx=5)
 
         self.firewall_btn = tk.Button(btn_frame, text="Фаервол", command=self.run_firewall, state=tk.DISABLED,
-                                      bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.firewall_btn.pack(side=tk.LEFT, padx=5)
 
         self.config_btn = tk.Button(btn_frame, text="Конфиги веб", command=self.run_config, state=tk.DISABLED,
@@ -128,7 +128,7 @@ class DiagnosticApp:
         self.config_btn.pack(side=tk.LEFT, padx=5)
 
         self.logs_btn = tk.Button(btn_frame, text="Логи сайтов", command=self.run_logs, state=tk.DISABLED,
-                                  bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.logs_btn.pack(side=tk.LEFT, padx=5)
 
         self.access_btn = tk.Button(btn_frame, text="Анализ логов доступа", command=self.run_access_analysis, state=tk.DISABLED,
@@ -136,12 +136,16 @@ class DiagnosticApp:
         self.access_btn.pack(side=tk.LEFT, padx=5)
 
         self.oom_btn = tk.Button(btn_frame, text="Поиск OOM", command=self.run_oom_search, state=tk.DISABLED,
-                                 bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.oom_btn.pack(side=tk.LEFT, padx=5)
 
         self.dns_btn = tk.Button(btn_frame, text="DNS-проверка", command=self.run_dns_check, state=tk.DISABLED,
-                         bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.dns_btn.pack(side=tk.LEFT, padx=5)
+
+        self.resolv_btn = tk.Button(btn_frame, text="DNS-резолверы", command=self.run_dns_resolvers, state=tk.DISABLED,
+                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.resolv_btn.pack(side=tk.LEFT, padx=5)
 
         # Кнопки управления swap (второй ряд)
         swap_frame = tk.Frame(self.root, bg=self.bg)
@@ -245,6 +249,7 @@ class DiagnosticApp:
         self.access_btn.config(state=tk.NORMAL)
         self.oom_btn.config(state=tk.NORMAL)
         self.dns_btn.config(state=tk.NORMAL)
+        self.resolv_btn.config(state=tk.NORMAL)
         self.swap_btn.config(state=tk.NORMAL)
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
@@ -297,7 +302,8 @@ class DiagnosticApp:
         self.logs_btn.config(state=tk.DISABLED)
         self.access_btn.config(state=tk.DISABLED)
         self.oom_btn.config(state=tk.DISABLED)
-        self.dns_btn.config(state=tk.NORMAL)
+        self.dns_btn.config(state=tk.DISABLED)
+        self.resolv_btn.config(state=tk.DISABLED)
         self.swap_btn.config(state=tk.DISABLED)
         self.fstab_btn.config(state=tk.DISABLED)
         self.send_btn.config(state=tk.DISABLED)
