@@ -8,7 +8,7 @@ from diagnostic import (
     disk_memory_report, network_report,
     analyze_access_log, get_domains,
     search_oom_logs, dns_report, dns_report_local,
-    dns_resolvers_report
+    dns_resolvers_report,
     get_current_dns_resolvers,
     set_dns_resolvers
 )
@@ -258,10 +258,10 @@ class DiagnosticApp:
         self.oom_btn.config(state=tk.NORMAL)
         self.dns_btn.config(state=tk.NORMAL)
         self.resolv_btn.config(state=tk.NORMAL)
+        self.edit_dns_btn.config(state=tk.NORMAL)
         self.swap_btn.config(state=tk.NORMAL)
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
-        self.edit_dns_btn.config(state=tk.NORMAL)
         self.connect_btn.config(state=tk.DISABLED)
 
         # Фокус на командную строку
@@ -313,10 +313,10 @@ class DiagnosticApp:
         self.oom_btn.config(state=tk.DISABLED)
         self.dns_btn.config(state=tk.DISABLED)
         self.resolv_btn.config(state=tk.DISABLED)
+        self.edit_dns_btn.config(state=tk.DISABLED)
         self.swap_btn.config(state=tk.DISABLED)
         self.fstab_btn.config(state=tk.DISABLED)
         self.send_btn.config(state=tk.DISABLED)
-        self.edit_dns_btn.config(state=tk.DISABLED)
         self.connect_btn.config(state=tk.NORMAL)
         self.log("Соединение закрыто.")
 
@@ -521,6 +521,7 @@ class DiagnosticApp:
             self.log("STDERR: " + err.strip())
         out, _ = self.checker.exec_command("tail -3 /etc/fstab")
         self.log("Последние строки /etc/fstab:\n" + out)
+
     def run_dns_check(self):
         if not self.checker:
             return
@@ -577,4 +578,103 @@ class DiagnosticApp:
             return
         self.log("\n" + "="*60)
         result = dns_resolvers_report(self.checker)
-        self.log(result)    
+        self.log(result)
+
+    # ---------- РЕДАКТИРОВАНИЕ DNS ----------
+    def run_edit_dns(self):
+        if not self.checker:
+            return
+
+        # Получаем текущие nameserver'ы
+        current_ns = get_current_dns_resolvers(self.checker)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Редактирование DNS-резолверов")
+        dialog.geometry("500x400")
+        dialog.configure(bg=self.bg)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Список nameserver'ов
+        tk.Label(dialog, text="DNS-серверы (нажмите для редактирования):", bg=self.bg, fg=self.fg).pack(pady=5)
+
+        listbox = tk.Listbox(dialog, selectmode=tk.SINGLE, bg=self.entry_bg, fg=self.entry_fg, selectbackground=self.select_bg)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        for ns in current_ns:
+            listbox.insert(tk.END, ns)
+
+        # Фрейм для кнопок управления
+        btn_frame = tk.Frame(dialog, bg=self.bg)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        def add_ns():
+            new_ns = simpledialog.askstring("Добавить DNS", "Введите IP-адрес DNS-сервера:", parent=dialog)
+            if new_ns and re.match(r'^(\d{1,3}\.){3}\d{1,3}$', new_ns):
+                listbox.insert(tk.END, new_ns)
+            elif new_ns:
+                messagebox.showerror("Ошибка", "Некорректный IP-адрес")
+
+        def edit_ns():
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showwarning("Нет выбора", "Выберите DNS-сервер для редактирования")
+                return
+            old = listbox.get(selection[0])
+            new = simpledialog.askstring("Редактировать DNS", "Введите новый IP-адрес:", initialvalue=old, parent=dialog)
+            if new and re.match(r'^(\d{1,3}\.){3}\d{1,3}$', new):
+                listbox.delete(selection[0])
+                listbox.insert(selection[0], new)
+            elif new:
+                messagebox.showerror("Ошибка", "Некорректный IP-адрес")
+
+        def delete_ns():
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showwarning("Нет выбора", "Выберите DNS-сервер для удаления")
+                return
+            listbox.delete(selection[0])
+
+        def set_preset(preset_list):
+            listbox.delete(0, tk.END)
+            for ns in preset_list:
+                listbox.insert(tk.END, ns)
+
+        # Кнопки Add, Edit, Delete
+        tk.Button(btn_frame, text="Добавить", command=add_ns, bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_frame, text="Редактировать", command=edit_ns, bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_frame, text="Удалить", command=delete_ns, bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
+
+        # Предустановленные наборы
+        preset_frame = tk.Frame(dialog, bg=self.bg)
+        preset_frame.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(preset_frame, text="Предустановленные наборы:", bg=self.bg, fg=self.fg).pack(side=tk.LEFT, padx=5)
+        tk.Button(preset_frame, text="Google", command=lambda: set_preset(['8.8.8.8', '8.8.4.4']), bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
+        tk.Button(preset_frame, text="Cloudflare", command=lambda: set_preset(['1.1.1.1', '1.0.0.1']), bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
+        tk.Button(preset_frame, text="OpenDNS", command=lambda: set_preset(['208.67.222.222', '208.67.220.220']), bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
+
+        # Кнопка "Применить"
+        def apply_changes():
+            new_list = []
+            for i in range(listbox.size()):
+                ns = listbox.get(i)
+                if ns.strip():
+                    new_list.append(ns.strip())
+            if not new_list:
+                messagebox.showwarning("Пустой список", "Должен быть хотя бы один DNS-сервер")
+                return
+            if messagebox.askyesno("Подтверждение", f"Установить DNS:\n{', '.join(new_list)}?"):
+                dialog.destroy()
+                self.log("\n" + "="*60)
+                result = set_dns_resolvers(self.checker, new_list)
+                self.log(result)
+                self.log("\nОбновлённый список DNS:")
+                out, _ = self.checker.exec_command('grep -E "^nameserver" /etc/resolv.conf | awk \'{print $2}\'')
+                if out.strip():
+                    self.log(out.strip())
+                else:
+                    self.log("(не удалось прочитать /etc/resolv.conf)")
+
+        tk.Button(dialog, text="Применить изменения", command=apply_changes, bg="#4e9a06", fg="white").pack(pady=10)
+
+        # Закрытие окна без применения
+        tk.Button(dialog, text="Отмена", command=dialog.destroy, bg=self.btn_bg, fg=self.btn_fg).pack(pady=5)
