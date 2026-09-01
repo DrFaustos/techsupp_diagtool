@@ -538,3 +538,65 @@ def dns_report_local(domain):
     lines.append("(NS-записи доступны только при проверке с сервера)")
 
     return "\n".join(lines)
+def dns_report(checker, domain, ip=None):
+    """
+    Выполняет DNS-проверку на сервере через dig.
+    Если ip указан, делает PTR-запрос для этого IP.
+    Иначе:
+      - A-запись для domain
+      - NS-запись для domain
+      - PTR-запрос для первого полученного IP (если есть)
+    Возвращает форматированную строку.
+    """
+    import re
+
+    lines = []
+    lines.append(f"=== DNS-ПРОВЕРКА НА СЕРВЕРЕ ДЛЯ {domain} ===")
+
+    # Проверяем, является ли domain IP-адресом
+    ip_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+    is_ip = bool(ip_pattern.match(domain))
+
+    if is_ip:
+        # Если введён IP, делаем только PTR
+        cmd = f"dig +short -x {domain} 2>/dev/null"
+        out, _ = checker.exec_command(cmd)
+        if out.strip():
+            lines.append(f"PTR (обратный DNS): {out.strip()}")
+        else:
+            lines.append("PTR-запись не найдена.")
+        return "\n".join(lines)
+
+    # Если ip передан явно, используем его для PTR
+    target_ip = ip
+    if not target_ip:
+        # Получаем A-запись для домена
+        cmd = f"dig +short A {domain} 2>/dev/null"
+        out, _ = checker.exec_command(cmd)
+        if out.strip():
+            a_records = out.splitlines()
+            lines.append(f"A-записи: {', '.join(a_records)}")
+            target_ip = a_records[0].strip()
+        else:
+            lines.append("A-записи не найдены.")
+
+    # NS-записи
+    cmd = f"dig +short NS {domain} 2>/dev/null"
+    out, _ = checker.exec_command(cmd)
+    if out.strip():
+        lines.append(f"NS-записи: {', '.join(out.splitlines())}")
+    else:
+        lines.append("NS-записи не найдены.")
+
+    # PTR-запрос, если есть IP
+    if target_ip:
+        cmd = f"dig +short -x {target_ip} 2>/dev/null"
+        out, _ = checker.exec_command(cmd)
+        if out.strip():
+            lines.append(f"PTR для {target_ip}: {out.strip()}")
+        else:
+            lines.append(f"PTR-запись для {target_ip} не найдена.")
+    else:
+        lines.append("Не удалось получить IP для PTR-запроса.")
+
+    return "\n".join(lines)
