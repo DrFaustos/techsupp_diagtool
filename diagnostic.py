@@ -65,28 +65,28 @@ def get_domains(checker, panel_type):
                     if domain and domain not in domains:
                         domains.append(domain)
             if domains:
-                return list(set(domains))  # убираем дубли
+                return list(set(domains))
     
-    # === Если mgrctl не сработал или не ISPmanager – парсим конфиги ===
+    # === Парсим конфиги ===
     search_paths = []
     if panel_type == 'fastpanel':
         search_paths = [
+            '/etc/nginx/fastpanel2-available/*/*.conf',   # новый путь для FastPanel
             '/usr/local/fastpanel/etc/nginx/sites-available/*',
             '/etc/nginx/sites-available/*'
         ]
     elif panel_type == 'ispmanager':
-        # Основные пути для ISPmanager: vhosts (пользовательские), sites-enabled, conf.d
         search_paths = [
-            '/etc/nginx/vhosts/*/*.conf',              # пользовательские vhosts (www-root/domain.conf)
-            '/etc/nginx/vhosts/*.conf',                # если конфиги прямо в vhosts (на всякий случай)
-            '/usr/local/mgr5/etc/nginx/vhosts/*.conf', # стандартные пути ISPmanager
+            '/etc/nginx/vhosts/*/*.conf',
+            '/etc/nginx/vhosts/*.conf',
+            '/usr/local/mgr5/etc/nginx/vhosts/*.conf',
             '/usr/local/mgr5/etc/nginx/vhosts/*/*.conf',
             '/usr/local/mgr5/etc/nginx/sites-enabled/*.conf',
             '/usr/local/mgr5/etc/nginx/conf.d/*.conf',
             '/etc/nginx/sites-enabled/*',
             '/etc/nginx/conf.d/*.conf'
         ]
-    else:  # none или не определено
+    else:
         search_paths = [
             '/etc/nginx/sites-enabled/*',
             '/etc/nginx/conf.d/*.conf',
@@ -94,17 +94,14 @@ def get_domains(checker, panel_type):
         ]
 
     for path_pattern in search_paths:
-        # Извлекаем server_name, разбиваем по пробелам, фильтруем мусор
         cmd = f"grep -h 'server_name' {path_pattern} 2>/dev/null | sed 's/.*server_name\\s*\\([^;]*\\);.*/\\1/' | tr -s ' ' '\\n' | grep -v '^_' | grep -v '^$' | grep -v 'localhost' | grep -v 'default_server' | grep -v '^\\*'"
         out, _ = checker.exec_command(cmd)
         if out.strip():
             for d in out.split('\n'):
                 d = d.strip()
-                # Проверяем, что это похоже на домен (содержит точку и не начинается с цифры/спецсимвола)
                 if d and '.' in d and not d.startswith('_') and not d.startswith('*'):
                     domains.append(d)
     
-    # Убираем дубли и сортируем
     return list(set(domains))
 
 def check_site_logs(checker, panel_type, domains):
@@ -112,16 +109,17 @@ def check_site_logs(checker, panel_type, domains):
     for domain in domains:
         log_paths = []
         if panel_type == 'fastpanel':
-            cmd = f"find /var/www -type f -path '*/data/logs/{domain}.error.log' 2>/dev/null"
+            # Ищем все error.log, содержащие домен в имени
+            cmd = f"find /var/www -type f -path '*/data/logs/*' -name '*{domain}*.error.log' 2>/dev/null"
             out, _ = checker.exec_command(cmd)
             if out.strip():
                 log_paths.extend(out.strip().split('\n'))
-            cmd = f"find /home -type f -path '*/logs/{domain}.error.log' 2>/dev/null"
+            # fallback в /home
+            cmd = f"find /home -type f -path '*/logs/*' -name '*{domain}*.error.log' 2>/dev/null"
             out, _ = checker.exec_command(cmd)
             if out.strip():
                 log_paths.extend(out.strip().split('\n'))
         elif panel_type == 'ispmanager':
-            # Стандартные пути ISPmanager
             cmd = f"find /var/www -type f -path '*/{domain}/data/logs/error.log' 2>/dev/null"
             out, _ = checker.exec_command(cmd)
             if out.strip():
@@ -130,7 +128,6 @@ def check_site_logs(checker, panel_type, domains):
             out, _ = checker.exec_command(cmd)
             if out.strip():
                 log_paths.extend(out.strip().split('\n'))
-            # Новая проверка: /var/www/httpd-logs/domain.error.log
             cmd = f"test -f /var/www/httpd-logs/{domain}.error.log && echo 'exists'"
             out, _ = checker.exec_command(cmd)
             if out.strip() == 'exists':
@@ -234,7 +231,6 @@ def network_report(checker):
     out_a, _ = checker.exec_command('ip a')
     out_r, _ = checker.exec_command('ip r')
 
-    # Определяем интерфейс по умолчанию и шлюз
     default_iface = None
     default_gw = None
     for line in out_r.splitlines():
@@ -242,16 +238,14 @@ def network_report(checker):
             parts = line.split()
             if len(parts) >= 5 and parts[0] == 'default' and parts[1] == 'via':
                 default_gw = parts[2]
-                default_iface = parts[4]  # dev
+                default_iface = parts[4]
                 break
 
-    # Определяем IP-адрес, используемый для исходящего трафика
     out_get, _ = checker.exec_command(
         'ip route get 1.1.1.1 2>/dev/null | grep -oP "src \\S+" | cut -d" " -f2'
     )
     src_ip = out_get.strip()
 
-    # Определяем внешний (плавающий) IP через публичный сервис
     out_ext, _ = checker.exec_command(
         'curl -s ifconfig.me 2>/dev/null || '
         'wget -qO- ifconfig.me 2>/dev/null || '
@@ -259,7 +253,6 @@ def network_report(checker):
     )
     external_ip = out_ext.strip()
 
-    # Формируем отчёт
     lines = []
     lines.append("=== СЕТЕВЫЕ ИНТЕРФЕЙСЫ (ip a) ===")
     lines.append(out_a)
@@ -282,20 +275,19 @@ def network_report(checker):
 def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=None, day=None):
     """
     Анализирует access-лог(и) указанного домена (включая ротационные .gz).
-    year, month, day – опциональные числовые фильтры (если None – не фильтровать).
-    Возвращает форматированную строку отчёта.
+    year, month, day – опциональные числовые фильтры.
     """
     import os
 
-    # --- 1. Находим основной файл лога, чтобы определить директорию ---
     log_path = None
     if panel_type == 'fastpanel':
-        cmd = f"find /var/www -type f -path '*/data/logs/{domain}.access.log' 2>/dev/null | head -1"
+        # Ищем любой access.log, содержащий домен в имени
+        cmd = f"find /var/www -type f -path '*/data/logs/*' -name '*{domain}*.access.log' 2>/dev/null | head -1"
         out, _ = checker.exec_command(cmd)
         if out.strip():
             log_path = out.strip()
         else:
-            cmd = f"find /home -type f -path '*/logs/{domain}.access.log' 2>/dev/null | head -1"
+            cmd = f"find /home -type f -path '*/logs/*' -name '*{domain}*.access.log' 2>/dev/null | head -1"
             out, _ = checker.exec_command(cmd)
             if out.strip():
                 log_path = out.strip()
@@ -329,19 +321,21 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
     if not log_path:
         return f"❌ Не найден access-лог для домена {domain}"
 
-    # --- 2. Получаем директорию и список всех access.log* файлов ---
     log_dir = os.path.dirname(log_path)
-    # Ищем все файлы access.log* (включая сжатые) в этой директории
-    cmd = f"ls -1 {log_dir}/{domain}.access.log* 2>/dev/null"
+    # Для FastPanel используем маску с *, для других точное имя
+    if panel_type == 'fastpanel':
+        file_pattern = f"{log_dir}/*{domain}*.access.log*"
+    else:
+        file_pattern = f"{log_dir}/{domain}.access.log*"
+
+    cmd = f"ls -1 {file_pattern} 2>/dev/null"
     out, _ = checker.exec_command(cmd)
     if not out.strip():
-        return f"❌ В директории {log_dir} нет файлов access.log*"
+        return f"❌ В директории {log_dir} нет файлов, соответствующих {file_pattern}"
 
     log_files = [f.strip() for f in out.split('\n') if f.strip()]
-    # Сортируем: сначала несжатые, затем сжатые (можно по имени, но нам важен порядок)
-    log_files.sort(key=lambda x: (x.endswith('.gz'), x))  # сначала .log, потом .gz
+    log_files.sort(key=lambda x: (x.endswith('.gz'), x))
 
-    # --- 3. Читаем все файлы и собираем статистику ---
     ip_counter = Counter()
     uri_counter = Counter()
     agent_counter = Counter()
@@ -352,31 +346,25 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
     )
 
     for fname in log_files:
-        # Определяем команду чтения: zcat для .gz, cat для остальных
         if fname.endswith('.gz'):
             read_cmd = f"zcat {fname} 2>/dev/null"
         else:
             read_cmd = f"cat {fname} 2>/dev/null"
         out, err = checker.exec_command(read_cmd)
         if err.strip():
-            continue  # пропускаем проблемные файлы
+            continue
         lines = out.splitlines()
         for line in lines:
             match = log_pattern.match(line)
             if not match:
                 continue
             data = match.groupdict()
-            # Извлекаем дату из временной метки [dd/MMM/yyyy:hh:mm:ss +zzzz]
             time_str = data['time']
             try:
-                # Парсим дату: [01/Jun/2025:12:34:56 +0000] -> извлекаем день, месяц, год
-                # Делим по ':' и берём первую часть (до двоеточия)
-                date_part = time_str.split(':')[0]  # "01/Jun/2025"
-                # Разбиваем по '/'
+                date_part = time_str.split(':')[0]
                 parts = date_part.split('/')
                 if len(parts) == 3:
                     log_day = int(parts[0])
-                    # Преобразуем месяц из трёхбуквенного в номер (Jan=1, Feb=2, ...)
                     month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
                     try:
@@ -389,7 +377,6 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
             except:
                 continue
 
-            # Фильтр по дате (если заданы)
             if year is not None and log_year != year:
                 continue
             if month is not None and log_month != month:
@@ -415,7 +402,6 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
     if total_requests == 0:
         return f"За указанный период (фильтры: год={year}, месяц={month}, день={day}) записей не найдено."
 
-    # --- 4. Формируем отчёт ---
     lines_out = []
     lines_out.append(f"=== АНАЛИЗ ПОСЕЩЕНИЙ ДЛЯ {domain} ===")
     lines_out.append(f"Директория логов: {log_dir}")
@@ -450,11 +436,6 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
     return "\n".join(lines_out)
 
 def search_oom_logs(checker):
-    """
-    Поиск событий Out-Of-Memory в системных логах (kern.log, syslog и ротации).
-    Возвращает форматированную строку отчёта.
-    """
-    # Ищем во всех файлах kern.log* и syslog* с контекстом ±5 строк
     cmd = "zgrep -B 5 -A 5 -i 'out of memory\\|killed process\\|oom-killer' /var/log/kern.log* /var/log/syslog* 2>/dev/null"
     out, err = checker.exec_command(cmd)
     if not out.strip():
@@ -466,7 +447,6 @@ def search_oom_logs(checker):
     report_lines.append("Файлы: /var/log/kern.log*, /var/log/syslog*")
     report_lines.append("")
 
-    # Разбиваем вывод на блоки, разделённые "--"
     blocks = []
     current_block = []
     for line in lines:
@@ -488,23 +468,16 @@ def search_oom_logs(checker):
         report_lines.append("")
 
     return "\n".join(report_lines)
+
 def dns_report_local(domain):
-    """
-    Выполняет DNS-проверку локально (с ПК, на котором запущена программа).
-    Возвращает форматированную строку с A-записями и PTR.
-    NS-записи не проверяются локально (только через сервер).
-    """
     import socket
     lines = []
     lines.append(f"=== ЛОКАЛЬНАЯ DNS-ПРОВЕРКА ДЛЯ {domain} ===")
 
-    # Определяем, является ли domain IP-адресом
-    import re
     ip_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
     is_ip = bool(ip_pattern.match(domain))
 
     if is_ip:
-        # Обратный PTR-запрос для IP
         try:
             ptr = socket.gethostbyaddr(domain)[0]
             lines.append(f"PTR (обратный DNS): {ptr}")
@@ -514,13 +487,11 @@ def dns_report_local(domain):
             lines.append(f"Ошибка PTR-запроса: {e}")
         return "\n".join(lines)
 
-    # A-записи (IPv4)
     try:
         a_records = socket.getaddrinfo(domain, None, socket.AF_INET)
         ips = list(set([addr[4][0] for addr in a_records]))
         if ips:
             lines.append(f"A-записи: {', '.join(ips)}")
-            # PTR для первого IP
             try:
                 ptr = socket.gethostbyaddr(ips[0])[0]
                 lines.append(f"PTR для {ips[0]}: {ptr}")
@@ -536,29 +507,16 @@ def dns_report_local(domain):
         lines.append(f"Ошибка DNS-запроса: {e}")
 
     lines.append("(NS-записи доступны только при проверке с сервера)")
-
     return "\n".join(lines)
-def dns_report(checker, domain, ip=None):
-    """
-    Выполняет DNS-проверку на сервере через dig.
-    Если ip указан, делает PTR-запрос для этого IP.
-    Иначе:
-      - A-запись для domain
-      - NS-запись для domain
-      - PTR-запрос для первого полученного IP (если есть)
-    Возвращает форматированную строку.
-    """
-    import re
 
+def dns_report(checker, domain, ip=None):
     lines = []
     lines.append(f"=== DNS-ПРОВЕРКА НА СЕРВЕРЕ ДЛЯ {domain} ===")
 
-    # Проверяем, является ли domain IP-адресом
     ip_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
     is_ip = bool(ip_pattern.match(domain))
 
     if is_ip:
-        # Если введён IP, делаем только PTR
         cmd = f"dig +short -x {domain} 2>/dev/null"
         out, _ = checker.exec_command(cmd)
         if out.strip():
@@ -567,10 +525,8 @@ def dns_report(checker, domain, ip=None):
             lines.append("PTR-запись не найдена.")
         return "\n".join(lines)
 
-    # Если ip передан явно, используем его для PTR
     target_ip = ip
     if not target_ip:
-        # Получаем A-запись для домена
         cmd = f"dig +short A {domain} 2>/dev/null"
         out, _ = checker.exec_command(cmd)
         if out.strip():
@@ -580,7 +536,6 @@ def dns_report(checker, domain, ip=None):
         else:
             lines.append("A-записи не найдены.")
 
-    # NS-записи
     cmd = f"dig +short NS {domain} 2>/dev/null"
     out, _ = checker.exec_command(cmd)
     if out.strip():
@@ -588,7 +543,6 @@ def dns_report(checker, domain, ip=None):
     else:
         lines.append("NS-записи не найдены.")
 
-    # PTR-запрос, если есть IP
     if target_ip:
         cmd = f"dig +short -x {target_ip} 2>/dev/null"
         out, _ = checker.exec_command(cmd)
@@ -600,16 +554,11 @@ def dns_report(checker, domain, ip=None):
         lines.append("Не удалось получить IP для PTR-запроса.")
 
     return "\n".join(lines)
+
 def dns_resolvers_report(checker):
-    """
-    Проверяет DNS-резолверы, используемые на сервере.
-    Читает /etc/resolv.conf, проверяет доступность nameserver'ов.
-    Возвращает форматированную строку.
-    """
     lines = []
     lines.append("=== DNS-РЕЗОЛВЕРЫ НА СЕРВЕРЕ ===")
 
-    # Читаем /etc/resolv.conf
     out, _ = checker.exec_command('cat /etc/resolv.conf 2>/dev/null')
     if not out.strip():
         lines.append("❌ Не удалось прочитать /etc/resolv.conf")
@@ -617,7 +566,6 @@ def dns_resolvers_report(checker):
 
     lines.append("Содержимое /etc/resolv.conf:\n" + out)
 
-    # Извлекаем nameserver'ы
     nameservers = []
     for line in out.splitlines():
         if line.strip().startswith('nameserver'):
@@ -632,32 +580,25 @@ def dns_resolvers_report(checker):
     lines.append(f"\nНайдено DNS-серверов: {len(nameservers)}")
     lines.append("Проверка доступности:")
 
-    # Проверяем каждый nameserver простым запросом к google.com
     for ns in nameservers:
-        # Проверяем, отвечает ли DNS-сервер на запрос (например, dig google.com @ns +timeout=2)
         cmd = f"dig +timeout=2 +tries=1 @{ns} google.com A 2>/dev/null | grep -q 'NOERROR' && echo 'доступен' || echo 'недоступен'"
         out, _ = checker.exec_command(cmd)
         status = out.strip() if out.strip() else "недоступен"
         lines.append(f"  {ns}: {status}")
 
-    # Определяем текущий резолвер, используемый системой
-    # Можно посмотреть через systemd-resolve, если есть
     out, _ = checker.exec_command('systemd-resolve --status 2>/dev/null | grep "DNS Servers"')
     if out.strip():
         lines.append("\nТекущие DNS-серверы (systemd-resolve):")
         lines.append(out.strip())
     else:
-        # fallback: проверить через resolvectl
         out, _ = checker.exec_command('resolvectl status 2>/dev/null | grep "DNS Servers"')
         if out.strip():
             lines.append("\nТекущие DNS-серверы (resolvectl):")
             lines.append(out.strip())
 
     return "\n".join(lines)
+
 def get_current_dns_resolvers(checker):
-    """
-    Возвращает список текущих nameserver'ов, извлечённых из /etc/resolv.conf.
-    """
     out, _ = checker.exec_command('grep -E "^nameserver" /etc/resolv.conf 2>/dev/null | awk \'{print $2}\'')
     if out.strip():
         return [ns.strip() for ns in out.splitlines() if ns.strip()]
@@ -668,21 +609,29 @@ def set_dns_resolvers(checker, nameservers):
     Устанавливает новые DNS-резолверы глобально (через /etc/systemd/resolved.conf)
     и на интерфейсах (через resolvectl), затем перезапускает systemd-resolved.
     """
-    import re
     lines = []
     lines.append("=== ИЗМЕНЕНИЕ DNS-РЕЗОЛВЕРОВ ===")
 
-    # Проверяем, активен ли systemd-resolved
     out, _ = checker.exec_command('systemctl is-active systemd-resolved 2>/dev/null')
     if out.strip() != 'active':
         lines.append("systemd-resolved не активен. Редактируем /etc/resolv.conf напрямую.")
-        # ... (код для прямого редактирования, как раньше)
+        checker.exec_command('cp /etc/resolv.conf /etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)')
+        new_content = "# Generated by SSH Diagnostic Tool\n"
+        for ns in nameservers:
+            new_content += f"nameserver {ns}\n"
+        cmd = f'echo "{new_content}" > /etc/resolv.conf'
+        out, err = checker.exec_command(cmd + ' 2>&1')
+        if err.strip():
+            lines.append(f"❌ Ошибка записи: {err.strip()}")
+        else:
+            lines.append("✅ /etc/resolv.conf обновлён.")
+            out_check, _ = checker.exec_command('cat /etc/resolv.conf')
+            lines.append("\nСодержимое /etc/resolv.conf:\n" + out_check)
         return "\n".join(lines)
 
     lines.append("Обнаружен systemd-resolved. Настраиваем глобальные DNS и интерфейсы.")
 
-    # 1. Редактируем /etc/systemd/resolved.conf
-    # Читаем текущий файл, заменяем строку DNS= или добавляем, если нет
+    # Редактируем /etc/systemd/resolved.conf
     out_conf, _ = checker.exec_command('cat /etc/systemd/resolved.conf 2>/dev/null')
     new_conf_lines = []
     dns_found = False
@@ -693,21 +642,16 @@ def set_dns_resolvers(checker, nameservers):
         else:
             new_conf_lines.append(line)
     if not dns_found:
-        # Если секция [Resolve] есть, добавляем DNS после неё, или в конец
-        # Проще добавить в конец файла, но нужно найти [Resolve]
         resolved_section = False
         for i, line in enumerate(new_conf_lines):
             if re.match(r'^\s*\[Resolve\]\s*$', line):
                 resolved_section = True
-                # Вставляем после секции
                 new_conf_lines.insert(i+1, f'DNS={ " ".join(nameservers) }')
                 break
         if not resolved_section:
             new_conf_lines.append('[Resolve]')
             new_conf_lines.append(f'DNS={ " ".join(nameservers) }')
-    # Записываем новый файл
     new_content = '\n'.join(new_conf_lines)
-    # Экранируем для echo
     new_content_escaped = new_content.replace('"', '\\"')
     cmd = f'echo "{new_content_escaped}" > /etc/systemd/resolved.conf'
     out, err = checker.exec_command(cmd + ' 2>&1')
@@ -716,15 +660,12 @@ def set_dns_resolvers(checker, nameservers):
     else:
         lines.append("✅ /etc/systemd/resolved.conf обновлён.")
 
-    # 2. Устанавливаем DNS для интерфейсов через resolvectl
-    # Получаем список интерфейсов
+    # Устанавливаем DNS для интерфейсов
     cmd_iface = "ip -o link show | awk -F': ' '{print $2}' | grep -v lo"
     out_ifaces, _ = checker.exec_command(cmd_iface)
     interfaces = [iface.strip() for iface in out_ifaces.splitlines() if iface.strip()]
     for iface in interfaces:
-        # Сбрасываем старые
         checker.exec_command(f'resolvectl dns {iface} "" 2>/dev/null')
-        # Устанавливаем новые
         cmd = f'resolvectl dns {iface} ' + ' '.join(nameservers)
         out, err = checker.exec_command(cmd + ' 2>&1')
         if err.strip() and 'error' in err.lower():
@@ -732,11 +673,10 @@ def set_dns_resolvers(checker, nameservers):
         else:
             lines.append(f"✅ DNS для {iface}: {', '.join(nameservers)}")
 
-    # 3. Перезапускаем systemd-resolved
+    # Перезапускаем
     checker.exec_command('systemctl restart systemd-resolved 2>/dev/null')
     lines.append("Перезапущен systemd-resolved.")
 
-    # 4. Проверяем результат
     out_check, _ = checker.exec_command('resolvectl status | grep -E "Global|DNS Servers"')
     lines.append("\nТекущие DNS (resolvectl):\n" + (out_check if out_check.strip() else "нет данных"))
     out_resolv, _ = checker.exec_command('cat /etc/resolv.conf')
