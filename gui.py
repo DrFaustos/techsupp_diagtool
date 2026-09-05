@@ -287,7 +287,9 @@ class DiagnosticApp:
         self.swap_btn.config(state=tk.NORMAL)
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
-        self.connect_btn.config(state=tk.DISABLED)
+
+        # Меняем кнопку подключения на "Отключиться"
+        self.connect_btn.config(text="Отключиться", bg="#cc0000", state=tk.NORMAL, command=self.disconnect)
 
         # Фокус на командную строку
         self.cmd_entry.focus_set()
@@ -328,6 +330,9 @@ class DiagnosticApp:
         if self.checker:
             self.checker.close()
             self.checker = None
+            self.panel_type = None
+        
+        # Деактивируем кнопки диагностики
         self.full_btn.config(state=tk.DISABLED)
         self.disk_btn.config(state=tk.DISABLED)
         self.network_btn.config(state=tk.DISABLED)
@@ -345,7 +350,10 @@ class DiagnosticApp:
         self.swap_btn.config(state=tk.DISABLED)
         self.fstab_btn.config(state=tk.DISABLED)
         self.send_btn.config(state=tk.DISABLED)
-        self.connect_btn.config(state=tk.NORMAL)
+
+        # Возвращаем кнопку в исходное состояние
+        self.connect_btn.config(text="Подключиться", bg="#4e9a06", state=tk.NORMAL, command=self.connect)
+        
         self.log("Соединение закрыто.")
 
     # ---------- ОТДЕЛЬНЫЕ ДИАГНОСТИКИ ----------
