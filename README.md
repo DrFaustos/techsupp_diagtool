@@ -67,16 +67,20 @@
 ### Шаги установки
 
 1. Клонируйте репозиторий:
+```
 git clone https://github.com/ваш-username/server-diagnostic-tool.git
 cd server-diagnostic-tool
+```
 
 Создайте виртуальное окружение:
 python3 -m venv venv
 source venv/bin/activate  # Linux/Mac
 # или venv\Scripts\activate  # Windows
 Установите зависимости:
-
+```
 pip install -r requirements.txt
+```
+
 Запустите программу:
 
 python3 main.py
@@ -212,8 +216,10 @@ server_diagnostic/
 ### Ошибка `No module named 'tkinter'`
 
 Установите Tkinter:
+```
 sudo apt install python3-tk  # Ubuntu/Debian
 sudo yum install python3-tkinter  # CentOS/RHEL
+```
 
 
 ### Ошибка подключения
