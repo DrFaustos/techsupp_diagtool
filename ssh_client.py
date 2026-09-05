@@ -13,7 +13,8 @@ class ServerChecker:
 
     def connect(self):
         self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Используем более безопасную политику
+        self.client.set_missing_host_key_policy(paramiko.WarningPolicy())
         try:
             if self.key_filename and os.path.exists(self.key_filename):
                 self.client.connect(
