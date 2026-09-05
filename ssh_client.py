@@ -12,8 +12,9 @@ class ServerChecker:
         self.client = None
 
     def connect(self):
+        """Подключается к серверу. Возвращает (success, message)"""
         self.client = paramiko.SSHClient()
-        # Используем более безопасную политику
+        # Используем WarningPolicy для безопасности
         self.client.set_missing_host_key_policy(paramiko.WarningPolicy())
         try:
             if self.key_filename and os.path.exists(self.key_filename):
@@ -36,13 +37,14 @@ class ServerChecker:
                     allow_agent=False,
                     look_for_keys=False
                 )
-            return True
+            return True, "Подключено"
+        except paramiko.AuthenticationException:
+            return False, "Ошибка аутентификации: проверьте логин/пароль или ключ"
+        except paramiko.SSHException as e:
+            return False, f"SSH ошибка: {str(e)}"
         except Exception as e:
-            print(f"Ошибка подключения к {self.host}:{self.port}")
-            print(f"Тип ошибки: {type(e).__name__}")
-            print(f"Сообщение: {str(e)}")
-            traceback.print_exc()
-            return False
+            error_msg = f"Ошибка подключения к {self.host}:{self.port}\nТип: {type(e).__name__}\nСообщение: {str(e)}"
+            return False, error_msg
 
     def exec_command(self, command):
         if not self.client:

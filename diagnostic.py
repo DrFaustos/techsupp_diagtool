@@ -53,13 +53,14 @@ DOMAIN_PATHS = {
 }
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-def find_files(checker, pattern):
-    """Находит файлы по паттерну и возвращает список"""
-    cmd = f"ls -1 {pattern} 2>/dev/null | head -20"
+def find_files(checker, pattern, limit=20):
+    """Находит файлы по паттерну и возвращает список с предупреждением об ограничении"""
+    cmd = f"ls -1 {pattern} 2>/dev/null | head -{limit}"
     out, _ = checker.exec_command(cmd)
-    if out.strip():
-        return [f.strip() for f in out.split('\n') if f.strip()]
-    return []
+    files = [f.strip() for f in out.split('\n') if f.strip()]
+    if len(files) >= limit:
+        files.append(f"⚠️ (показаны первые {limit} файлов)")
+    return files
 
 def find_file(checker, patterns):
     """Находит первый существующий файл из списка паттернов"""
@@ -107,41 +108,33 @@ def detect_panel(checker):
 
 # ==================== СБОР МЕТРИК ====================
 def get_metrics(checker):
-    """Собирает системные метрики (оптимизировано)"""
+    """Собирает системные метрики (по отдельности для надёжности)"""
     metrics = {}
     
-    # Группируем команды для уменьшения количества SSH-запросов
-    cmd = "df -h; df -i; free -m; uptime; ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null"
-    out, _ = checker.exec_command(cmd)
+    # Выполняем команды по отдельности для надёжности
+    out, _ = checker.exec_command('df -h')
+    metrics['disk'] = out
     
-    parts = out.split('\n\n')
-    if len(parts) >= 5:
-        metrics['disk'] = parts[0]
-        metrics['inodes'] = parts[1]
-        metrics['memory'] = parts[2]
-        metrics['uptime'] = parts[3]
-        metrics['listening_ports'] = parts[4] if len(parts) > 4 else ''
-    else:
-        # Fallback, если разделение не сработало
-        out1, _ = checker.exec_command('df -h')
-        metrics['disk'] = out1
-        out2, _ = checker.exec_command('df -i')
-        metrics['inodes'] = out2
-        out3, _ = checker.exec_command('free -m')
-        metrics['memory'] = out3
-        out4, _ = checker.exec_command('uptime')
-        metrics['uptime'] = out4
-        out5, _ = checker.exec_command('ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null')
-        metrics['listening_ports'] = out5
+    out, _ = checker.exec_command('df -i')
+    metrics['inodes'] = out
+    
+    out, _ = checker.exec_command('free -m')
+    metrics['memory'] = out
+    
+    out, _ = checker.exec_command('uptime')
+    metrics['uptime'] = out
+    
+    out, _ = checker.exec_command('ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null')
+    metrics['listening_ports'] = out
     
     # Фаервол
     firewall = {}
-    out, _ = checker.exec_command('ufw status 2>/dev/null || echo "ufw not installed"; iptables -L -n 2>/dev/null || echo "iptables not available"; nft list ruleset 2>/dev/null || echo "nftables not available"')
-    lines = out.split('\n\n')
-    if len(lines) >= 3:
-        firewall['ufw'] = lines[0]
-        firewall['iptables'] = lines[1]
-        firewall['nftables'] = lines[2]
+    out, _ = checker.exec_command('ufw status 2>/dev/null || echo "ufw not installed"')
+    firewall['ufw'] = out
+    out, _ = checker.exec_command('iptables -L -n 2>/dev/null || echo "iptables not available"')
+    firewall['iptables'] = out
+    out, _ = checker.exec_command('nft list ruleset 2>/dev/null || echo "nftables not available"')
+    firewall['nftables'] = out
     metrics['firewall'] = firewall
     
     # Статусы служб (группируем)
@@ -157,6 +150,7 @@ def get_metrics(checker):
 def find_logs(checker, panel_type, domain, log_type='error'):
     """Находит логи для домена (унифицированная функция)"""
     log_files = []
+    limit = 20
     
     if panel_type == 'fastpanel':
         patterns = [
@@ -164,7 +158,7 @@ def find_logs(checker, panel_type, domain, log_type='error'):
             f'/home/*/logs/*{domain}*.{log_type}.log'
         ]
         for pattern in patterns:
-            log_files.extend(find_files(checker, pattern))
+            log_files.extend(find_files(checker, pattern, limit))
             
     elif panel_type == 'ispmanager':
         patterns = [
@@ -173,7 +167,7 @@ def find_logs(checker, panel_type, domain, log_type='error'):
             f'/var/www/httpd-logs/{domain}.{log_type}.log'
         ]
         for pattern in patterns:
-            log_files.extend(find_files(checker, pattern))
+            log_files.extend(find_files(checker, pattern, limit))
             
     else:
         patterns = [
@@ -182,7 +176,7 @@ def find_logs(checker, panel_type, domain, log_type='error'):
             f'/var/log/httpd/{domain}-{log_type}_log'
         ]
         for pattern in patterns:
-            log_files.extend(find_files(checker, pattern))
+            log_files.extend(find_files(checker, pattern, limit))
     
     return list(set(log_files))
 
@@ -269,13 +263,11 @@ def network_report(checker):
 
 # ==================== АНАЛИЗ ЛОГОВ ДОСТУПА ====================
 def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=None, day=None):
-    """Анализирует access-логи (рефакторинг)"""
-    # Находим логи
+    """Анализирует access-логи"""
     log_files = find_logs(checker, panel_type, domain, 'access')
     if not log_files:
         return f"❌ Не найден access-лог для домена {domain}"
     
-    # Собираем статистику
     ip_counter = Counter()
     uri_counter = Counter()
     agent_counter = Counter()
@@ -283,6 +275,8 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
     unique_ips = set()
     
     for log_file in log_files:
+        if log_file.startswith('⚠️'):
+            continue  # пропускаем предупреждения
         content = read_file_content(checker, log_file)
         if not content:
             continue
@@ -297,7 +291,6 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
             if not entry:
                 continue
             
-            # Фильтр по дате
             if not filter_by_date(entry, year, month, day):
                 continue
             
@@ -320,7 +313,6 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
         if day: filters.append(f"день={day}")
         return f"За указанный период ({' '.join(filters)}) записей не найдено."
     
-    # Формируем отчёт
     lines_out = []
     lines_out.append(f"=== АНАЛИЗ ПОСЕЩЕНИЙ ДЛЯ {domain} ===")
     lines_out.append(f"Обработано файлов: {len(log_files)}")
@@ -352,10 +344,8 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
 
 # ==================== ПОИСК ДОМЕНОВ ====================
 def get_domains(checker, panel_type):
-    """Возвращает список доменов (рефакторинг)"""
     domains = []
     
-    # Для ISPmanager пробуем mgrctl
     if panel_type == 'ispmanager':
         out, _ = checker.exec_command('mgrctl -m webdomain list --output-format csv 2>/dev/null')
         if out.strip():
@@ -368,7 +358,6 @@ def get_domains(checker, panel_type):
             if domains:
                 return list(set(domains))
     
-    # Парсим конфиги
     paths = DOMAIN_PATHS.get(panel_type, DOMAIN_PATHS['none'])
     for pattern in paths:
         out, _ = checker.exec_command(f'ls -1 {pattern} 2>/dev/null | head -10')
@@ -381,14 +370,14 @@ def get_domains(checker, panel_type):
 
 # ==================== ПРОВЕРКА ЛОГОВ САЙТОВ ====================
 def check_site_logs(checker, panel_type, domains):
-    """Проверяет error-логи сайтов (рефакторинг)"""
     errors = {}
     for domain in domains:
         log_files = find_logs(checker, panel_type, domain, 'error')
         for log_file in log_files:
+            if log_file.startswith('⚠️'):
+                continue
             content = read_file_content(checker, log_file)
             if content:
-                # Ищем ошибки в последних 200 строках
                 lines = content.splitlines()[-200:]
                 for line in lines:
                     if re.search(r'error|fail|critical|fatal|panic|warning', line, re.I):
@@ -396,11 +385,10 @@ def check_site_logs(checker, panel_type, domains):
                             errors[domain] = []
                         errors[domain].append(f"{log_file}: {line.strip()}")
     
-    # Форматируем результат
     result = {}
     for domain, err_lines in errors.items():
         if err_lines:
-            result[f"{domain}:{log_file}"] = '\n'.join(err_lines[:10])  # Ограничиваем 10 строками
+            result[f"{domain}:{log_file}"] = '\n'.join(err_lines[:10])
     return result
 
 # ==================== ВЕБ-КОНФИГУРАЦИЯ ====================

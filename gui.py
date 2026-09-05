@@ -1,5 +1,6 @@
 import tkinter as tk
 import re
+import threading
 from tkinter import messagebox, filedialog, scrolledtext, simpledialog, ttk
 from diagnostic import (
     detect_panel, full_diagnostic_report,
@@ -178,10 +179,10 @@ class DiagnosticApp:
                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.config_editor_btn.pack(side=tk.LEFT, padx=5)
 
-        # Кнопки управления ISPmanager (будут видны только если панель = ispmanager)
+        # Кнопки управления ISPmanager
         self.ispmanager_frame = tk.Frame(btn_frame, bg=self.bg)
         self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
-        self.ispmanager_frame.pack_forget()  # скрываем по умолчанию
+        self.ispmanager_frame.pack_forget()
 
         self.isp_restart_btn = tk.Button(self.ispmanager_frame, text="Перезапустить панель", command=self.run_isp_restart, state=tk.DISABLED,
                                  bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
@@ -227,7 +228,7 @@ class DiagnosticApp:
                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.fstab_btn.pack(side=tk.LEFT, padx=5)
 
-        # Текстовое поле для вывода (с прокруткой) — тёмный фон
+        # Текстовое поле для вывода
         self.output = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, font=("Courier", 10),
                                                 bg=self.output_bg, fg=self.output_fg, insertbackground='white')
         self.output.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
@@ -294,17 +295,21 @@ class DiagnosticApp:
 
         self.log(f"\n=== Подключение к {ip}:{port} ...")
         self.checker = ServerChecker(ip, port, user, password, key_path)
-        if not self.checker.connect():
-            self.log("❌ Ошибка подключения. Проверьте данные доступа.")
+        success, message = self.checker.connect()
+        
+        if not success:
+            self.log(f"❌ {message}")
             self.checker = None
             return
+
+        self.log(f"✅ {message}")
 
         if self.panel_var.get() == 'auto':
             self.panel_type = detect_panel(self.checker)
         else:
             self.panel_type = self.panel_var.get()
 
-        self.log(f"✅ Подключено. Панель управления: {self.panel_type}")
+        self.log(f"Панель управления: {self.panel_type}")
 
         # Активируем кнопки диагностики
         self.full_btn.config(state=tk.NORMAL)
@@ -326,7 +331,7 @@ class DiagnosticApp:
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
 
-        # Показываем/скрываем кнопки ISPmanager в зависимости от панели
+        # Показываем/скрываем кнопки ISPmanager
         if self.panel_type == 'ispmanager':
             self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
             for btn in [self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
@@ -343,108 +348,63 @@ class DiagnosticApp:
         self.connect_btn.config(text="Отключиться", bg="#cc0000", state=tk.NORMAL, command=self.disconnect)
         self.cmd_entry.focus_set()
 
-    def send_command(self, event=None):
+    # ==================== ФУНКЦИИ ДЛЯ ФОНОВЫХ ПОТОКОВ ====================
+    def _run_in_thread(self, target_func, btn=None, *args, **kwargs):
+        """Запускает функцию в фоновом потоке"""
         if not self.checker:
             return
-        cmd = self.cmd_entry.get().strip()
-        if not cmd:
-            return
-
-        self.cmd_history.append(cmd)
-        self.history_index = len(self.cmd_history)
-
-        self.cmd_entry.delete(0, tk.END)
-
-        if cmd.lower() in ('exit', 'quit'):
-            self.log("Завершение сессии...")
-            self.disconnect()
-            return
-
-        self.log(f"\n$ {cmd}")
-        try:
-            stdout, stderr = self.checker.exec_command(cmd)
-            if stdout.strip():
-                self.log(stdout.strip())
-            if stderr.strip():
-                self.log("STDERR: " + stderr.strip())
-        except Exception as e:
-            self.log(f"Ошибка выполнения команды: {e}")
-
-    def disconnect(self):
-        if self.checker:
-            self.checker.close()
-            self.checker = None
-            self.panel_type = None
         
-        self.full_btn.config(state=tk.DISABLED)
-        self.disk_btn.config(state=tk.DISABLED)
-        self.network_btn.config(state=tk.DISABLED)
-        self.firewall_btn.config(state=tk.DISABLED)
-        self.config_btn.config(state=tk.DISABLED)
-        self.logs_btn.config(state=tk.DISABLED)
-        self.access_btn.config(state=tk.DISABLED)
-        self.oom_btn.config(state=tk.DISABLED)
-        self.dns_btn.config(state=tk.DISABLED)
-        self.resolv_btn.config(state=tk.DISABLED)
-        self.edit_dns_btn.config(state=tk.DISABLED)
-        self.ipv4_btn.config(state=tk.DISABLED)
-        self.ipv6_btn.config(state=tk.DISABLED)
-        self.restart_btn.config(state=tk.DISABLED)
-        self.config_editor_btn.config(state=tk.DISABLED)
-        self.swap_btn.config(state=tk.DISABLED)
-        self.fstab_btn.config(state=tk.DISABLED)
-        self.send_btn.config(state=tk.DISABLED)
+        if btn:
+            btn.config(state=tk.DISABLED, text="Выполняется...")
+        
+        def wrapper():
+            try:
+                result = target_func(*args, **kwargs)
+                self.root.after(0, self._display_result, result)
+            except Exception as e:
+                self.root.after(0, self._display_result, f"❌ Ошибка: {str(e)}")
+            finally:
+                if btn:
+                    # Восстанавливаем кнопку после завершения
+                    original_text = btn.cget('text').replace(' (Выполняется...)', '')
+                    self.root.after(0, lambda: btn.config(state=tk.NORMAL, text=original_text))
+        
+        thread = threading.Thread(target=wrapper)
+        thread.daemon = True
+        thread.start()
 
-        for btn in [self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
-                    self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
-                    self.isp_cron_btn, self.isp_fix_cron_btn]:
-            btn.config(state=tk.DISABLED)
-        self.ispmanager_frame.pack_forget()
-
-        self.connect_btn.config(text="Подключиться", bg="#4e9a06", state=tk.NORMAL, command=self.connect)
-        self.log("Соединение закрыто.")
-
-    # ---------- ДИАГНОСТИКИ ----------
-    def run_full(self):
-        if not self.checker:
-            return
+    def _display_result(self, text):
+        """Безопасно выводит результат в GUI из любого потока"""
         self.log("\n" + "="*60)
-        report = full_diagnostic_report(self.checker, self.panel_type)
-        self.log(report)
+        self.log(text)
+
+    # ==================== ДИАГНОСТИКИ ====================
+    def run_full(self):
+        self._run_in_thread(full_diagnostic_report, self.full_btn, self.checker, self.panel_type)
 
     def run_disk_memory(self):
-        if not self.checker:
-            return
-        self.log("\n" + "="*60)
-        self.log(disk_memory_report(self.checker))
+        self._run_in_thread(disk_memory_report, self.disk_btn, self.checker)
 
     def run_network(self):
-        if not self.checker:
-            return
-        self.log("\n" + "="*60)
-        self.log(network_report(self.checker))
+        self._run_in_thread(network_report, self.network_btn, self.checker)
 
     def run_firewall(self):
-        if not self.checker:
-            return
-        self.log("\n" + "="*60)
-        self.log(firewall_report(self.checker))
+        self._run_in_thread(firewall_report, self.firewall_btn, self.checker)
 
     def run_config(self):
-        if not self.checker:
-            return
-        self.log("\n" + "="*60)
-        self.log(web_config_report(self.checker))
+        self._run_in_thread(web_config_report, self.config_btn, self.checker)
 
     def run_logs(self):
-        if not self.checker:
-            return
-        self.log("\n" + "="*60)
-        self.log(site_logs_report(self.checker, self.panel_type))
+        self._run_in_thread(site_logs_report, self.logs_btn, self.checker, self.panel_type)
 
+    def run_oom_search(self):
+        self._run_in_thread(search_oom_logs, self.oom_btn, self.checker)
+
+    # ==================== АНАЛИЗ ЛОГОВ ДОСТУПА ====================
     def run_access_analysis(self):
         if not self.checker:
             return
+        
         domains = get_domains(self.checker, self.panel_type)
         domain_var = tk.StringVar()
         if domains:
@@ -505,10 +465,10 @@ class DiagnosticApp:
                     return
 
             dialog.destroy()
-            self.log("\n" + "="*60)
-            result = analyze_access_log(self.checker, self.panel_type, domain, top_n, year, month, day)
-            self.log(result)
-            last_result[0] = result
+            self._run_in_thread(
+                analyze_access_log, self.access_btn,
+                self.checker, self.panel_type, domain, top_n, year, month, day
+            )
 
         def on_save():
             if last_result[0] is None:
@@ -532,12 +492,7 @@ class DiagnosticApp:
         dialog.columnconfigure(2, weight=1)
         dialog.columnconfigure(3, weight=1)
 
-    def run_oom_search(self):
-        if not self.checker:
-            return
-        self.log("\n" + "="*60)
-        self.log(search_oom_logs(self.checker))
-
+    # ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
     def create_swap(self):
         if not self.checker:
             return
@@ -584,7 +539,7 @@ class DiagnosticApp:
             self.log("Запись /swapfile уже присутствует в fstab.")
             return
 
-        cmd = 'echo "/swapfile none swap sw 0 0" | sudo tee -a /etc/fstab'
+        cmd = 'echo "/swapfile none swap sw 0 0" >> /etc/fstab'
         out, err = self.checker.exec_command(cmd)
         self.log(f"$ {cmd}")
         if out.strip():
@@ -640,9 +595,7 @@ class DiagnosticApp:
     def run_dns_resolvers(self):
         if not self.checker:
             return
-        self.log("\n" + "="*60)
-        result = dns_resolvers_report(self.checker)
-        self.log(result)
+        self._run_in_thread(dns_resolvers_report, self.resolv_btn, self.checker)
 
     def run_edit_dns(self):
         if not self.checker:
@@ -720,15 +673,7 @@ class DiagnosticApp:
                 return
             if messagebox.askyesno("Подтверждение", f"Установить DNS:\n{', '.join(new_list)}?", parent=self.root):
                 dialog.destroy()
-                self.log("\n" + "="*60)
-                result = set_dns_resolvers(self.checker, new_list)
-                self.log(result)
-                self.log("\nОбновлённый список DNS:")
-                out, _ = self.checker.exec_command('grep -E "^nameserver" /etc/resolv.conf | awk \'{print $2}\'')
-                if out.strip():
-                    self.log(out.strip())
-                else:
-                    self.log("(не удалось прочитать /etc/resolv.conf)")
+                self._run_in_thread(set_dns_resolvers, self.edit_dns_btn, self.checker, new_list)
 
         tk.Button(dialog, text="Применить изменения", command=apply_changes, bg="#4e9a06", fg="white").pack(pady=10)
         tk.Button(dialog, text="Отмена", command=dialog.destroy, bg=self.btn_bg, fg=self.btn_fg).pack(pady=5)
@@ -750,9 +695,7 @@ class DiagnosticApp:
             return
         
         if messagebox.askyesno("Подтверждение", f"Заменить {old_ip} на {new_ip} во всех .conf-файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.", parent=self.root):
-            self.log("\n" + "="*60)
-            result = replace_ipv4(self.checker, old_ip, new_ip)
-            self.log(result)
+            self._run_in_thread(replace_ipv4, self.ipv4_btn, self.checker, old_ip, new_ip)
 
     def run_replace_ipv6(self):
         if not self.checker:
@@ -765,17 +708,13 @@ class DiagnosticApp:
             return
         
         if messagebox.askyesno("Подтверждение", f"Заменить {old_ip} на {new_ip} во всех файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.", parent=self.root):
-            self.log("\n" + "="*60)
-            result = replace_ipv6(self.checker, old_ip, new_ip)
-            self.log(result)
+            self._run_in_thread(replace_ipv6, self.ipv6_btn, self.checker, old_ip, new_ip)
 
     def run_restart_services(self):
         if not self.checker:
             return
         if messagebox.askyesno("Подтверждение", "Перезапустить nginx, mysql, apache?", parent=self.root):
-            self.log("\n" + "="*60)
-            result = restart_services(self.checker)
-            self.log("\n".join(result))
+            self._run_in_thread(restart_services, self.restart_btn, self.checker)
 
     def get_bash_history(self):
         if not self.checker:
@@ -837,9 +776,13 @@ class DiagnosticApp:
             if not filepath:
                 messagebox.showwarning("Внимание", "Выберите файл")
                 return
+            # Блокируем редактирование во время загрузки
+            text_editor.config(state=tk.DISABLED)
+            self.root.update()
             content = read_file(self.checker, filepath)
             text_editor.delete(1.0, tk.END)
             text_editor.insert(tk.END, content)
+            text_editor.config(state=tk.NORMAL)
             current_filepath[0] = filepath
         
         load_btn = tk.Button(top_frame, text="Загрузить", command=load_file, bg=self.btn_bg, fg=self.btn_fg)
@@ -865,9 +808,12 @@ class DiagnosticApp:
                 return
             content = text_editor.get(1.0, tk.END)
             if messagebox.askyesno("Подтверждение", f"Сохранить изменения в {filepath}?", parent=editor_dialog):
+                # Блокируем на время сохранения
+                text_editor.config(state=tk.DISABLED)
+                self.root.update()
                 result = write_file(self.checker, filepath, content)
-                self.log("\n" + "="*60)
-                self.log(result)
+                self._display_result(result)
+                text_editor.config(state=tk.NORMAL)
                 messagebox.showinfo("Успех", "Файл сохранён")
         
         def reload_file():
@@ -875,9 +821,12 @@ class DiagnosticApp:
             if not filepath:
                 messagebox.showwarning("Внимание", "Сначала загрузите файл")
                 return
+            text_editor.config(state=tk.DISABLED)
+            self.root.update()
             content = read_file(self.checker, filepath)
             text_editor.delete(1.0, tk.END)
             text_editor.insert(tk.END, content)
+            text_editor.config(state=tk.NORMAL)
         
         def close_editor():
             if text_editor.get(1.0, tk.END).strip():
@@ -892,70 +841,119 @@ class DiagnosticApp:
         
         if files:
             file_combo.set(files[0])
+            text_editor.config(state=tk.DISABLED)
+            self.root.update()
             content = read_file(self.checker, files[0])
             text_editor.insert(tk.END, content)
+            text_editor.config(state=tk.NORMAL)
             current_filepath[0] = files[0]
 
-    # ---------- УПРАВЛЕНИЕ ISPmanager ----------
+    # ==================== УПРАВЛЕНИЕ ISPmanager ====================
     def run_isp_restart(self):
         if not self.checker:
             return
         if messagebox.askyesno("Подтверждение", "Перезапустить панель ISPmanager?", parent=self.root):
-            self.log("\n" + "="*60)
-            result = ispmanager_restart(self.checker)
-            self.log(result)
+            self._run_in_thread(ispmanager_restart, self.isp_restart_btn, self.checker)
 
     def run_isp_kill(self):
         if not self.checker:
             return
         if messagebox.askyesno("Подтверждение", "Принудительно завершить процесс core (панель)?\n⚠️ Это может привести к потере данных!", parent=self.root):
-            self.log("\n" + "="*60)
-            result = ispmanager_kill_core(self.checker)
-            self.log(result)
+            self._run_in_thread(ispmanager_kill_core, self.isp_kill_btn, self.checker)
 
     def run_isp_update(self):
         if not self.checker:
             return
         if messagebox.askyesno("Подтверждение", "Обновить панель ISPmanager?\n⚠️ Обновление может занять несколько минут!", parent=self.root):
-            self.log("\n" + "="*60)
-            result = ispmanager_update(self.checker)
-            self.log(result)
+            self._run_in_thread(ispmanager_update, self.isp_update_btn, self.checker)
 
     def run_isp_ssl(self):
         if not self.checker:
             return
         if messagebox.askyesno("Подтверждение", "Принудительно запустить выпуск Let's Encrypt сертификатов?\n⚠️ Процесс может занять несколько минут!", parent=self.root):
-            self.log("\n" + "="*60)
-            result = ispmanager_ssl_issue(self.checker)
-            self.log(result)
+            self._run_in_thread(ispmanager_ssl_issue, self.isp_ssl_btn, self.checker)
 
     def run_isp_disable(self):
         if not self.checker:
             return
         if messagebox.askyesno("Подтверждение", "Отключить панель ISPmanager?\n⚠️ Панель будет остановлена!", parent=self.root):
-            self.log("\n" + "="*60)
-            result = ispmanager_disable(self.checker)
-            self.log(result)
+            self._run_in_thread(ispmanager_disable, self.isp_disable_btn, self.checker)
 
     def run_isp_geoip(self):
         if not self.checker:
             return
         if messagebox.askyesno("Подтверждение", "Отключить модуль авторизации GeoIP?", parent=self.root):
-            self.log("\n" + "="*60)
-            result = ispmanager_disable_geoip(self.checker)
-            self.log(result)
+            self._run_in_thread(ispmanager_disable_geoip, self.isp_geoip_btn, self.checker)
 
     def run_isp_cron(self):
         if not self.checker:
             return
-        self.log("\n" + "="*60)
-        result = ispmanager_check_cron_path(self.checker)
-        self.log(result)
+        self._run_in_thread(ispmanager_check_cron_path, self.isp_cron_btn, self.checker)
 
     def run_isp_fix_cron(self):
         if not self.checker:
             return
         if messagebox.askyesno("Подтверждение", "Закомментировать переменную PATH в crontab?\n⚠️ Это может повлиять на другие cron-задания!", parent=self.root):
-            self.log("\n" + "="*60)
-            result = ispmanager_fix_cron_path(self.checker)
-            self.log(result)
+            self._run_in_thread(ispmanager_fix_cron_path, self.isp_fix_cron_btn, self.checker)
+
+    # ==================== ОТПРАВКА КОМАНД ====================
+    def send_command(self, event=None):
+        if not self.checker:
+            return
+        cmd = self.cmd_entry.get().strip()
+        if not cmd:
+            return
+
+        self.cmd_history.append(cmd)
+        self.history_index = len(self.cmd_history)
+
+        self.cmd_entry.delete(0, tk.END)
+
+        if cmd.lower() in ('exit', 'quit'):
+            self.log("Завершение сессии...")
+            self.disconnect()
+            return
+
+        self.log(f"\n$ {cmd}")
+        try:
+            stdout, stderr = self.checker.exec_command(cmd)
+            if stdout.strip():
+                self.log(stdout.strip())
+            if stderr.strip():
+                self.log("STDERR: " + stderr.strip())
+        except Exception as e:
+            self.log(f"Ошибка выполнения команды: {e}")
+
+    def disconnect(self):
+        if self.checker:
+            self.checker.close()
+            self.checker = None
+            self.panel_type = None
+        
+        self.full_btn.config(state=tk.DISABLED)
+        self.disk_btn.config(state=tk.DISABLED)
+        self.network_btn.config(state=tk.DISABLED)
+        self.firewall_btn.config(state=tk.DISABLED)
+        self.config_btn.config(state=tk.DISABLED)
+        self.logs_btn.config(state=tk.DISABLED)
+        self.access_btn.config(state=tk.DISABLED)
+        self.oom_btn.config(state=tk.DISABLED)
+        self.dns_btn.config(state=tk.DISABLED)
+        self.resolv_btn.config(state=tk.DISABLED)
+        self.edit_dns_btn.config(state=tk.DISABLED)
+        self.ipv4_btn.config(state=tk.DISABLED)
+        self.ipv6_btn.config(state=tk.DISABLED)
+        self.restart_btn.config(state=tk.DISABLED)
+        self.config_editor_btn.config(state=tk.DISABLED)
+        self.swap_btn.config(state=tk.DISABLED)
+        self.fstab_btn.config(state=tk.DISABLED)
+        self.send_btn.config(state=tk.DISABLED)
+
+        for btn in [self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
+                    self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
+                    self.isp_cron_btn, self.isp_fix_cron_btn]:
+            btn.config(state=tk.DISABLED)
+        self.ispmanager_frame.pack_forget()
+
+        self.connect_btn.config(text="Подключиться", bg="#4e9a06", state=tk.NORMAL, command=self.connect)
+        self.log("Соединение закрыто.")
