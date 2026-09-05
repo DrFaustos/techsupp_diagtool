@@ -185,7 +185,6 @@ killall, pkill – для управления процессами
 🔧 Устранение неполадок
 Ошибка No module named 'tkinter'
 Установите Tkinter:
-
 sudo apt install python3-tk  # Ubuntu/Debian
 sudo yum install python3-tkinter  # CentOS/RHEL
 Ошибка подключения
@@ -212,12 +211,7 @@ MIT License
 
 ✨ Автор
 Разработано для техподдержки облачных серверов.
-
-📞 Контакты
-REG.RU – хостинг и облачные серверы
-
 Документация по ISPmanager
-
 Документация по FastPanel
 
 📦 Сборка исполняемого файла (опционально)
@@ -228,9 +222,7 @@ pyinstaller --onefile --windowed --name="ServerDiagnostic" main.py
 
 🙏 Благодарности
 Paramiko – библиотека для SSH
-
 Tkinter – GUI-фреймворк
-
-Команда REG.RU за тестирование и идеи
+Команда REG.RU идеи
 
 © 2026 Все права защищены
