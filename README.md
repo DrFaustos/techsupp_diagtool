@@ -268,8 +268,10 @@ DeepSeek – искусственный интеллект, который по�
 ## 📦 Сборка исполняемого файла (опционально)
 
 Для создания standalone-версии:
+```
 pip install pyinstaller
 pyinstaller --onefile --windowed --name="ServerDiagnostic" main.py
+```
 Исполняемый файл появится в папке `dist/`.
 
 ---
