@@ -66,7 +66,7 @@
 
 ### Шаги установки
 
-1. Клонируйте репозиторий:
+Клонируйте репозиторий:
 ```
 git clone https://github.com/ваш-username/server-diagnostic-tool.git
 cd server-diagnostic-tool
@@ -75,7 +75,7 @@ cd server-diagnostic-tool
 Создайте виртуальное окружение:
 python3 -m venv venv
 source venv/bin/activate  # Linux/Mac
-# или venv\Scripts\activate  # Windows
+### или venv\Scripts\activate  # Windows
 Установите зависимости:
 ```
 pip install -r requirements.txt
