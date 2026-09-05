@@ -87,12 +87,18 @@ python3 main.py
 📁 Структура проекта
 
 server_diagnostic/
+
 ├── main.py # Точка входа
-├── gui.py # Графический интерфейс (Tkinter)
-├── diagnostic.py # Основная логика диагностики
-├── ssh_client.py # SSH-подключение (Paramiko)
-├── requirements.txt # Зависимости
-└── README.md # Документация
+
+├── gui.py # Графический интерфейс (Tkinter) 
+
+├── diagnostic.py # Основная логика диагностики 
+
+├── ssh_client.py # SSH-подключение (Paramiko) 
+
+├── requirements.txt # Зависимости 
+
+└── README.md # Документация 
 
 ### Описание файлов
 
