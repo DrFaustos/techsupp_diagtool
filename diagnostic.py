@@ -53,7 +53,7 @@ def get_metrics(checker):
 def get_domains(checker, panel_type):
     domains = []
     
-    # === ISPmanager: сначала пробуем mgrctl (самый надёжный способ) ===
+    # === ISPmanager: сначала пробуем mgrctl ===
     if panel_type == 'ispmanager':
         out, _ = checker.exec_command('mgrctl -m webdomain list --output-format csv 2>/dev/null')
         if out.strip():
@@ -71,7 +71,7 @@ def get_domains(checker, panel_type):
     search_paths = []
     if panel_type == 'fastpanel':
         search_paths = [
-            '/etc/nginx/fastpanel2-available/*/*.conf',   # новый путь для FastPanel
+            '/etc/nginx/fastpanel2-available/*/*.conf',
             '/usr/local/fastpanel/etc/nginx/sites-available/*',
             '/etc/nginx/sites-available/*'
         ]
@@ -109,12 +109,10 @@ def check_site_logs(checker, panel_type, domains):
     for domain in domains:
         log_paths = []
         if panel_type == 'fastpanel':
-            # Ищем все error.log, содержащие домен в имени
             cmd = f"find /var/www -type f -path '*/data/logs/*' -name '*{domain}*.error.log' 2>/dev/null"
             out, _ = checker.exec_command(cmd)
             if out.strip():
                 log_paths.extend(out.strip().split('\n'))
-            # fallback в /home
             cmd = f"find /home -type f -path '*/logs/*' -name '*{domain}*.error.log' 2>/dev/null"
             out, _ = checker.exec_command(cmd)
             if out.strip():
@@ -217,7 +215,7 @@ def full_diagnostic_report(checker, panel):
     lines.append("\n=== ДИАГНОСТИКА ЗАВЕРШЕНА ===")
     return "\n".join(lines)
 
-# ---------- НОВЫЕ ФУНКЦИИ ДЛЯ ОТДЕЛЬНЫХ ПРОВЕРОК ----------
+# ---------- ОТДЕЛЬНЫЕ ПРОВЕРКИ ----------
 def disk_memory_report(checker):
     out, _ = checker.exec_command('df -h')
     df_h = out
@@ -272,16 +270,12 @@ def network_report(checker):
 
     return "\n".join(lines)
 
+# ---------- АНАЛИЗ ЛОГОВ ДОСТУПА ----------
 def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=None, day=None):
-    """
-    Анализирует access-лог(и) указанного домена (включая ротационные .gz).
-    year, month, day – опциональные числовые фильтры.
-    """
     import os
-
     log_path = None
+
     if panel_type == 'fastpanel':
-        # Ищем любой access.log, содержащий домен в имени
         cmd = f"find /var/www -type f -path '*/data/logs/*' -name '*{domain}*.access.log' 2>/dev/null | head -1"
         out, _ = checker.exec_command(cmd)
         if out.strip():
@@ -322,7 +316,6 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
         return f"❌ Не найден access-лог для домена {domain}"
 
     log_dir = os.path.dirname(log_path)
-    # Для FastPanel используем маску с *, для других точное имя
     if panel_type == 'fastpanel':
         file_pattern = f"{log_dir}/*{domain}*.access.log*"
     else:
@@ -435,6 +428,7 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
 
     return "\n".join(lines_out)
 
+# ---------- ПОИСК OOM ----------
 def search_oom_logs(checker):
     cmd = "zgrep -B 5 -A 5 -i 'out of memory\\|killed process\\|oom-killer' /var/log/kern.log* /var/log/syslog* 2>/dev/null"
     out, err = checker.exec_command(cmd)
@@ -469,6 +463,7 @@ def search_oom_logs(checker):
 
     return "\n".join(report_lines)
 
+# ---------- DNS ФУНКЦИИ ----------
 def dns_report_local(domain):
     import socket
     lines = []
@@ -605,10 +600,6 @@ def get_current_dns_resolvers(checker):
     return []
 
 def set_dns_resolvers(checker, nameservers):
-    """
-    Устанавливает новые DNS-резолверы глобально (через /etc/systemd/resolved.conf)
-    и на интерфейсах (через resolvectl), затем перезапускает systemd-resolved.
-    """
     lines = []
     lines.append("=== ИЗМЕНЕНИЕ DNS-РЕЗОЛВЕРОВ ===")
 
@@ -631,7 +622,6 @@ def set_dns_resolvers(checker, nameservers):
 
     lines.append("Обнаружен systemd-resolved. Настраиваем глобальные DNS и интерфейсы.")
 
-    # Редактируем /etc/systemd/resolved.conf
     out_conf, _ = checker.exec_command('cat /etc/systemd/resolved.conf 2>/dev/null')
     new_conf_lines = []
     dns_found = False
@@ -660,7 +650,6 @@ def set_dns_resolvers(checker, nameservers):
     else:
         lines.append("✅ /etc/systemd/resolved.conf обновлён.")
 
-    # Устанавливаем DNS для интерфейсов
     cmd_iface = "ip -o link show | awk -F': ' '{print $2}' | grep -v lo"
     out_ifaces, _ = checker.exec_command(cmd_iface)
     interfaces = [iface.strip() for iface in out_ifaces.splitlines() if iface.strip()]
@@ -673,7 +662,6 @@ def set_dns_resolvers(checker, nameservers):
         else:
             lines.append(f"✅ DNS для {iface}: {', '.join(nameservers)}")
 
-    # Перезапускаем
     checker.exec_command('systemctl restart systemd-resolved 2>/dev/null')
     lines.append("Перезапущен systemd-resolved.")
 
@@ -683,3 +671,61 @@ def set_dns_resolvers(checker, nameservers):
     lines.append("\nСодержимое /etc/resolv.conf:\n" + out_resolv)
 
     return "\n".join(lines)
+
+# ---------- ЗАМЕНА IP-АДРЕСОВ ----------
+def replace_ipv4(checker, old_ip, new_ip):
+    """Заменяет IPv4-адрес во всех .conf-файлах в /etc и перезапускает nginx, mysql, apache"""
+    lines = []
+    lines.append(f"=== ЗАМЕНА IPv4: {old_ip} -> {new_ip} ===")
+    
+    # Экранируем точки для sed
+    old_escaped = old_ip.replace('.', '\.')
+    
+    # Выполняем замену
+    cmd = f"find /etc -type f -name '*.conf' -exec sed -i -e 's#{old_escaped}#{new_ip}#g' '{{}}' \\; 2>/dev/null"
+    out, err = checker.exec_command(cmd)
+    if err.strip():
+        lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
+    lines.append("✅ IPv4 заменён во всех .conf-файлах в /etc.")
+    
+    # Перезапускаем службы
+    lines.extend(restart_services(checker))
+    return "\n".join(lines)
+
+def replace_ipv6(checker, old_ip, new_ip):
+    """Заменяет IPv6-адрес во всех файлах в /etc и перезапускает nginx, mysql, apache"""
+    lines = []
+    lines.append(f"=== ЗАМЕНА IPv6: {old_ip} -> {new_ip} ===")
+    
+    # Выполняем замену
+    cmd = f"find /etc -type f -exec sed -i 's/{old_ip}/{new_ip}/g' '{{}}' + 2>/dev/null"
+    out, err = checker.exec_command(cmd)
+    if err.strip():
+        lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
+    lines.append("✅ IPv6 заменён во всех файлах в /etc.")
+    
+    # Перезапускаем службы
+    lines.extend(restart_services(checker))
+    return "\n".join(lines)
+
+# ---------- ПЕРЕЗАПУСК СЛУЖБ ----------
+def restart_services(checker):
+    """Перезапускает nginx, mysql, apache (если установлены)"""
+    lines = []
+    lines.append("\n=== ПЕРЕЗАПУСК СЛУЖБ ===")
+    
+    services = ['nginx', 'mysql', 'apache2']
+    for svc in services:
+        # Проверяем, существует ли служба
+        out, _ = checker.exec_command(f'systemctl list-unit-files | grep -q "^{svc}.service" && echo "yes" || echo "no"')
+        if out.strip() == 'yes':
+            out, err = checker.exec_command(f'systemctl restart {svc} 2>/dev/null')
+            status, _ = checker.exec_command(f'systemctl is-active {svc} 2>/dev/null')
+            if status.strip() == 'active':
+                lines.append(f"✅ {svc} перезапущен")
+            else:
+                lines.append(f"❌ {svc} не запустился")
+        else:
+            lines.append(f"⏭️ {svc} не установлен")
+    
+    return lines

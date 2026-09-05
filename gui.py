@@ -1,5 +1,7 @@
 import tkinter as tk
 import re
+import subprocess
+import os
 from tkinter import messagebox, filedialog, scrolledtext, simpledialog, ttk
 from diagnostic import (
     detect_panel, full_diagnostic_report,
@@ -10,7 +12,10 @@ from diagnostic import (
     search_oom_logs, dns_report, dns_report_local,
     dns_resolvers_report,
     get_current_dns_resolvers,
-    set_dns_resolvers
+    set_dns_resolvers,
+    replace_ipv4,
+    replace_ipv6,
+    restart_services
 )
 from ssh_client import ServerChecker
 
@@ -155,6 +160,19 @@ class DiagnosticApp:
                               bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.edit_dns_btn.pack(side=tk.LEFT, padx=5)
 
+        # Кнопки замены IP
+        self.ipv4_btn = tk.Button(btn_frame, text="Заменить IPv4", command=self.run_replace_ipv4, state=tk.DISABLED,
+                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.ipv4_btn.pack(side=tk.LEFT, padx=5)
+
+        self.ipv6_btn = tk.Button(btn_frame, text="Заменить IPv6", command=self.run_replace_ipv6, state=tk.DISABLED,
+                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.ipv6_btn.pack(side=tk.LEFT, padx=5)
+
+        self.restart_btn = tk.Button(btn_frame, text="Перезапустить службы", command=self.run_restart_services, state=tk.DISABLED,
+                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.restart_btn.pack(side=tk.LEFT, padx=5)
+
         # Кнопки управления swap (второй ряд)
         swap_frame = tk.Frame(self.root, bg=self.bg)
         swap_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -186,6 +204,10 @@ class DiagnosticApp:
         self.send_btn = tk.Button(cmd_frame, text="Send", command=self.send_command, state=tk.DISABLED,
                                   bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
         self.send_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.history_btn = tk.Button(cmd_frame, text="История", command=self.show_bash_history,
+                             bg=self.btn_bg, fg=self.btn_fg)
+        self.history_btn.pack(side=tk.LEFT, padx=5)
 
         # Начальное сообщение
         self.log("Ожидание подключения...")
@@ -259,6 +281,9 @@ class DiagnosticApp:
         self.dns_btn.config(state=tk.NORMAL)
         self.resolv_btn.config(state=tk.NORMAL)
         self.edit_dns_btn.config(state=tk.NORMAL)
+        self.ipv4_btn.config(state=tk.NORMAL)
+        self.ipv6_btn.config(state=tk.NORMAL)
+        self.restart_btn.config(state=tk.NORMAL)
         self.swap_btn.config(state=tk.NORMAL)
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
@@ -314,6 +339,9 @@ class DiagnosticApp:
         self.dns_btn.config(state=tk.DISABLED)
         self.resolv_btn.config(state=tk.DISABLED)
         self.edit_dns_btn.config(state=tk.DISABLED)
+        self.ipv4_btn.config(state=tk.DISABLED)
+        self.ipv6_btn.config(state=tk.DISABLED)
+        self.restart_btn.config(state=tk.DISABLED)
         self.swap_btn.config(state=tk.DISABLED)
         self.fstab_btn.config(state=tk.DISABLED)
         self.send_btn.config(state=tk.DISABLED)
@@ -469,7 +497,7 @@ class DiagnosticApp:
     def create_swap(self):
         if not self.checker:
             return
-        size = simpledialog.askstring("Размер swap", "Введите размер swap файла в МБ (например, 1024):")
+        size = simpledialog.askstring("Размер swap", "Введите размер swap файла в МБ (например, 1024):", parent=self.root)
         if not size:
             return
         try:
@@ -522,6 +550,7 @@ class DiagnosticApp:
         out, _ = self.checker.exec_command("tail -3 /etc/fstab")
         self.log("Последние строки /etc/fstab:\n" + out)
 
+    # ---------- DNS ФУНКЦИИ ----------
     def run_dns_check(self):
         if not self.checker:
             return
@@ -559,12 +588,8 @@ class DiagnosticApp:
             dialog.destroy()
             self.log("\n" + "="*60)
             if local_var.get():
-                # Локальная проверка
-                from diagnostic import dns_report_local
                 result = dns_report_local(domain)
             else:
-                # Проверка через сервер
-                from diagnostic import dns_report
                 result = dns_report(self.checker, domain)
             self.log(result)
 
@@ -662,7 +687,7 @@ class DiagnosticApp:
             if not new_list:
                 messagebox.showwarning("Пустой список", "Должен быть хотя бы один DNS-сервер")
                 return
-            if messagebox.askyesno("Подтверждение", f"Установить DNS:\n{', '.join(new_list)}?"):
+            if messagebox.askyesno("Подтверждение", f"Установить DNS:\n{', '.join(new_list)}?", parent=self.root):
                 dialog.destroy()
                 self.log("\n" + "="*60)
                 result = set_dns_resolvers(self.checker, new_list)
@@ -678,3 +703,82 @@ class DiagnosticApp:
 
         # Закрытие окна без применения
         tk.Button(dialog, text="Отмена", command=dialog.destroy, bg=self.btn_bg, fg=self.btn_fg).pack(pady=5)
+
+    # ---------- ЗАМЕНА IPV4 ----------
+    def run_replace_ipv4(self):
+        if not self.checker:
+            return
+        old_ip = simpledialog.askstring("Замена IPv4", "Введите старый IPv4-адрес (который нужно заменить):", parent=self.root)
+        if not old_ip:
+            return
+        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', old_ip):
+            messagebox.showerror("Ошибка", "Неверный формат IPv4-адреса")
+            return
+        new_ip = simpledialog.askstring("Замена IPv4", f"Введите новый IPv4-адрес (вместо {old_ip}):", parent=self.root)
+        if not new_ip:
+            return
+        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', new_ip):
+            messagebox.showerror("Ошибка", "Неверный формат IPv4-адреса")
+            return
+        
+        if messagebox.askyesno("Подтверждение", f"Заменить {old_ip} на {new_ip} во всех .conf-файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.", parent=self.root):
+            self.log("\n" + "="*60)
+            result = replace_ipv4(self.checker, old_ip, new_ip)
+            self.log(result)
+
+    # ---------- ЗАМЕНА IPV6 ----------
+    def run_replace_ipv6(self):
+        if not self.checker:
+            return
+        old_ip = simpledialog.askstring("Замена IPv6", "Введите старый IPv6-адрес (который нужно заменить):", parent=self.root)
+        if not old_ip:
+            return
+        new_ip = simpledialog.askstring("Замена IPv6", f"Введите новый IPv6-адрес (вместо {old_ip}):", parent=self.root)
+        if not new_ip:
+            return
+        
+        if messagebox.askyesno("Подтверждение", f"Заменить {old_ip} на {new_ip} во всех файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.", parent=self.root):
+            self.log("\n" + "="*60)
+            result = replace_ipv6(self.checker, old_ip, new_ip)
+            self.log(result)
+
+    # ---------- ПЕРЕЗАПУСК СЛУЖБ ----------
+    def run_restart_services(self):
+        if not self.checker:
+            return
+        if messagebox.askyesno("Подтверждение", "Перезапустить nginx, mysql, apache?", parent=self.root):
+            self.log("\n" + "="*60)
+            result = restart_services(self.checker)
+            self.log("\n".join(result))
+
+    # ---------- BASH HISTORY ----------
+    def get_bash_history(self):
+        """Получает историю команд из ~/.bash_history"""
+        if not self.checker:
+            return []
+        out, _ = self.checker.exec_command('cat ~/.bash_history 2>/dev/null | tail -100')
+        if out.strip():
+            return [line.strip() for line in out.splitlines() if line.strip()]
+        return []
+
+    def show_bash_history(self):
+        """Открывает окно с историей команд"""
+        if not self.checker:
+            return
+        history = self.get_bash_history()
+        if not history:
+            messagebox.showinfo("История команд", "История команд не найдена или пуста.")
+            return
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Bash История команд")
+        dialog.geometry("600x400")
+        dialog.configure(bg=self.bg)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        text = scrolledtext.ScrolledText(dialog, wrap=tk.NONE, font=("Courier", 10),
+                                        bg=self.entry_bg, fg=self.entry_fg)
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        text.insert(tk.END, "\n".join(history))
+        text.config(state=tk.DISABLED)
