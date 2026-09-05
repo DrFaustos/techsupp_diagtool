@@ -678,17 +678,14 @@ def replace_ipv4(checker, old_ip, new_ip):
     lines = []
     lines.append(f"=== ЗАМЕНА IPv4: {old_ip} -> {new_ip} ===")
     
-    # Экранируем точки для sed
     old_escaped = old_ip.replace('.', '\.')
     
-    # Выполняем замену
     cmd = f"find /etc -type f -name '*.conf' -exec sed -i -e 's#{old_escaped}#{new_ip}#g' '{{}}' \\; 2>/dev/null"
     out, err = checker.exec_command(cmd)
     if err.strip():
         lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
     lines.append("✅ IPv4 заменён во всех .conf-файлах в /etc.")
     
-    # Перезапускаем службы
     lines.extend(restart_services(checker))
     return "\n".join(lines)
 
@@ -697,14 +694,12 @@ def replace_ipv6(checker, old_ip, new_ip):
     lines = []
     lines.append(f"=== ЗАМЕНА IPv6: {old_ip} -> {new_ip} ===")
     
-    # Выполняем замену
     cmd = f"find /etc -type f -exec sed -i 's/{old_ip}/{new_ip}/g' '{{}}' + 2>/dev/null"
     out, err = checker.exec_command(cmd)
     if err.strip():
         lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
     lines.append("✅ IPv6 заменён во всех файлах в /etc.")
     
-    # Перезапускаем службы
     lines.extend(restart_services(checker))
     return "\n".join(lines)
 
@@ -716,10 +711,9 @@ def restart_services(checker):
     
     services = ['nginx', 'mysql', 'apache2']
     for svc in services:
-        # Проверяем, существует ли служба
         out, _ = checker.exec_command(f'systemctl list-unit-files | grep -q "^{svc}.service" && echo "yes" || echo "no"')
         if out.strip() == 'yes':
-            out, err = checker.exec_command(f'systemctl restart {svc} 2>/dev/null')
+            checker.exec_command(f'systemctl restart {svc} 2>/dev/null')
             status, _ = checker.exec_command(f'systemctl is-active {svc} 2>/dev/null')
             if status.strip() == 'active':
                 lines.append(f"✅ {svc} перезапущен")
@@ -729,3 +723,221 @@ def restart_services(checker):
             lines.append(f"⏭️ {svc} не установлен")
     
     return lines
+
+# ---------- РЕДАКТОР КОНФИГОВ ----------
+def get_config_files(checker, panel_type):
+    """Возвращает список конфигурационных файлов для выбранной панели"""
+    files = []
+    
+    common_paths = [
+        '/etc/nginx/nginx.conf',
+        '/etc/nginx/sites-available/',
+        '/etc/nginx/sites-enabled/',
+        '/etc/nginx/conf.d/',
+        '/etc/apache2/apache2.conf',
+        '/etc/apache2/sites-available/',
+        '/etc/apache2/sites-enabled/',
+        '/etc/apache2/conf-available/',
+        '/etc/apache2/conf-enabled/',
+        '/etc/httpd/conf/httpd.conf',
+        '/etc/httpd/conf.d/',
+        '/etc/php/*/php.ini',
+        '/etc/php/*/fpm/php.ini',
+        '/etc/php/*/cli/php.ini',
+        '/etc/mysql/mysql.conf.d/mysqld.cnf',
+        '/etc/mysql/my.cnf',
+    ]
+    
+    panel_paths = {
+        'fastpanel': [
+            '/usr/local/fastpanel/etc/nginx/',
+            '/usr/local/fastpanel/etc/php/',
+            '/etc/nginx/fastpanel2-available/',
+        ],
+        'ispmanager': [
+            '/usr/local/mgr5/etc/nginx/',
+            '/usr/local/mgr5/etc/apache2/',
+            '/usr/local/mgr5/etc/php/',
+        ]
+    }
+    
+    for path in common_paths:
+        out, _ = checker.exec_command(f'ls -d {path} 2>/dev/null && echo "exists"')
+        if out.strip() == 'exists':
+            out2, _ = checker.exec_command(f'ls -1 {path} 2>/dev/null | head -20')
+            if out2.strip():
+                for f in out2.splitlines():
+                    if f.strip():
+                        if path.endswith('/'):
+                            files.append(f"{path}{f}")
+                        else:
+                            files.append(path)
+            else:
+                files.append(path)
+    
+    if panel_type in panel_paths:
+        for path in panel_paths[panel_type]:
+            out, _ = checker.exec_command(f'ls -d {path} 2>/dev/null && echo "exists"')
+            if out.strip() == 'exists':
+                out2, _ = checker.exec_command(f'find {path} -type f -name "*.conf" 2>/dev/null | head -20')
+                if out2.strip():
+                    for f in out2.splitlines():
+                        if f.strip():
+                            files.append(f)
+    
+    files = sorted(list(set(files)))
+    if len(files) > 50:
+        files = files[:50]
+    
+    return files
+
+def read_file(checker, filepath):
+    """Читает содержимое файла на сервере и возвращает строку"""
+    out, err = checker.exec_command(f'cat {filepath} 2>/dev/null')
+    if err.strip():
+        return f"❌ Ошибка чтения файла: {err}"
+    return out
+
+def write_file(checker, filepath, content):
+    """Записывает содержимое в файл на сервере (создаёт резервную копию)"""
+    lines = []
+    lines.append(f"=== СОХРАНЕНИЕ ФАЙЛА: {filepath} ===")
+    checker.exec_command(f'cp {filepath} {filepath}.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null')
+    cmd = f"cat > {filepath} <<'EOF'\n{content}\nEOF"
+    out, err = checker.exec_command(cmd + ' 2>&1')
+    if err.strip():
+        lines.append(f"❌ Ошибка записи: {err}")
+        return "\n".join(lines)
+    lines.append("✅ Файл сохранён.")
+    return "\n".join(lines)
+
+# ---------- УПРАВЛЕНИЕ ISPmanager ----------
+def ispmanager_restart(checker):
+    """Перезапускает панель ISPmanager"""
+    lines = []
+    lines.append("=== ПЕРЕЗАПУСК ISPmanager ===")
+    out, err = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr exit 2>&1')
+    if err.strip():
+        lines.append(f"❌ Ошибка: {err}")
+    else:
+        lines.append("✅ Команда на перезапуск отправлена через mgrctl")
+    checker.exec_command('sleep 3')
+    out2, _ = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr sysinfo 2>&1 | head -1')
+    if 'error' not in out2.lower():
+        lines.append("✅ Панель работает")
+    else:
+        lines.append("⚠️ Панель возможно не запустилась, проверьте вручную")
+    return "\n".join(lines)
+
+def ispmanager_kill_core(checker):
+    """Принудительно завершает процесс core (панель)"""
+    lines = []
+    lines.append("=== ПРИНУДИТЕЛЬНОЕ ЗАВЕРШЕНИЕ CORE ===")
+    out, err = checker.exec_command('killall core 2>&1')
+    if err.strip():
+        lines.append(f"⚠️ killall core: {err}")
+    else:
+        lines.append("✅ killall core выполнен")
+    out2, err2 = checker.exec_command('pkill -9 core 2>&1')
+    if err2.strip():
+        lines.append(f"⚠️ pkill -9 core: {err2}")
+    else:
+        lines.append("✅ pkill -9 core выполнен")
+    checker.exec_command('sleep 2')
+    out3, _ = checker.exec_command('ps aux | grep core | grep -v grep')
+    if not out3.strip():
+        lines.append("✅ Процесс core завершён")
+    else:
+        lines.append("⚠️ Процесс core всё ещё работает")
+    return "\n".join(lines)
+
+def ispmanager_update(checker):
+    """Обновляет панель ISPmanager через pkgupgrade.sh"""
+    lines = []
+    lines.append("=== ОБНОВЛЕНИЕ ISPmanager ===")
+    lines.append("⚠️ Обновление может занять несколько минут...")
+    out, err = checker.exec_command('/usr/local/mgr5/sbin/pkgupgrade.sh coremanager 2>&1')
+    if err.strip():
+        lines.append(f"❌ Ошибка обновления: {err}")
+    else:
+        lines.append("✅ Обновление завершено")
+    lines.append(out if out.strip() else "Вывод обновления пуст")
+    return "\n".join(lines)
+
+def ispmanager_ssl_issue(checker):
+    """Принудительный выпуск Let's Encrypt сертификатов"""
+    lines = []
+    lines.append("=== ПРИНУДИТЕЛЬНЫЙ ВЫПУСК LET'S ENCRYPT ===")
+    lines.append("⚠️ Процесс может занять несколько минут...")
+    out, err = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr letsencrypt.periodic 2>&1')
+    if err.strip():
+        lines.append(f"❌ Ошибка: {err}")
+    else:
+        lines.append("✅ Команда выполнена")
+    lines.append(out if out.strip() else "Вывод: процесс запущен")
+    return "\n".join(lines)
+
+def ispmanager_disable(checker):
+    """Отключает панель ISPmanager"""
+    lines = []
+    lines.append("=== ОТКЛЮЧЕНИЕ ISPmanager ===")
+    lines.append("⚠️ Панель будет остановлена!")
+    out, err = checker.exec_command('chmod -x /usr/local/mgr5/bin/core 2>&1')
+    if err.strip():
+        lines.append(f"❌ chmod: {err}")
+    else:
+        lines.append("✅ Права на core убраны")
+    out2, err2 = checker.exec_command('killall core 2>&1')
+    if err2.strip():
+        lines.append(f"⚠️ killall core: {err2}")
+    else:
+        lines.append("✅ core остановлен")
+    out3, err3 = checker.exec_command('killall ihttpd 2>&1')
+    if err3.strip():
+        lines.append(f"⚠️ killall ihttpd: {err3}")
+    else:
+        lines.append("✅ ihttpd остановлен")
+    lines.append("⚠️ Для включения панели выполните: chmod +x /usr/local/mgr5/bin/core && /usr/local/mgr5/bin/core")
+    return "\n".join(lines)
+
+def ispmanager_disable_geoip(checker):
+    """Отключает модуль авторизации GeoIP в ISPmanager"""
+    lines = []
+    lines.append("=== ОТКЛЮЧЕНИЕ GEOIP В ISPmanager ===")
+    out, err = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr usrparam setgeoip=off sok=ok 2>&1')
+    if err.strip():
+        lines.append(f"❌ Ошибка: {err}")
+    else:
+        lines.append("✅ GeoIP отключён")
+    lines.append(out if out.strip() else "Команда выполнена")
+    return "\n".join(lines)
+
+def ispmanager_check_cron_path(checker):
+    """Проверяет наличие переменной PATH в crontab"""
+    lines = []
+    lines.append("=== ПРОВЕРКА CRON PATH ===")
+    out, _ = checker.exec_command('crontab -l 2>/dev/null | grep "^PATH="')
+    if out.strip():
+        lines.append(f"⚠️ Найдена переменная PATH в crontab:\n{out}")
+        lines.append("⚠️ Это может мешать автоматическому выпуску SSL")
+    else:
+        lines.append("✅ Переменная PATH не найдена в crontab")
+    return "\n".join(lines)
+
+def ispmanager_fix_cron_path(checker):
+    """Закомментирует переменную PATH в crontab"""
+    lines = []
+    lines.append("=== ИСПРАВЛЕНИЕ CRON PATH ===")
+    checker.exec_command('crontab -l > /tmp/crontab_backup.txt 2>/dev/null')
+    lines.append("✅ Резервная копия сохранена в /tmp/crontab_backup.txt")
+    out, err = checker.exec_command("crontab -l 2>/dev/null | sed 's/^PATH=/#PATH=/' | crontab - 2>&1")
+    if err.strip():
+        lines.append(f"❌ Ошибка: {err}")
+    else:
+        lines.append("✅ Переменная PATH закомментирована")
+    out2, _ = checker.exec_command('crontab -l 2>/dev/null | grep "^#PATH="')
+    if out2.strip():
+        lines.append("✅ Проверка: PATH закомментирована")
+    else:
+        lines.append("⚠️ Проверка: возможно PATH не была закомментирована")
+    return "\n".join(lines)

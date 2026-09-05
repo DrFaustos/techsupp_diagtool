@@ -37,7 +37,6 @@ class ServerChecker:
                 )
             return True
         except Exception as e:
-            # Выводим полный traceback для диагностики
             print(f"Ошибка подключения к {self.host}:{self.port}")
             print(f"Тип ошибки: {type(e).__name__}")
             print(f"Сообщение: {str(e)}")
