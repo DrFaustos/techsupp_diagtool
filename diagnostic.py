@@ -73,26 +73,21 @@ def create_backup(checker, filepath, backup_type='configs'):
     Создаёт резервную копию файла с временной меткой в соответствующей поддиректории.
     Возвращает путь к бэкапу или None в случае ошибки.
     """
-    # Убеждаемся, что директория для бэкапов существует
     ensure_backup_dir(checker)
     
-    # Получаем имя файла без пути
     filename = os.path.basename(filepath)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     backup_filename = f"{filename}.{timestamp}.bak"
     backup_path = f"{BACKUP_SUBDIRS.get(backup_type, BACKUP_SUBDIRS['configs'])}/{backup_filename}"
     
-    # Проверяем, существует ли исходный файл
     out, _ = checker.exec_command(f'test -f {filepath} && echo "exists"')
     if out.strip() != 'exists':
         return None
     
-    # Создаём бэкап
     out, err = checker.exec_command(f'cp {filepath} {backup_path} 2>&1')
     if err.strip():
         return None
     
-    # Проверяем, что бэкап создан
     out, _ = checker.exec_command(f'test -f {backup_path} && echo "exists"')
     if out.strip() == 'exists':
         return backup_path
@@ -642,12 +637,10 @@ def set_dns_resolvers(checker, nameservers):
     lines = []
     lines.append("=== ИЗМЕНЕНИЕ DNS-РЕЗОЛВЕРОВ ===")
     
-    # Проверяем активность systemd-resolved
     out, _ = checker.exec_command('systemctl is-active systemd-resolved 2>/dev/null')
     if out.strip() != 'active':
         lines.append("systemd-resolved не активен. Редактируем /etc/resolv.conf напрямую.")
         
-        # СОЗДАЁМ БЭКАП
         backup_path = create_backup(checker, '/etc/resolv.conf', 'dns')
         if backup_path:
             lines.append(f"✅ Резервная копия создана: {backup_path}")
@@ -726,4 +719,236 @@ def write_file(checker, filepath, content):
     lines.append(f"=== СОХРАНЕНИЕ ФАЙЛА: {filepath} ===")
     
     # СОЗДАЁМ БЭКАП
-    backup_path = create_backup
+    backup_path = create_backup(checker, filepath, 'configs')
+    if backup_path:
+        lines.append(f"✅ Резервная копия создана: {backup_path}")
+    else:
+        lines.append("⚠️ Не удалось создать резервную копию файла")
+    
+    # Записываем новое содержимое
+    cmd = f"cat > {filepath} <<'EOF'\n{content}\nEOF"
+    out, err = checker.exec_command(cmd + ' 2>&1')
+    if err.strip():
+        lines.append(f"❌ Ошибка записи: {err}")
+        return "\n".join(lines)
+    
+    lines.append("✅ Файл сохранён.")
+    return "\n".join(lines)
+
+def read_file(checker, filepath):
+    out, err = checker.exec_command(f'cat {filepath} 2>/dev/null')
+    if err.strip():
+        return f"❌ Ошибка чтения файла: {err}"
+    return out
+
+def get_config_files(checker, panel_type):
+    files = []
+    common_paths = [
+        '/etc/nginx/nginx.conf',
+        '/etc/nginx/sites-available/',
+        '/etc/nginx/sites-enabled/',
+        '/etc/nginx/conf.d/',
+        '/etc/apache2/apache2.conf',
+        '/etc/apache2/sites-available/',
+        '/etc/apache2/sites-enabled/',
+        '/etc/apache2/conf-available/',
+        '/etc/apache2/conf-enabled/',
+        '/etc/httpd/conf/httpd.conf',
+        '/etc/httpd/conf.d/',
+        '/etc/php/*/php.ini',
+        '/etc/php/*/fpm/php.ini',
+        '/etc/php/*/cli/php.ini',
+        '/etc/mysql/mysql.conf.d/mysqld.cnf',
+        '/etc/mysql/my.cnf',
+    ]
+    
+    panel_paths = {
+        'fastpanel': [
+            '/usr/local/fastpanel/etc/nginx/',
+            '/usr/local/fastpanel/etc/php/',
+            '/etc/nginx/fastpanel2-available/',
+        ],
+        'ispmanager': [
+            '/usr/local/mgr5/etc/nginx/',
+            '/usr/local/mgr5/etc/apache2/',
+            '/usr/local/mgr5/etc/php/',
+        ]
+    }
+    
+    for path in common_paths:
+        out, _ = checker.exec_command(f'ls -d {path} 2>/dev/null && echo "exists"')
+        if out.strip() == 'exists':
+            out2, _ = checker.exec_command(f'ls -1 {path} 2>/dev/null | head -20')
+            if out2.strip():
+                for f in out2.splitlines():
+                    if f.strip():
+                        files.append(f"{path}{f}" if path.endswith('/') else path)
+            else:
+                files.append(path)
+    
+    if panel_type in panel_paths:
+        for path in panel_paths[panel_type]:
+            out, _ = checker.exec_command(f'ls -d {path} 2>/dev/null && echo "exists"')
+            if out.strip() == 'exists':
+                out2, _ = checker.exec_command(f'find {path} -type f -name "*.conf" 2>/dev/null | head -20')
+                if out2.strip():
+                    for f in out2.splitlines():
+                        if f.strip():
+                            files.append(f)
+    
+    return sorted(list(set(files)))[:50]
+
+# ==================== УПРАВЛЕНИЕ ISPmanager ====================
+def ispmanager_restart(checker):
+    lines = []
+    lines.append("=== ПЕРЕЗАПУСК ISPmanager ===")
+    out, err = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr exit 2>&1')
+    if err.strip():
+        lines.append(f"❌ Ошибка: {err}")
+    else:
+        lines.append("✅ Команда на перезапуск отправлена через mgrctl")
+    checker.exec_command('sleep 3')
+    out2, _ = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr sysinfo 2>&1 | head -1')
+    lines.append("✅ Панель работает" if 'error' not in out2.lower() else "⚠️ Панель возможно не запустилась")
+    return "\n".join(lines)
+
+def ispmanager_kill_core(checker):
+    lines = []
+    lines.append("=== ПРИНУДИТЕЛЬНОЕ ЗАВЕРШЕНИЕ CORE ===")
+    checker.exec_command('killall core 2>&1')
+    checker.exec_command('pkill -9 core 2>&1')
+    checker.exec_command('sleep 2')
+    out, _ = checker.exec_command('ps aux | grep core | grep -v grep')
+    lines.append("✅ Процесс core завершён" if not out.strip() else "⚠️ Процесс core всё ещё работает")
+    return "\n".join(lines)
+
+def ispmanager_update(checker):
+    lines = []
+    lines.append("=== ОБНОВЛЕНИЕ ISPmanager ===")
+    lines.append("⚠️ Обновление может занять несколько минут...")
+    out, err = checker.exec_command('/usr/local/mgr5/sbin/pkgupgrade.sh coremanager 2>&1')
+    lines.append("✅ Обновление завершено" if not err.strip() else f"❌ Ошибка обновления: {err}")
+    return "\n".join(lines)
+
+def ispmanager_ssl_issue(checker):
+    lines = []
+    lines.append("=== ПРИНУДИТЕЛЬНЫЙ ВЫПУСК LET'S ENCRYPT ===")
+    lines.append("⚠️ Процесс может занять несколько минут...")
+    out, err = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr letsencrypt.periodic 2>&1')
+    lines.append("✅ Команда выполнена" if not err.strip() else f"❌ Ошибка: {err}")
+    return "\n".join(lines)
+
+def ispmanager_disable(checker):
+    lines = []
+    lines.append("=== ОТКЛЮЧЕНИЕ ISPmanager ===")
+    lines.append("⚠️ Панель будет остановлена!")
+    checker.exec_command('chmod -x /usr/local/mgr5/bin/core 2>&1')
+    checker.exec_command('killall core 2>&1')
+    checker.exec_command('killall ihttpd 2>&1')
+    lines.append("✅ Панель отключена")
+    lines.append("⚠️ Для включения выполните: chmod +x /usr/local/mgr5/bin/core && /usr/local/mgr5/bin/core")
+    return "\n".join(lines)
+
+def ispmanager_disable_geoip(checker):
+    lines = []
+    lines.append("=== ОТКЛЮЧЕНИЕ GEOIP В ISPmanager ===")
+    out, err = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr usrparam setgeoip=off sok=ok 2>&1')
+    lines.append("✅ GeoIP отключён" if not err.strip() else f"❌ Ошибка: {err}")
+    return "\n".join(lines)
+
+def ispmanager_check_cron_path(checker):
+    lines = []
+    lines.append("=== ПРОВЕРКА CRON PATH ===")
+    out, _ = checker.exec_command('crontab -l 2>/dev/null | grep "^PATH="')
+    lines.append(f"⚠️ Найдена переменная PATH в crontab:\n{out}" if out.strip() else "✅ Переменная PATH не найдена в crontab")
+    return "\n".join(lines)
+
+def ispmanager_fix_cron_path(checker):
+    lines = []
+    lines.append("=== ИСПРАВЛЕНИЕ CRON PATH ===")
+    # СОЗДАЁМ БЭКАП CRONTAB
+    backup_path = create_backup(checker, '/tmp/crontab_backup.txt', 'crontab')
+    if backup_path:
+        lines.append(f"✅ Резервная копия crontab создана: {backup_path}")
+    else:
+        lines.append("⚠️ Не удалось создать резервную копию crontab")
+    
+    checker.exec_command('crontab -l > /tmp/crontab_backup.txt 2>/dev/null')
+    out, err = checker.exec_command("crontab -l 2>/dev/null | sed 's/^PATH=/#PATH=/' | crontab - 2>&1")
+    lines.append("✅ Переменная PATH закомментирована" if not err.strip() else f"❌ Ошибка: {err}")
+    return "\n".join(lines)
+
+# ==================== ПОИСК OOM ====================
+def search_oom_logs(checker):
+    """Поиск событий Out-Of-Memory в системных логах"""
+    cmd = "zgrep -B 5 -A 5 -i 'out of memory\\|killed process\\|oom-killer' /var/log/kern.log* /var/log/syslog* 2>/dev/null"
+    out, err = checker.exec_command(cmd)
+    if not out.strip():
+        return "OOM-событий в логах не найдено."
+    
+    lines = out.splitlines()
+    report_lines = []
+    report_lines.append("=== ПОИСК OOM-СОБЫТИЙ В ЛОГАХ ===")
+    report_lines.append("Файлы: /var/log/kern.log*, /var/log/syslog*")
+    report_lines.append("")
+    
+    blocks = []
+    current_block = []
+    for line in lines:
+        if line.strip() == '--':
+            if current_block:
+                blocks.append('\n'.join(current_block))
+                current_block = []
+        else:
+            current_block.append(line)
+    if current_block:
+        blocks.append('\n'.join(current_block))
+    
+    if not blocks:
+        return "OOM-событий не обнаружено (пустые блоки)."
+    
+    for i, block in enumerate(blocks, 1):
+        report_lines.append(f"--- Событие #{i} ---")
+        report_lines.append(block)
+        report_lines.append("")
+    
+    return "\n".join(report_lines)
+
+# ==================== ЗАМЕНА IP ====================
+def replace_ipv4(checker, old_ip, new_ip):
+    lines = []
+    lines.append(f"=== ЗАМЕНА IPv4: {old_ip} -> {new_ip} ===")
+    old_escaped = old_ip.replace('.', '\.')
+    cmd = f"find /etc -type f -name '*.conf' -exec sed -i -e 's#{old_escaped}#{new_ip}#g' '{{}}' \\; 2>/dev/null"
+    out, err = checker.exec_command(cmd)
+    if err.strip():
+        lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
+    lines.append("✅ IPv4 заменён во всех .conf-файлах в /etc.")
+    lines.extend(restart_services(checker))
+    return "\n".join(lines)
+
+def replace_ipv6(checker, old_ip, new_ip):
+    lines = []
+    lines.append(f"=== ЗАМЕНА IPv6: {old_ip} -> {new_ip} ===")
+    cmd = f"find /etc -type f -exec sed -i 's/{old_ip}/{new_ip}/g' '{{}}' + 2>/dev/null"
+    out, err = checker.exec_command(cmd)
+    if err.strip():
+        lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
+    lines.append("✅ IPv6 заменён во всех файлах в /etc.")
+    lines.extend(restart_services(checker))
+    return "\n".join(lines)
+
+# ==================== ПЕРЕЗАПУСК СЛУЖБ ====================
+def restart_services(checker):
+    lines = []
+    lines.append("\n=== ПЕРЕЗАПУСК СЛУЖБ ===")
+    services = ['nginx', 'mysql', 'apache2']
+    for svc in services:
+        out, _ = checker.exec_command(f'systemctl list-unit-files | grep -q "^{svc}.service" && echo "yes" || echo "no"')
+        if out.strip() == 'yes':
+            checker.exec_command(f'systemctl restart {svc} 2>/dev/null')
+            status, _ = checker.exec_command(f'systemctl is-active {svc} 2>/dev/null')
+            lines.append(f"✅ {svc} {'перезапущен' if status.strip() == 'active' else 'не запустился'}")
+        else:
+            lines.append(f"⏭️ {svc} не установлен")
+    return lines
