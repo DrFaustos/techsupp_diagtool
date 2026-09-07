@@ -77,7 +77,6 @@ def detect_system_theme():
 
 class DiagnosticApp:
     def __init__(self):
-        # Сохраняем начальную тему как атрибут
         self.initial_theme = detect_system_theme()
         self.root = tb.Window(themename=self.initial_theme)
         self.root.title("SSH Диагностика сервера")
@@ -112,10 +111,27 @@ class DiagnosticApp:
             selectbackground=colors['selectbackground']
         )
 
+    def apply_scrollbar_style(self, theme_name=None):
+        """Настраивает ширину и цвет вертикальной полосы прокрутки"""
+        if theme_name is None:
+            theme_name = self.root.style.theme.name
+
+        style = ttk.Style()
+        style.configure('Custom.Vertical.TScrollbar',
+                        width=20,
+                        background='#0078d4',
+                        troughcolor='#2a2a2a' if theme_name in DARK_THEMES else '#e0e0e0')
+        style.map('Custom.Vertical.TScrollbar',
+                  background=[('active', '#1084d4')])
+
+        if hasattr(self, 'output') and hasattr(self.output, 'vbar'):
+            self.output.vbar.config(style='Custom.Vertical.TScrollbar')
+
     def switch_theme(self, theme_name):
         try:
             self.root.style.theme_use(theme_name)
             self.update_output_colors(theme_name)
+            self.apply_scrollbar_style(theme_name)
             self.current_theme = theme_name
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось переключить тему: {e}")
@@ -485,6 +501,7 @@ class DiagnosticApp:
         )
         self.output.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         self.update_output_colors(self.initial_theme)
+        self.apply_scrollbar_style(self.initial_theme)
 
         # ---------- ИНТЕРАКТИВНЫЙ ТЕРМИНАЛ ----------
         cmd_frame = tb.Frame(self.root, bootstyle="secondary")
@@ -643,7 +660,7 @@ class DiagnosticApp:
         if not self.checker:
             return
         if btn:
-            btn.config(state=tk.DISABLED, text="Выполняется...")
+            btn.config(state=tk.DISABLED)
         self.progress.pack(pady=5)
         self.progress.start(10)
 
@@ -656,8 +673,7 @@ class DiagnosticApp:
             finally:
                 self.root.after(0, self._stop_progress)
                 if btn:
-                    original_text = btn.cget('text').replace(' (Выполняется...)', '')
-                    self.root.after(0, lambda: btn.config(state=tk.NORMAL, text=original_text))
+                    self.root.after(0, lambda: btn.config(state=tk.NORMAL))
 
         thread = threading.Thread(target=wrapper)
         thread.daemon = True
@@ -1087,6 +1103,7 @@ class DiagnosticApp:
         text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         text.insert(tk.END, "\n".join(history))
         text.config(state=tk.DISABLED)
+
     def run_config_editor(self):
         if not self.checker:
             return

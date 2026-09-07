@@ -255,9 +255,10 @@ def filter_by_date(entry, year=None, month=None, day=None):
 
 # ==================== ФУНКЦИИ ДЛЯ ОТДЕЛЬНЫХ ПРОВЕРОК ====================
 def disk_memory_report(checker):
-    out, _ = checker.exec_command('df -h; df -i; free -m')
-    parts = out.strip().split('\n\n')
-    return f"=== ДИСКИ И ПАМЯТЬ ===\nДиски (df -h):\n{parts[0] if len(parts) > 0 else ''}\n\nInodes (df -i):\n{parts[1] if len(parts) > 1 else ''}\n\nПамять (free -m):\n{parts[2] if len(parts) > 2 else ''}"
+    out_h, _ = checker.exec_command('df -h')
+    out_i, _ = checker.exec_command('df -i')
+    out_f, _ = checker.exec_command('free -m')
+    return f"=== ДИСКИ И ПАМЯТЬ ===\nДиски (df -h):\n{out_h}\n\nInodes (df -i):\n{out_i}\n\nПамять (free -m):\n{out_f}"
 
 def network_report(checker):
     out_a, _ = checker.exec_command('ip a')
