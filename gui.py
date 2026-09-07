@@ -34,39 +34,55 @@ from diagnostic import (
 from ssh_client import ServerChecker
 
 
+# ==================== НАСТРОЙКИ ТЕМ ====================
+DARK_THEMES = ['darkly', 'cyborg', 'superhero', 'vapor', 'solar']
+LIGHT_THEMES = ['flatly', 'litera', 'minty', 'pulse', 'cosmo', 'sandstone']
+
+def get_theme_colors(theme_name):
+    """Возвращает цвета для поля вывода в зависимости от темы"""
+    if theme_name in DARK_THEMES:
+        return {
+            'bg': '#1a1a1a',
+            'fg': '#d3d7cf',
+            'insertbackground': 'white',
+            'selectbackground': '#3465a4'
+        }
+    else:
+        return {
+            'bg': '#ffffff',
+            'fg': '#000000',
+            'insertbackground': 'black',
+            'selectbackground': '#3465a4'
+        }
+
 def detect_system_theme():
     """
     Определяет тему ОС (Linux/GNOME) и возвращает имя темы для ttkbootstrap.
     """
     try:
-        # Для GNOME
         result = subprocess.run(
             ['gsettings', 'get', 'org.gnome.desktop.interface', 'gtk-theme'],
             capture_output=True, text=True, timeout=2
         )
         if result.returncode == 0:
             theme = result.stdout.strip().strip("'")
-            if 'dark' in theme.lower():
-                return 'darkly'   # Тёмная тема
+            if 'dark' in theme.lower() or 'black' in theme.lower():
+                return 'darkly'
             else:
-                return 'flatly'   # Светлая тема
+                return 'flatly'
     except Exception:
         pass
-
-    # Если не удалось определить — используем тёмную тему по умолчанию
     return 'darkly'
 
 
 class DiagnosticApp:
     def __init__(self):
-        # Определяем тему
-        theme = detect_system_theme()
-        self.root = tb.Window(themename=theme)
+        initial_theme = detect_system_theme()
+        self.root = tb.Window(themename=initial_theme)
         self.root.title("SSH Диагностика сервера")
         self.root.geometry("1100x720")
         self.root.minsize(1000, 650)
 
-        # Переменные для данных подключения
         self.ip_var = tk.StringVar()
         self.port_var = tk.StringVar(value="22")
         self.user_var = tk.StringVar(value="root")
@@ -74,22 +90,35 @@ class DiagnosticApp:
         self.key_var = tk.StringVar(value="~/.ssh/id_rsa")
         self.panel_var = tk.StringVar(value="auto")
 
-        # Состояние подключения
         self.checker = None
         self.panel_type = None
 
-        # История команд
         self.cmd_history = []
         self.history_index = -1
 
-        # Создаём виджеты
         self.create_widgets()
-
-        # Фокус на поле ввода команд при старте
         self.cmd_entry.focus_set()
 
+    def update_output_colors(self, theme_name=None):
+        if theme_name is None:
+            theme_name = self.root.style.theme.name
+        colors = get_theme_colors(theme_name)
+        self.output.config(
+            bg=colors['bg'],
+            fg=colors['fg'],
+            insertbackground=colors['insertbackground'],
+            selectbackground=colors['selectbackground']
+        )
+
+    def switch_theme(self, theme_name):
+        try:
+            self.root.style.theme_use(theme_name)
+            self.update_output_colors(theme_name)
+            self.current_theme = theme_name
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось переключить тему: {e}")
+
     def create_widgets(self):
-        # Верхняя панель: ввод данных
         top_frame = tb.Frame(self.root, bootstyle="secondary")
         top_frame.pack(fill=tk.X, padx=10, pady=5)
 
@@ -164,20 +193,22 @@ class DiagnosticApp:
         btn_frame = tb.Frame(self.root, bootstyle="secondary")
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
+        # Подключение
         self.connect_btn = tb.Button(
             btn_frame,
             text="Подключиться",
             command=self.connect,
-            bootstyle="success-outline"
+            bootstyle="success"
         )
         self.connect_btn.pack(side=tk.LEFT, padx=5)
 
+        # Основные кнопки (используем solid для лучшей видимости)
         self.full_btn = tb.Button(
             btn_frame,
             text="Полная диагностика",
             command=self.run_full,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.full_btn.pack(side=tk.LEFT, padx=5)
 
@@ -186,7 +217,7 @@ class DiagnosticApp:
             text="Диски и память",
             command=self.run_disk_memory,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.disk_btn.pack(side=tk.LEFT, padx=5)
 
@@ -195,7 +226,7 @@ class DiagnosticApp:
             text="Сеть",
             command=self.run_network,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.network_btn.pack(side=tk.LEFT, padx=5)
 
@@ -204,7 +235,7 @@ class DiagnosticApp:
             text="Фаервол",
             command=self.run_firewall,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.firewall_btn.pack(side=tk.LEFT, padx=5)
 
@@ -213,7 +244,7 @@ class DiagnosticApp:
             text="Конфиги веб",
             command=self.run_config,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.config_btn.pack(side=tk.LEFT, padx=5)
 
@@ -222,7 +253,7 @@ class DiagnosticApp:
             text="Логи сайтов",
             command=self.run_logs,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.logs_btn.pack(side=tk.LEFT, padx=5)
 
@@ -231,7 +262,7 @@ class DiagnosticApp:
             text="Анализ логов доступа",
             command=self.run_access_analysis,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.access_btn.pack(side=tk.LEFT, padx=5)
 
@@ -240,7 +271,7 @@ class DiagnosticApp:
             text="Поиск OOM",
             command=self.run_oom_search,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.oom_btn.pack(side=tk.LEFT, padx=5)
 
@@ -249,7 +280,7 @@ class DiagnosticApp:
             text="DNS-проверка",
             command=self.run_dns_check,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.dns_btn.pack(side=tk.LEFT, padx=5)
 
@@ -258,7 +289,7 @@ class DiagnosticApp:
             text="DNS-резолверы",
             command=self.run_dns_resolvers,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.resolv_btn.pack(side=tk.LEFT, padx=5)
 
@@ -267,7 +298,7 @@ class DiagnosticApp:
             text="Изменить DNS",
             command=self.run_edit_dns,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.edit_dns_btn.pack(side=tk.LEFT, padx=5)
 
@@ -276,7 +307,7 @@ class DiagnosticApp:
             text="Заменить IPv4",
             command=self.run_replace_ipv4,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.ipv4_btn.pack(side=tk.LEFT, padx=5)
 
@@ -285,7 +316,7 @@ class DiagnosticApp:
             text="Заменить IPv6",
             command=self.run_replace_ipv6,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.ipv6_btn.pack(side=tk.LEFT, padx=5)
 
@@ -294,7 +325,7 @@ class DiagnosticApp:
             text="Перезапустить службы",
             command=self.run_restart_services,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.restart_btn.pack(side=tk.LEFT, padx=5)
 
@@ -303,11 +334,39 @@ class DiagnosticApp:
             text="Редактор конфигов",
             command=self.run_config_editor,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.config_editor_btn.pack(side=tk.LEFT, padx=5)
 
-        # Кнопки управления ISPmanager (будут видны только если панель = ispmanager)
+        # ---------- ПЕРЕКЛЮЧАТЕЛЬ ТЕМ ----------
+        theme_frame = tb.Frame(btn_frame, bootstyle="secondary")
+        theme_frame.pack(side=tk.RIGHT, padx=10)
+
+        tb.Label(theme_frame, text="Тема:", bootstyle="inverse-secondary").pack(side=tk.LEFT, padx=5)
+
+        available_themes = DARK_THEMES + LIGHT_THEMES
+        self.theme_var = tk.StringVar(value=detect_system_theme())
+
+        theme_combo = ttk.Combobox(
+            theme_frame,
+            textvariable=self.theme_var,
+            values=available_themes,
+            state='readonly',
+            width=12
+        )
+        theme_combo.pack(side=tk.LEFT, padx=5)
+        theme_combo.bind('<<ComboboxSelected>>', lambda e: self.switch_theme(self.theme_var.get()))
+
+        self.toggle_theme_btn = tb.Button(
+            theme_frame,
+            text="🌓",
+            command=self.toggle_theme,
+            bootstyle="secondary",
+            width=3
+        )
+        self.toggle_theme_btn.pack(side=tk.LEFT, padx=5)
+
+        # ---------- КНОПКИ ISPmanager ----------
         self.ispmanager_frame = tb.Frame(btn_frame, bootstyle="secondary")
         self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
         self.ispmanager_frame.pack_forget()
@@ -317,7 +376,7 @@ class DiagnosticApp:
             text="Перезапустить панель",
             command=self.run_isp_restart,
             state=tk.DISABLED,
-            bootstyle="warning-outline"
+            bootstyle="warning"
         )
         self.isp_restart_btn.pack(side=tk.LEFT, padx=2)
 
@@ -326,7 +385,7 @@ class DiagnosticApp:
             text="Kill core",
             command=self.run_isp_kill,
             state=tk.DISABLED,
-            bootstyle="danger-outline"
+            bootstyle="danger"
         )
         self.isp_kill_btn.pack(side=tk.LEFT, padx=2)
 
@@ -335,7 +394,7 @@ class DiagnosticApp:
             text="Обновить панель",
             command=self.run_isp_update,
             state=tk.DISABLED,
-            bootstyle="info-outline"
+            bootstyle="info"
         )
         self.isp_update_btn.pack(side=tk.LEFT, padx=2)
 
@@ -344,7 +403,7 @@ class DiagnosticApp:
             text="Выпуск SSL",
             command=self.run_isp_ssl,
             state=tk.DISABLED,
-            bootstyle="primary-outline"
+            bootstyle="primary"
         )
         self.isp_ssl_btn.pack(side=tk.LEFT, padx=2)
 
@@ -353,7 +412,7 @@ class DiagnosticApp:
             text="Отключить панель",
             command=self.run_isp_disable,
             state=tk.DISABLED,
-            bootstyle="danger-outline"
+            bootstyle="danger"
         )
         self.isp_disable_btn.pack(side=tk.LEFT, padx=2)
 
@@ -362,7 +421,7 @@ class DiagnosticApp:
             text="Отключить GeoIP",
             command=self.run_isp_geoip,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.isp_geoip_btn.pack(side=tk.LEFT, padx=2)
 
@@ -371,7 +430,7 @@ class DiagnosticApp:
             text="Проверить CRON",
             command=self.run_isp_cron,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.isp_cron_btn.pack(side=tk.LEFT, padx=2)
 
@@ -380,11 +439,11 @@ class DiagnosticApp:
             text="Исправить CRON",
             command=self.run_isp_fix_cron,
             state=tk.DISABLED,
-            bootstyle="warning-outline"
+            bootstyle="warning"
         )
         self.isp_fix_cron_btn.pack(side=tk.LEFT, padx=2)
 
-        # Кнопки управления swap (второй ряд)
+        # ---------- КНОПКИ SWAP ----------
         swap_frame = tb.Frame(self.root, bootstyle="secondary")
         swap_frame.pack(fill=tk.X, padx=10, pady=5)
 
@@ -393,7 +452,7 @@ class DiagnosticApp:
             text="Создать swap файл",
             command=self.create_swap,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.swap_btn.pack(side=tk.LEFT, padx=5)
 
@@ -402,11 +461,11 @@ class DiagnosticApp:
             text="Прописать swap в fstab",
             command=self.add_swap_to_fstab,
             state=tk.DISABLED,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.fstab_btn.pack(side=tk.LEFT, padx=5)
 
-        # Прогресс-бар (изначально скрыт)
+        # ---------- ПРОГРЕСС-БАР ----------
         self.progress = tb.Progressbar(
             self.root,
             bootstyle="info-striped",
@@ -416,15 +475,16 @@ class DiagnosticApp:
         self.progress.pack(pady=5)
         self.progress.pack_forget()
 
-        # Текстовое поле для вывода
+        # ---------- ТЕКСТОВОЕ ПОЛЕ ВЫВОДА ----------
         self.output = scrolledtext.ScrolledText(
             self.root,
             wrap=tk.WORD,
             font=("Courier", 10)
         )
         self.output.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.update_output_colors(initial_theme)
 
-        # Нижняя панель: интерактивная командная строка
+        # ---------- ИНТЕРАКТИВНЫЙ ТЕРМИНАЛ ----------
         cmd_frame = tb.Frame(self.root, bootstyle="secondary")
         cmd_frame.pack(fill=tk.X, padx=10, pady=5)
 
@@ -436,13 +496,14 @@ class DiagnosticApp:
         self.cmd_entry.bind("<Return>", self.send_command)
         self.cmd_entry.bind("<Up>", self.history_up)
         self.cmd_entry.bind("<Down>", self.history_down)
+        self.cmd_entry.bind("<Tab>", self.autocomplete)  # Добавляем автодополнение
 
         self.send_btn = tb.Button(
             cmd_frame,
             text="Send",
             command=self.send_command,
             state=tk.DISABLED,
-            bootstyle="primary-outline"
+            bootstyle="primary"
         )
         self.send_btn.pack(side=tk.LEFT, padx=5)
 
@@ -450,11 +511,33 @@ class DiagnosticApp:
             cmd_frame,
             text="История",
             command=self.show_bash_history,
-            bootstyle="secondary-outline"
+            bootstyle="secondary"
         )
         self.history_btn.pack(side=tk.LEFT, padx=5)
 
         self.log("Ожидание подключения...")
+
+    # ---------- АВТОДОПОЛНЕНИЕ ----------
+    def autocomplete(self, event):
+        """Простое автодополнение по истории команд при нажатии Tab"""
+        current = self.cmd_entry.get()
+        if not current:
+            return "break"
+        matches = [cmd for cmd in self.cmd_history if cmd.startswith(current)]
+        if matches:
+            # Подставляем первое совпадение
+            self.cmd_entry.delete(0, tk.END)
+            self.cmd_entry.insert(0, matches[0])
+        return "break"
+
+    def toggle_theme(self):
+        current_theme = self.root.style.theme.name
+        if current_theme in DARK_THEMES:
+            new_theme = 'flatly'
+        else:
+            new_theme = 'darkly'
+        self.switch_theme(new_theme)
+        self.theme_var.set(new_theme)
 
     def browse_key(self):
         filename = filedialog.askopenfilename()
@@ -462,7 +545,6 @@ class DiagnosticApp:
             self.key_var.set(filename)
 
     def log(self, text):
-        """Добавляет текст в поле вывода и прокручивает вниз"""
         self.output.insert(tk.END, text + "\n")
         self.output.see(tk.END)
 
@@ -514,7 +596,7 @@ class DiagnosticApp:
 
         self.log(f"Панель управления: {self.panel_type}")
 
-        # Активируем кнопки диагностики
+        # Активируем кнопки
         self.full_btn.config(state=tk.NORMAL)
         self.disk_btn.config(state=tk.NORMAL)
         self.network_btn.config(state=tk.NORMAL)
@@ -534,7 +616,7 @@ class DiagnosticApp:
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
 
-        # Показываем/скрываем кнопки ISPmanager
+        # ISPmanager кнопки
         if self.panel_type == 'ispmanager':
             self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
             for btn in [
@@ -552,20 +634,15 @@ class DiagnosticApp:
             ]:
                 btn.config(state=tk.DISABLED)
 
-        self.connect_btn.config(text="Отключиться", bootstyle="danger-outline",
-                                command=self.disconnect)
+        self.connect_btn.config(text="Отключиться", bootstyle="danger", command=self.disconnect)
         self.cmd_entry.focus_set()
 
-    # ==================== ФУНКЦИИ ДЛЯ ФОНОВЫХ ПОТОКОВ ====================
+    # ---------- ФОНОВЫЕ ЗАДАЧИ ----------
     def _run_in_thread(self, target_func, btn=None, *args, **kwargs):
-        """Запускает функцию в фоновом потоке с прогресс-баром"""
         if not self.checker:
             return
-
         if btn:
             btn.config(state=tk.DISABLED, text="Выполняется...")
-
-        # Показываем прогресс-бар
         self.progress.pack(pady=5)
         self.progress.start(10)
 
@@ -579,27 +656,23 @@ class DiagnosticApp:
                 self.root.after(0, self._stop_progress)
                 if btn:
                     original_text = btn.cget('text').replace(' (Выполняется...)', '')
-                    self.root.after(0, lambda: btn.config(state=tk.NORMAL,
-                                                            text=original_text))
+                    self.root.after(0, lambda: btn.config(state=tk.NORMAL, text=original_text))
 
         thread = threading.Thread(target=wrapper)
         thread.daemon = True
         thread.start()
 
     def _stop_progress(self):
-        """Останавливает и скрывает прогресс-бар"""
         self.progress.stop()
         self.progress.pack_forget()
 
     def _display_result(self, text):
-        """Безопасно выводит результат в GUI из любого потока"""
         self.log("\n" + "="*60)
         self.log(text)
 
-    # ==================== ДИАГНОСТИКИ ====================
+    # ---------- ДИАГНОСТИКИ ----------
     def run_full(self):
-        self._run_in_thread(full_diagnostic_report, self.full_btn,
-                           self.checker, self.panel_type)
+        self._run_in_thread(full_diagnostic_report, self.full_btn, self.checker, self.panel_type)
 
     def run_disk_memory(self):
         self._run_in_thread(disk_memory_report, self.disk_btn, self.checker)
@@ -614,13 +687,12 @@ class DiagnosticApp:
         self._run_in_thread(web_config_report, self.config_btn, self.checker)
 
     def run_logs(self):
-        self._run_in_thread(site_logs_report, self.logs_btn,
-                           self.checker, self.panel_type)
+        self._run_in_thread(site_logs_report, self.logs_btn, self.checker, self.panel_type)
 
     def run_oom_search(self):
         self._run_in_thread(search_oom_logs, self.oom_btn, self.checker)
 
-    # ==================== АНАЛИЗ ЛОГОВ ДОСТУПА ====================
+    # ---------- АНАЛИЗ ЛОГОВ ДОСТУПА ----------
     def run_access_analysis(self):
         if not self.checker:
             return
@@ -630,7 +702,9 @@ class DiagnosticApp:
         if domains:
             domain_var.set(domains[0])
 
-        dialog = tb.Toplevel(self.root, title="Анализ логов доступа")
+        # Исправление ошибки Toplevel
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Анализ логов доступа")
         dialog.geometry("500x320")
         dialog.transient(self.root)
         dialog.grab_set()
@@ -642,8 +716,7 @@ class DiagnosticApp:
         domain_combo = ttk.Combobox(
             dialog, textvariable=domain_var, values=domains, state='normal'
         )
-        domain_combo.grid(row=row, column=1, columnspan=3,
-                         padx=5, pady=5, sticky='ew')
+        domain_combo.grid(row=row, column=1, columnspan=3, padx=5, pady=5, sticky='ew')
         if not domains:
             domain_combo.set('')
         row += 1
@@ -657,34 +730,20 @@ class DiagnosticApp:
         )
         row += 1
 
-        tb.Label(dialog, text="Фильтр по дате (опционально):",
-                bootstyle="inverse-secondary").grid(
+        tb.Label(dialog, text="Фильтр по дате (опционально):", bootstyle="inverse-secondary").grid(
             row=row, column=0, sticky='e', padx=5, pady=5
         )
         year_var = tk.StringVar()
         month_var = tk.StringVar()
         day_var = tk.StringVar()
         frame_date = tb.Frame(dialog, bootstyle="secondary")
-        frame_date.grid(row=row, column=1, columnspan=3,
-                       sticky='w', padx=5, pady=5)
-        tb.Entry(frame_date, textvariable=year_var, width=5).pack(
-            side='left', padx=2
-        )
-        tb.Label(frame_date, text="ГГГГ", bootstyle="inverse-secondary").pack(
-            side='left', padx=2
-        )
-        tb.Entry(frame_date, textvariable=month_var, width=3).pack(
-            side='left', padx=2
-        )
-        tb.Label(frame_date, text="ММ", bootstyle="inverse-secondary").pack(
-            side='left', padx=2
-        )
-        tb.Entry(frame_date, textvariable=day_var, width=3).pack(
-            side='left', padx=2
-        )
-        tb.Label(frame_date, text="ДД", bootstyle="inverse-secondary").pack(
-            side='left', padx=2
-        )
+        frame_date.grid(row=row, column=1, columnspan=3, sticky='w', padx=5, pady=5)
+        tb.Entry(frame_date, textvariable=year_var, width=5).pack(side='left', padx=2)
+        tb.Label(frame_date, text="ГГГГ", bootstyle="inverse-secondary").pack(side='left', padx=2)
+        tb.Entry(frame_date, textvariable=month_var, width=3).pack(side='left', padx=2)
+        tb.Label(frame_date, text="ММ", bootstyle="inverse-secondary").pack(side='left', padx=2)
+        tb.Entry(frame_date, textvariable=day_var, width=3).pack(side='left', padx=2)
+        tb.Label(frame_date, text="ДД", bootstyle="inverse-secondary").pack(side='left', padx=2)
         row += 1
 
         last_result = [None]
@@ -702,18 +761,12 @@ class DiagnosticApp:
             month = int(month_var.get()) if month_var.get().strip() else None
             day = int(day_var.get()) if day_var.get().strip() else None
 
-            for val, name in [
-                (year, 'год'),
-                (month, 'месяц'),
-                (day, 'день')
-            ]:
+            for val, name in [(year, 'год'), (month, 'месяц'), (day, 'день')]:
                 if val is not None and not (
                     1 <= val <= 9999 if name == 'год' else
                     (1 <= val <= 12 if name == 'месяц' else 1 <= val <= 31)
                 ):
-                    messagebox.showerror(
-                        "Ошибка", f"Некорректное значение для {name}"
-                    )
+                    messagebox.showerror("Ошибка", f"Некорректное значение для {name}")
                     return
 
             dialog.destroy()
@@ -724,10 +777,7 @@ class DiagnosticApp:
 
         def on_save():
             if last_result[0] is None:
-                messagebox.showwarning(
-                    "Нет данных",
-                    "Сначала выполните анализ, чтобы сохранить отчёт."
-                )
+                messagebox.showwarning("Нет данных", "Сначала выполните анализ, чтобы сохранить отчёт.")
                 return
             filename = filedialog.asksaveasfilename(
                 defaultextension=".txt",
@@ -743,24 +793,14 @@ class DiagnosticApp:
 
         btn_frame = tb.Frame(dialog, bootstyle="secondary")
         btn_frame.grid(row=row, column=0, columnspan=4, pady=10)
-        tb.Button(
-            btn_frame,
-            text="Анализировать",
-            command=on_analyze,
-            bootstyle="success-outline"
-        ).pack(side='left', padx=5)
-        tb.Button(
-            btn_frame,
-            text="Сохранить отчёт",
-            command=on_save,
-            bootstyle="primary-outline"
-        ).pack(side='left', padx=5)
+        tb.Button(btn_frame, text="Анализировать", command=on_analyze, bootstyle="success").pack(side='left', padx=5)
+        tb.Button(btn_frame, text="Сохранить отчёт", command=on_save, bootstyle="primary").pack(side='left', padx=5)
 
         dialog.columnconfigure(1, weight=1)
         dialog.columnconfigure(2, weight=1)
         dialog.columnconfigure(3, weight=1)
 
-    # ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
+    # ---------- ОСТАЛЬНЫЕ ФУНКЦИИ ----------
     def create_swap(self):
         if not self.checker:
             return
@@ -782,15 +822,11 @@ class DiagnosticApp:
         out, _ = self.checker.exec_command(cmd)
         free_mb = int(out.strip()) if out.strip().isdigit() else 0
         if free_mb < size_mb + 100:
-            self.log(
-                f"❌ Недостаточно свободного места "
-                f"(доступно {free_mb} МБ, требуется ~{size_mb+100} МБ)"
-            )
+            self.log(f"❌ Недостаточно свободного места (доступно {free_mb} МБ, требуется ~{size_mb+100} МБ)")
             return
 
         cmds = [
-            f"fallocate -l {size_mb}M /swapfile 2>/dev/null || "
-            f"dd if=/dev/zero of=/swapfile bs=1M count={size_mb}",
+            f"fallocate -l {size_mb}M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count={size_mb}",
             "chmod 600 /swapfile",
             "mkswap /swapfile",
             "swapon /swapfile"
@@ -810,9 +846,7 @@ class DiagnosticApp:
         if not self.checker:
             return
         self.log("\n=== Добавление /swapfile в /etc/fstab ===")
-        out, _ = self.checker.exec_command(
-            "grep -q '/swapfile' /etc/fstab && echo 'yes' || echo 'no'"
-        )
+        out, _ = self.checker.exec_command("grep -q '/swapfile' /etc/fstab && echo 'yes' || echo 'no'")
         if out.strip() == 'yes':
             self.log("Запись /swapfile уже присутствует в fstab.")
             return
@@ -835,7 +869,8 @@ class DiagnosticApp:
         if domains:
             domain_var.set(domains[0])
 
-        dialog = tb.Toplevel(self.root, title="DNS-проверка")
+        dialog = tb.Toplevel(self.root)
+        dialog.title("DNS-проверка")
         dialog.geometry("450x230")
         dialog.transient(self.root)
         dialog.grab_set()
@@ -872,12 +907,9 @@ class DiagnosticApp:
                 result = dns_report(self.checker, domain)
             self.log(result)
 
-        tb.Button(
-            dialog,
-            text="Проверить",
-            command=on_check,
-            bootstyle="success-outline"
-        ).grid(row=2, column=0, columnspan=2, pady=10)
+        tb.Button(dialog, text="Проверить", command=on_check, bootstyle="success").grid(
+            row=2, column=0, columnspan=2, pady=10
+        )
         dialog.columnconfigure(1, weight=1)
 
     def run_dns_resolvers(self):
@@ -890,16 +922,13 @@ class DiagnosticApp:
             return
         current_ns = get_current_dns_resolvers(self.checker)
 
-        dialog = tb.Toplevel(self.root, title="Редактирование DNS-резолверов")
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Редактирование DNS-резолверов")
         dialog.geometry("500x400")
         dialog.transient(self.root)
         dialog.grab_set()
 
-        tb.Label(
-            dialog,
-            text="DNS-серверы (нажмите для редактирования):",
-            bootstyle="inverse-secondary"
-        ).pack(pady=5)
+        tb.Label(dialog, text="DNS-серверы (нажмите для редактирования):", bootstyle="inverse-secondary").pack(pady=5)
 
         listbox = tk.Listbox(
             dialog,
@@ -916,11 +945,7 @@ class DiagnosticApp:
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
         def add_ns():
-            new_ns = simpledialog.askstring(
-                "Добавить DNS",
-                "Введите IP-адрес DNS-сервера:",
-                parent=dialog
-            )
+            new_ns = simpledialog.askstring("Добавить DNS", "Введите IP-адрес DNS-сервера:", parent=dialog)
             if new_ns and re.match(r'^(\d{1,3}\.){3}\d{1,3}$', new_ns):
                 listbox.insert(tk.END, new_ns)
             elif new_ns:
@@ -929,16 +954,10 @@ class DiagnosticApp:
         def edit_ns():
             selection = listbox.curselection()
             if not selection:
-                messagebox.showwarning("Нет выбора",
-                                     "Выберите DNS-сервер для редактирования")
+                messagebox.showwarning("Нет выбора", "Выберите DNS-сервер для редактирования")
                 return
             old = listbox.get(selection[0])
-            new = simpledialog.askstring(
-                "Редактировать DNS",
-                "Введите новый IP-адрес:",
-                initialvalue=old,
-                parent=dialog
-            )
+            new = simpledialog.askstring("Редактировать DNS", "Введите новый IP-адрес:", initialvalue=old, parent=dialog)
             if new and re.match(r'^(\d{1,3}\.){3}\d{1,3}$', new):
                 listbox.delete(selection[0])
                 listbox.insert(selection[0], new)
@@ -948,8 +967,7 @@ class DiagnosticApp:
         def delete_ns():
             selection = listbox.curselection()
             if not selection:
-                messagebox.showwarning("Нет выбора",
-                                     "Выберите DNS-сервер для удаления")
+                messagebox.showwarning("Нет выбора", "Выберите DNS-сервер для удаления")
                 return
             listbox.delete(selection[0])
 
@@ -958,50 +976,16 @@ class DiagnosticApp:
             for ns in preset_list:
                 listbox.insert(tk.END, ns)
 
-        tb.Button(
-            btn_frame,
-            text="Добавить",
-            command=add_ns,
-            bootstyle="success-outline"
-        ).pack(side=tk.LEFT, padx=2)
-        tb.Button(
-            btn_frame,
-            text="Редактировать",
-            command=edit_ns,
-            bootstyle="primary-outline"
-        ).pack(side=tk.LEFT, padx=2)
-        tb.Button(
-            btn_frame,
-            text="Удалить",
-            command=delete_ns,
-            bootstyle="danger-outline"
-        ).pack(side=tk.LEFT, padx=2)
+        tb.Button(btn_frame, text="Добавить", command=add_ns, bootstyle="success").pack(side=tk.LEFT, padx=2)
+        tb.Button(btn_frame, text="Редактировать", command=edit_ns, bootstyle="primary").pack(side=tk.LEFT, padx=2)
+        tb.Button(btn_frame, text="Удалить", command=delete_ns, bootstyle="danger").pack(side=tk.LEFT, padx=2)
 
         preset_frame = tb.Frame(dialog, bootstyle="secondary")
         preset_frame.pack(fill=tk.X, padx=10, pady=5)
-        tb.Label(
-            preset_frame,
-            text="Предустановленные наборы:",
-            bootstyle="inverse-secondary"
-        ).pack(side=tk.LEFT, padx=5)
-        tb.Button(
-            preset_frame,
-            text="Google",
-            command=lambda: set_preset(['8.8.8.8', '8.8.4.4']),
-            bootstyle="info-outline"
-        ).pack(side=tk.LEFT, padx=2)
-        tb.Button(
-            preset_frame,
-            text="Cloudflare",
-            command=lambda: set_preset(['1.1.1.1', '1.0.0.1']),
-            bootstyle="info-outline"
-        ).pack(side=tk.LEFT, padx=2)
-        tb.Button(
-            preset_frame,
-            text="OpenDNS",
-            command=lambda: set_preset(['208.67.222.222', '208.67.220.220']),
-            bootstyle="info-outline"
-        ).pack(side=tk.LEFT, padx=2)
+        tb.Label(preset_frame, text="Предустановленные наборы:", bootstyle="inverse-secondary").pack(side=tk.LEFT, padx=5)
+        tb.Button(preset_frame, text="Google", command=lambda: set_preset(['8.8.8.8', '8.8.4.4']), bootstyle="info").pack(side=tk.LEFT, padx=2)
+        tb.Button(preset_frame, text="Cloudflare", command=lambda: set_preset(['1.1.1.1', '1.0.0.1']), bootstyle="info").pack(side=tk.LEFT, padx=2)
+        tb.Button(preset_frame, text="OpenDNS", command=lambda: set_preset(['208.67.222.222', '208.67.220.220']), bootstyle="info").pack(side=tk.LEFT, padx=2)
 
         def apply_changes():
             new_list = []
@@ -1010,51 +994,25 @@ class DiagnosticApp:
                 if ns.strip():
                     new_list.append(ns.strip())
             if not new_list:
-                messagebox.showwarning("Пустой список",
-                                     "Должен быть хотя бы один DNS-сервер")
+                messagebox.showwarning("Пустой список", "Должен быть хотя бы один DNS-сервер")
                 return
-            if messagebox.askyesno(
-                "Подтверждение",
-                f"Установить DNS:\n{', '.join(new_list)}?",
-                parent=self.root
-            ):
+            if messagebox.askyesno("Подтверждение", f"Установить DNS:\n{', '.join(new_list)}?", parent=self.root):
                 dialog.destroy()
-                self._run_in_thread(
-                    set_dns_resolvers, self.edit_dns_btn, self.checker, new_list
-                )
+                self._run_in_thread(set_dns_resolvers, self.edit_dns_btn, self.checker, new_list)
 
-        tb.Button(
-            dialog,
-            text="Применить изменения",
-            command=apply_changes,
-            bootstyle="success"
-        ).pack(pady=10)
-
-        tb.Button(
-            dialog,
-            text="Отмена",
-            command=dialog.destroy,
-            bootstyle="secondary"
-        ).pack(pady=5)
+        tb.Button(dialog, text="Применить изменения", command=apply_changes, bootstyle="success").pack(pady=10)
+        tb.Button(dialog, text="Отмена", command=dialog.destroy, bootstyle="secondary").pack(pady=5)
 
     def run_replace_ipv4(self):
         if not self.checker:
             return
-        old_ip = simpledialog.askstring(
-            "Замена IPv4",
-            "Введите старый IPv4-адрес (который нужно заменить):",
-            parent=self.root
-        )
+        old_ip = simpledialog.askstring("Замена IPv4", "Введите старый IPv4-адрес (который нужно заменить):", parent=self.root)
         if not old_ip:
             return
         if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', old_ip):
             messagebox.showerror("Ошибка", "Неверный формат IPv4-адреса")
             return
-        new_ip = simpledialog.askstring(
-            "Замена IPv4",
-            f"Введите новый IPv4-адрес (вместо {old_ip}):",
-            parent=self.root
-        )
+        new_ip = simpledialog.askstring("Замена IPv4", f"Введите новый IPv4-адрес (вместо {old_ip}):", parent=self.root)
         if not new_ip:
             return
         if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', new_ip):
@@ -1063,60 +1021,38 @@ class DiagnosticApp:
 
         if messagebox.askyesno(
             "Подтверждение",
-            f"Заменить {old_ip} на {new_ip} во всех .conf-файлах в /etc?\n\n"
-            "Будут перезапущены nginx, mysql, apache.",
+            f"Заменить {old_ip} на {new_ip} во всех .conf-файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.",
             parent=self.root
         ):
-            self._run_in_thread(
-                replace_ipv4, self.ipv4_btn, self.checker, old_ip, new_ip
-            )
+            self._run_in_thread(replace_ipv4, self.ipv4_btn, self.checker, old_ip, new_ip)
 
     def run_replace_ipv6(self):
         if not self.checker:
             return
-        old_ip = simpledialog.askstring(
-            "Замена IPv6",
-            "Введите старый IPv6-адрес (который нужно заменить):",
-            parent=self.root
-        )
+        old_ip = simpledialog.askstring("Замена IPv6", "Введите старый IPv6-адрес (который нужно заменить):", parent=self.root)
         if not old_ip:
             return
-        new_ip = simpledialog.askstring(
-            "Замена IPv6",
-            f"Введите новый IPv6-адрес (вместо {old_ip}):",
-            parent=self.root
-        )
+        new_ip = simpledialog.askstring("Замена IPv6", f"Введите новый IPv6-адрес (вместо {old_ip}):", parent=self.root)
         if not new_ip:
             return
 
         if messagebox.askyesno(
             "Подтверждение",
-            f"Заменить {old_ip} на {new_ip} во всех файлах в /etc?\n\n"
-            "Будут перезапущены nginx, mysql, apache.",
+            f"Заменить {old_ip} на {new_ip} во всех файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.",
             parent=self.root
         ):
-            self._run_in_thread(
-                replace_ipv6, self.ipv6_btn, self.checker, old_ip, new_ip
-            )
+            self._run_in_thread(replace_ipv6, self.ipv6_btn, self.checker, old_ip, new_ip)
 
     def run_restart_services(self):
         if not self.checker:
             return
-        if messagebox.askyesno(
-            "Подтверждение",
-            "Перезапустить nginx, mysql, apache?",
-            parent=self.root
-        ):
-            self._run_in_thread(
-                restart_services, self.restart_btn, self.checker
-            )
+        if messagebox.askyesno("Подтверждение", "Перезапустить nginx, mysql, apache?", parent=self.root):
+            self._run_in_thread(restart_services, self.restart_btn, self.checker)
 
     def get_bash_history(self):
         if not self.checker:
             return []
-        out, _ = self.checker.exec_command(
-            'cat ~/.bash_history 2>/dev/null | tail -100'
-        )
+        out, _ = self.checker.exec_command('cat ~/.bash_history 2>/dev/null | tail -100')
         if out.strip():
             return [line.strip() for line in out.splitlines() if line.strip()]
         return []
@@ -1126,20 +1062,16 @@ class DiagnosticApp:
             return
         history = self.get_bash_history()
         if not history:
-            messagebox.showinfo("История команд",
-                              "История команд не найдена или пуста.")
+            messagebox.showinfo("История команд", "История команд не найдена или пуста.")
             return
 
-        dialog = tb.Toplevel(self.root, title="Bash История команд")
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Bash История команд")
         dialog.geometry("600x400")
         dialog.transient(self.root)
         dialog.grab_set()
 
-        text = scrolledtext.ScrolledText(
-            dialog,
-            wrap=tk.NONE,
-            font=("Courier", 10)
-        )
+        text = scrolledtext.ScrolledText(dialog, wrap=tk.NONE, font=("Courier", 10))
         text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         text.insert(tk.END, "\n".join(history))
         text.config(state=tk.DISABLED)
@@ -1150,12 +1082,11 @@ class DiagnosticApp:
 
         files = get_config_files(self.checker, self.panel_type)
         if not files:
-            messagebox.showinfo("Информация",
-                              "Конфигурационные файлы не найдены.")
+            messagebox.showinfo("Информация", "Конфигурационные файлы не найдены.")
             return
 
-        editor_dialog = tb.Toplevel(self.root,
-                                   title="Редактор конфигурационных файлов")
+        editor_dialog = tb.Toplevel(self.root)
+        editor_dialog.title("Редактор конфигурационных файлов")
         editor_dialog.geometry("800x600")
         editor_dialog.minsize(700, 500)
         editor_dialog.transient(self.root)
@@ -1164,14 +1095,10 @@ class DiagnosticApp:
         top_frame = tb.Frame(editor_dialog, bootstyle="secondary")
         top_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        tb.Label(top_frame, text="Файл:", bootstyle="inverse-secondary").pack(
-            side=tk.LEFT, padx=5
-        )
+        tb.Label(top_frame, text="Файл:", bootstyle="inverse-secondary").pack(side=tk.LEFT, padx=5)
 
         file_var = tk.StringVar()
-        file_combo = ttk.Combobox(
-            top_frame, textvariable=file_var, values=files, width=60
-        )
+        file_combo = ttk.Combobox(top_frame, textvariable=file_var, values=files, width=60)
         file_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
         def load_file():
@@ -1187,22 +1114,13 @@ class DiagnosticApp:
             text_editor.config(state=tk.NORMAL)
             current_filepath[0] = filepath
 
-        load_btn = tb.Button(
-            top_frame,
-            text="Загрузить",
-            command=load_file,
-            bootstyle="primary-outline"
-        )
+        load_btn = tb.Button(top_frame, text="Загрузить", command=load_file, bootstyle="primary")
         load_btn.pack(side=tk.LEFT, padx=5)
 
         editor_frame = tb.Frame(editor_dialog, bootstyle="secondary")
         editor_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        text_editor = scrolledtext.ScrolledText(
-            editor_frame,
-            wrap=tk.NONE,
-            font=("Courier", 10)
-        )
+        text_editor = scrolledtext.ScrolledText(editor_frame, wrap=tk.NONE, font=("Courier", 10))
         text_editor.pack(fill=tk.BOTH, expand=True)
 
         current_filepath = [""]
@@ -1216,11 +1134,7 @@ class DiagnosticApp:
                 messagebox.showwarning("Внимание", "Сначала загрузите файл")
                 return
             content = text_editor.get(1.0, tk.END)
-            if messagebox.askyesno(
-                "Подтверждение",
-                f"Сохранить изменения в {filepath}?",
-                parent=editor_dialog
-            ):
+            if messagebox.askyesno("Подтверждение", f"Сохранить изменения в {filepath}?", parent=editor_dialog):
                 text_editor.config(state=tk.DISABLED)
                 self.root.update()
                 result = write_file(self.checker, filepath, content)
@@ -1242,33 +1156,14 @@ class DiagnosticApp:
 
         def close_editor():
             if text_editor.get(1.0, tk.END).strip():
-                if messagebox.askyesno(
-                    "Подтверждение",
-                    "Закрыть редактор без сохранения изменений?",
-                    parent=editor_dialog
-                ):
+                if messagebox.askyesno("Подтверждение", "Закрыть редактор без сохранения изменений?", parent=editor_dialog):
                     editor_dialog.destroy()
             else:
                 editor_dialog.destroy()
 
-        tb.Button(
-            bottom_frame,
-            text="Сохранить",
-            command=save_file,
-            bootstyle="success"
-        ).pack(side=tk.LEFT, padx=5)
-        tb.Button(
-            bottom_frame,
-            text="Перезагрузить",
-            command=reload_file,
-            bootstyle="warning-outline"
-        ).pack(side=tk.LEFT, padx=5)
-        tb.Button(
-            bottom_frame,
-            text="Закрыть",
-            command=close_editor,
-            bootstyle="danger"
-        ).pack(side=tk.RIGHT, padx=5)
+        tb.Button(bottom_frame, text="Сохранить", command=save_file, bootstyle="success").pack(side=tk.LEFT, padx=5)
+        tb.Button(bottom_frame, text="Перезагрузить", command=reload_file, bootstyle="warning").pack(side=tk.LEFT, padx=5)
+        tb.Button(bottom_frame, text="Закрыть", command=close_editor, bootstyle="danger").pack(side=tk.RIGHT, padx=5)
 
         if files:
             file_combo.set(files[0])
@@ -1279,103 +1174,63 @@ class DiagnosticApp:
             text_editor.config(state=tk.NORMAL)
             current_filepath[0] = files[0]
 
-    # ==================== УПРАВЛЕНИЕ ISPmanager ====================
+    # ---------- УПРАВЛЕНИЕ ISPmanager ----------
     def run_isp_restart(self):
         if not self.checker:
             return
-        if messagebox.askyesno(
-            "Подтверждение",
-            "Перезапустить панель ISPmanager?",
-            parent=self.root
-        ):
-            self._run_in_thread(
-                ispmanager_restart, self.isp_restart_btn, self.checker
-            )
+        if messagebox.askyesno("Подтверждение", "Перезапустить панель ISPmanager?", parent=self.root):
+            self._run_in_thread(ispmanager_restart, self.isp_restart_btn, self.checker)
 
     def run_isp_kill(self):
         if not self.checker:
             return
         if messagebox.askyesno(
             "Подтверждение",
-            "Принудительно завершить процесс core (панель)?\n"
-            "⚠️ Это может привести к потере данных!",
+            "Принудительно завершить процесс core (панель)?\n⚠️ Это может привести к потере данных!",
             parent=self.root
         ):
-            self._run_in_thread(
-                ispmanager_kill_core, self.isp_kill_btn, self.checker
-            )
+            self._run_in_thread(ispmanager_kill_core, self.isp_kill_btn, self.checker)
 
     def run_isp_update(self):
         if not self.checker:
             return
-        if messagebox.askyesno(
-            "Подтверждение",
-            "Обновить панель ISPmanager?\n"
-            "⚠️ Обновление может занять несколько минут!",
-            parent=self.root
-        ):
-            self._run_in_thread(
-                ispmanager_update, self.isp_update_btn, self.checker
-            )
+        if messagebox.askyesno("Подтверждение", "Обновить панель ISPmanager?\n⚠️ Обновление может занять несколько минут!", parent=self.root):
+            self._run_in_thread(ispmanager_update, self.isp_update_btn, self.checker)
 
     def run_isp_ssl(self):
         if not self.checker:
             return
         if messagebox.askyesno(
             "Подтверждение",
-            "Принудительно запустить выпуск Let's Encrypt сертификатов?\n"
-            "⚠️ Процесс может занять несколько минут!",
+            "Принудительно запустить выпуск Let's Encrypt сертификатов?\n⚠️ Процесс может занять несколько минут!",
             parent=self.root
         ):
-            self._run_in_thread(
-                ispmanager_ssl_issue, self.isp_ssl_btn, self.checker
-            )
+            self._run_in_thread(ispmanager_ssl_issue, self.isp_ssl_btn, self.checker)
 
     def run_isp_disable(self):
         if not self.checker:
             return
-        if messagebox.askyesno(
-            "Подтверждение",
-            "Отключить панель ISPmanager?\n⚠️ Панель будет остановлена!",
-            parent=self.root
-        ):
-            self._run_in_thread(
-                ispmanager_disable, self.isp_disable_btn, self.checker
-            )
+        if messagebox.askyesno("Подтверждение", "Отключить панель ISPmanager?\n⚠️ Панель будет остановлена!", parent=self.root):
+            self._run_in_thread(ispmanager_disable, self.isp_disable_btn, self.checker)
 
     def run_isp_geoip(self):
         if not self.checker:
             return
-        if messagebox.askyesno(
-            "Подтверждение",
-            "Отключить модуль авторизации GeoIP?",
-            parent=self.root
-        ):
-            self._run_in_thread(
-                ispmanager_disable_geoip, self.isp_geoip_btn, self.checker
-            )
+        if messagebox.askyesno("Подтверждение", "Отключить модуль авторизации GeoIP?", parent=self.root):
+            self._run_in_thread(ispmanager_disable_geoip, self.isp_geoip_btn, self.checker)
 
     def run_isp_cron(self):
         if not self.checker:
             return
-        self._run_in_thread(
-            ispmanager_check_cron_path, self.isp_cron_btn, self.checker
-        )
+        self._run_in_thread(ispmanager_check_cron_path, self.isp_cron_btn, self.checker)
 
     def run_isp_fix_cron(self):
         if not self.checker:
             return
-        if messagebox.askyesno(
-            "Подтверждение",
-            "Закомментировать переменную PATH в crontab?\n"
-            "⚠️ Это может повлиять на другие cron-задания!",
-            parent=self.root
-        ):
-            self._run_in_thread(
-                ispmanager_fix_cron_path, self.isp_fix_cron_btn, self.checker
-            )
+        if messagebox.askyesno("Подтверждение", "Закомментировать переменную PATH в crontab?\n⚠️ Это может повлиять на другие cron-задания!", parent=self.root):
+            self._run_in_thread(ispmanager_fix_cron_path, self.isp_fix_cron_btn, self.checker)
 
-    # ==================== ОТПРАВКА КОМАНД ====================
+    # ---------- ОТПРАВКА КОМАНД ----------
     def send_command(self, event=None):
         if not self.checker:
             return
@@ -1436,11 +1291,7 @@ class DiagnosticApp:
             btn.config(state=tk.DISABLED)
         self.ispmanager_frame.pack_forget()
 
-        self.connect_btn.config(
-            text="Подключиться",
-            bootstyle="success-outline",
-            command=self.connect
-        )
+        self.connect_btn.config(text="Подключиться", bootstyle="success", command=self.connect)
         self.log("Соединение закрыто.")
 
 
