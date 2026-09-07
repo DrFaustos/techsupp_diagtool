@@ -112,21 +112,19 @@ class DiagnosticApp:
         )
 
     def apply_scrollbar_style(self, theme_name=None):
-        """Настраивает ширину и цвет вертикальной полосы прокрутки"""
+        """Настраивает ширину и цвет вертикальной полосы прокрутки (для tk.Scrollbar)"""
         if theme_name is None:
             theme_name = self.root.style.theme.name
 
-        style = ttk.Style()
-        style.configure('Custom.Vertical.TScrollbar',
-                        width=20,
-                        background='#0078d4',
-                        troughcolor='#2a2a2a' if theme_name in DARK_THEMES else '#e0e0e0')
-        style.map('Custom.Vertical.TScrollbar',
-                  background=[('active', '#1084d4')])
-
+        # Настраиваем скроллбар напрямую (это tk.Scrollbar, не ttk)
         if hasattr(self, 'output') and hasattr(self.output, 'vbar'):
-            self.output.vbar.config(style='Custom.Vertical.TScrollbar')
-
+            self.output.vbar.config(
+                width=20,
+                bg='#0078d4',
+                activebackground='#1084d4',
+                troughcolor='#2a2a2a' if theme_name in DARK_THEMES else '#e0e0e0'
+            )
+            
     def switch_theme(self, theme_name):
         try:
             self.root.style.theme_use(theme_name)
