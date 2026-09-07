@@ -1050,23 +1050,35 @@ class DiagnosticApp:
             self._run_in_thread(restart_services, self.restart_btn, self.checker)
 
     def get_bash_history(self):
+        """Получает историю команд из ~/.bash_history на удалённом сервере"""
         if not self.checker:
+            self.log("⚠️ Нет подключения к серверу")
             return []
-        out, _ = self.checker.exec_command('cat ~/.bash_history 2>/dev/null | tail -100')
+        out, err = self.checker.exec_command('cat ~/.bash_history 2>/dev/null | tail -100')
+        if err.strip():
+            self.log(f"⚠️ Ошибка при чтении истории: {err}")
+            return []
         if out.strip():
-            return [line.strip() for line in out.splitlines() if line.strip()]
-        return []
+            lines = [line.strip() for line in out.splitlines() if line.strip()]
+            if not lines:
+                self.log("ℹ️ История команд на сервере пуста.")
+            return lines
+        else:
+            self.log("ℹ️ История команд на сервере не найдена или пуста.")
+            return []
 
     def show_bash_history(self):
+        """Открывает окно с историей команд с удалённого сервера"""
         if not self.checker:
+            messagebox.showwarning("Нет подключения", "Подключитесь к серверу, чтобы получить историю команд.")
             return
         history = self.get_bash_history()
         if not history:
-            messagebox.showinfo("История команд", "История команд не найдена или пуста.")
+            messagebox.showinfo("История команд", "История команд на сервере не найдена или пуста.")
             return
 
         dialog = tb.Toplevel(self.root)
-        dialog.title("Bash История команд")
+        dialog.title("Bash История команд (с сервера)")
         dialog.geometry("600x400")
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1075,7 +1087,6 @@ class DiagnosticApp:
         text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         text.insert(tk.END, "\n".join(history))
         text.config(state=tk.DISABLED)
-
     def run_config_editor(self):
         if not self.checker:
             return
