@@ -77,8 +77,9 @@ def detect_system_theme():
 
 class DiagnosticApp:
     def __init__(self):
-        initial_theme = detect_system_theme()
-        self.root = tb.Window(themename=initial_theme)
+        # Сохраняем начальную тему как атрибут
+        self.initial_theme = detect_system_theme()
+        self.root = tb.Window(themename=self.initial_theme)
         self.root.title("SSH Диагностика сервера")
         self.root.geometry("1100x720")
         self.root.minsize(1000, 650)
@@ -95,6 +96,7 @@ class DiagnosticApp:
 
         self.cmd_history = []
         self.history_index = -1
+        self.current_theme = self.initial_theme
 
         self.create_widgets()
         self.cmd_entry.focus_set()
@@ -345,7 +347,7 @@ class DiagnosticApp:
         tb.Label(theme_frame, text="Тема:", bootstyle="inverse-secondary").pack(side=tk.LEFT, padx=5)
 
         available_themes = DARK_THEMES + LIGHT_THEMES
-        self.theme_var = tk.StringVar(value=detect_system_theme())
+        self.theme_var = tk.StringVar(value=self.initial_theme)
 
         theme_combo = ttk.Combobox(
             theme_frame,
@@ -482,7 +484,7 @@ class DiagnosticApp:
             font=("Courier", 10)
         )
         self.output.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        self.update_output_colors(initial_theme)
+        self.update_output_colors(self.initial_theme)
 
         # ---------- ИНТЕРАКТИВНЫЙ ТЕРМИНАЛ ----------
         cmd_frame = tb.Frame(self.root, bootstyle="secondary")
@@ -496,7 +498,7 @@ class DiagnosticApp:
         self.cmd_entry.bind("<Return>", self.send_command)
         self.cmd_entry.bind("<Up>", self.history_up)
         self.cmd_entry.bind("<Down>", self.history_down)
-        self.cmd_entry.bind("<Tab>", self.autocomplete)  # Добавляем автодополнение
+        self.cmd_entry.bind("<Tab>", self.autocomplete)
 
         self.send_btn = tb.Button(
             cmd_frame,
@@ -525,7 +527,6 @@ class DiagnosticApp:
             return "break"
         matches = [cmd for cmd in self.cmd_history if cmd.startswith(current)]
         if matches:
-            # Подставляем первое совпадение
             self.cmd_entry.delete(0, tk.END)
             self.cmd_entry.insert(0, matches[0])
         return "break"
@@ -702,7 +703,6 @@ class DiagnosticApp:
         if domains:
             domain_var.set(domains[0])
 
-        # Исправление ошибки Toplevel
         dialog = tb.Toplevel(self.root)
         dialog.title("Анализ логов доступа")
         dialog.geometry("500x320")
