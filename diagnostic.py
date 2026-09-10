@@ -925,6 +925,14 @@ def replace_ipv4(checker, old_ip, new_ip):
     if err.strip():
         lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
     lines.append("✅ IPv4 заменён во всех .conf-файлах в /etc.")
+    lines.append("")
+    lines.append("=== ПРОВЕРКА КОНФИГУРАЦИИ NGINX ===")
+    out_nginx, _ = checker.exec_command('nginx -t 2>&1')
+    lines.append(out_nginx.strip() if out_nginx.strip() else "(вывод пуст)")
+    lines.append("")
+    lines.append("=== SYSTEMD DAEMON-RELOAD ===")
+    checker.exec_command('systemctl daemon-reload 2>&1')
+    lines.append("✅ daemon-reload выполнен")
     lines.extend(restart_services(checker))
     return "\n".join(lines)
 
@@ -936,20 +944,41 @@ def replace_ipv6(checker, old_ip, new_ip):
     if err.strip():
         lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
     lines.append("✅ IPv6 заменён во всех файлах в /etc.")
+    lines.append("")
+    lines.append("=== ПРОВЕРКА КОНФИГУРАЦИИ NGINX ===")
+    out_nginx, _ = checker.exec_command('nginx -t 2>&1')
+    lines.append(out_nginx.strip() if out_nginx.strip() else "(вывод пуст)")
+    lines.append("")
+    lines.append("=== SYSTEMD DAEMON-RELOAD ===")
+    checker.exec_command('systemctl daemon-reload 2>&1')
+    lines.append("✅ daemon-reload выполнен")
     lines.extend(restart_services(checker))
     return "\n".join(lines)
 
 # ==================== ПЕРЕЗАПУСК СЛУЖБ ====================
 def restart_services(checker):
     lines = []
-    lines.append("\n=== ПЕРЕЗАПУСК СЛУЖБ ===")
-    services = ['nginx', 'mysql', 'apache2']
-    for svc in services:
+    lines.append("\n=== ПЕРЕЗАПУСК / ПЕРЕЗАГРУЗКА СЛУЖБ ===")
+    services = {
+        'nginx': 'reload',      # nginx перезагружаем мягко
+        'mysql': 'restart',     # mysql перезапускаем жёстко
+        'apache2': 'reload'     # apache тоже можно мягко
+    }
+    for svc, action in services.items():
         out, _ = checker.exec_command(f'systemctl list-unit-files | grep -q "^{svc}.service" && echo "yes" || echo "no"')
         if out.strip() == 'yes':
-            checker.exec_command(f'systemctl restart {svc} 2>/dev/null')
+            checker.exec_command(f'systemctl {action} {svc} 2>/dev/null')
             status, _ = checker.exec_command(f'systemctl is-active {svc} 2>/dev/null')
-            lines.append(f"✅ {svc} {'перезапущен' if status.strip() == 'active' else 'не запустился'}")
+            if status.strip() == 'active':
+                lines.append(f"✅ {svc} ({action}) выполнен")
+            else:
+                # Если reload не сработал — пробуем restart
+                checker.exec_command(f'systemctl restart {svc} 2>/dev/null')
+                status2, _ = checker.exec_command(f'systemctl is-active {svc} 2>/dev/null')
+                if status2.strip() == 'active':
+                    lines.append(f"✅ {svc} перезапущен (fallback)")
+                else:
+                    lines.append(f"❌ {svc} не запустился")
         else:
             lines.append(f"⏭️ {svc} не установлен")
     return lines
