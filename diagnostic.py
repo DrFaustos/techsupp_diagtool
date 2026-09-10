@@ -919,7 +919,7 @@ def search_oom_logs(checker):
 def replace_ipv4(checker, old_ip, new_ip):
     lines = []
     lines.append(f"=== ЗАМЕНА IPv4: {old_ip} -> {new_ip} ===")
-    old_escaped = old_ip.replace('.', '\.')
+    old_escaped = old_ip.replace('.', '\\.')
     cmd = f"find /etc -type f -name '*.conf' -exec sed -i -e 's#{old_escaped}#{new_ip}#g' '{{}}' \\; 2>/dev/null"
     out, err = checker.exec_command(cmd)
     if err.strip():

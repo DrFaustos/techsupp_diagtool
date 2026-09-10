@@ -936,6 +936,24 @@ class DiagnosticApp:
             return
         current_ns = get_current_dns_resolvers(self.checker)
 
+        # === ДИАГНОСТИКА ===
+        self.log(f"\n=== DNS-резолверы, полученные с сервера: {current_ns}")
+
+        if not current_ns:
+            # Попробуем прочитать /etc/resolv.conf напрямую
+            out, _ = self.checker.exec_command('cat /etc/resolv.conf 2>/dev/null')
+            self.log("Содержимое /etc/resolv.conf:\n" + out)
+            # Если файл пуст, попробуем resolvectl
+            out2, _ = self.checker.exec_command('resolvectl status 2>/dev/null | grep "DNS Servers"')
+            if out2.strip():
+                self.log("DNS из resolvectl:\n" + out2)
+            messagebox.showwarning(
+                "DNS не найдены",
+                "Не удалось получить текущие DNS-серверы.\n"
+                "Проверьте вывод в главном окне."
+            )
+            return
+
         dialog = tb.Toplevel(self.root)
         dialog.title("Редактирование DNS-резолверов")
         dialog.geometry("500x400")
@@ -944,12 +962,14 @@ class DiagnosticApp:
 
         tb.Label(dialog, text="DNS-серверы (нажмите для редактирования):", bootstyle="inverse-secondary").pack(pady=5)
 
+        colors = get_theme_colors(self.current_theme)
+
         listbox = tk.Listbox(
             dialog,
             selectmode=tk.SINGLE,
-            bg=self.root.cget('bg'),
-            fg=self.root.cget('fg'),
-            selectbackground=self.root.style.colors.get('primary')
+            bg=colors['bg'],
+            fg=colors['fg'],
+            selectbackground='#3465a4'
         )
         listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         for ns in current_ns:
