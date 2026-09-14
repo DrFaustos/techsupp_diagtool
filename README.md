@@ -86,12 +86,19 @@ python3 main.py
 📁 Структура проекта
 ```
 server_diagnostic/
-├── main.py # Точка входа
-├── gui.py # Графический интерфейс (Tkinter) 
-├── diagnostic.py # Основная логика диагностики 
-├── ssh_client.py # SSH-подключение (Paramiko) 
-├── requirements.txt # Зависимости 
-└── README.md # Документация 
+├── main.py             # Точка входа
+├── gui.py              # Графический интерфейс (ttkbootstrap/Tkinter)
+├── diagnostic.py       # Фасад диагностики (реэкспорт, обратная совместимость)
+├── common.py           # Конфигурации и вспомогательные функции
+├── metrics.py          # Определение панели, метрики, отчёты, веб-конфиг
+├── logs.py             # Поиск/анализ логов, домены, поиск OOM
+├── dns.py              # DNS-проверки и работа с резолверами
+├── files.py            # Файлы, конфиги, замена IP, перезапуск служб
+├── panels.py           # Управление панелью ISPmanager
+├── reports.py          # Сводный отчёт по диагностике
+├── ssh_client.py       # SSH-подключение (Paramiko)
+├── requirements.txt    # Зависимости
+└── README.md           # Документация
 ```
 ### Описание файлов
 
@@ -99,9 +106,16 @@ server_diagnostic/
 |------|----------|
 | main.py | Запускает GUI-приложение |
 | gui.py | Весь графический интерфейс: окна, кнопки, поля ввода, терминал |
-| diagnostic.py | Все функции диагностики: сбор метрик, анализ логов, DNS, замена IP, управление панелями |
-| ssh_client.py | Класс для SSH-подключения через Paramiko |
-| requirements.txt | Список зависимостей (paramiko) |
+| diagnostic.py | Фасад: реэкспортирует функции из модулей ниже (сохранён для совместимости) |
+| common.py | Конфигурации (BACKUP_DIR, LOG_PATHS, DOMAIN_PATHS), q(), бэкапы, SFTP-запись |
+| metrics.py | detect_panel, get_metrics, disk_memory_report, network_report, web_config_report |
+| logs.py | find_logs, analyze_access_log, get_domains, check_site_logs, search_oom_logs |
+| dns.py | dns_report, dns_report_local, dns_resolvers_report, set_dns_resolvers |
+| files.py | read_file, write_file, get_config_files, replace_ipv4/ipv6, restart_services |
+| panels.py | Функции управления ISPmanager (restart, update, ssl, disable и т.д.) |
+| reports.py | full_diagnostic_report — сводный отчёт |
+| ssh_client.py | Класс SSH-подключения через Paramiko (exec_command + run с кодом возврата) |
+| requirements.txt | Список зависимостей (paramiko, ttkbootstrap с версиями) |
 
 
 ---
@@ -263,7 +277,7 @@ DeepSeek – искусственный интеллект, который по�
 
 ## 📞 Контакты
 
-- REG.RU – хостинг и облачные серверы
+- Рег.Облако - облачные серверы
 - Документация по ISPmanager
 - Документация по FastPanel
 
@@ -284,7 +298,7 @@ pyinstaller --onefile --windowed --name="ServerDiagnostic" main.py
 
 - Paramiko – библиотека для SSH
 - Tkinter – GUI-фреймворк
-- Команда REG.RU за тестирование и идеи
+- Команда Рег.Облако за тестирование и идеи
 - DeepSeek – за помощь в разработке и ускорение процесса создания проекта
 
 ---
