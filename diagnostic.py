@@ -224,6 +224,7 @@ def get_metrics(checker):
 
     return metrics
 
+
 # ==================== ПОИСК ЛОГОВ ====================
 def find_logs(checker, panel_type, domain, log_type='error'):
     """Находит логи для домена (унифицированная функция)"""
@@ -959,15 +960,16 @@ def search_oom_logs(checker):
 
 
 # ==================== ЗАМЕНА IP ====================
-def _sed_escape(value):
-    """Экранирует значение для использования в sed s/// (разделитель #)."""
-    return value.replace('\\', '\\\\').replace('#', '\\#').replace('&', '\\&')
-
-
 def replace_ipv4(checker, old_ip, new_ip):
+    """Замена старого IPv4 на новый во всех *.conf в /etc (как в ручной команде)."""
     lines = [f"=== ЗАМЕНА IPv4: {old_ip} -> {new_ip} ==="]
-    old_escaped = _sed_escape(old_ip)
-    cmd = f"find /etc -type f -name '*.conf' -exec sed -i -e 's#{old_escaped}#{new_ip}#g' '{{}}' \\; 2>/dev/null"
+    # Экранируем точки, как в исходной команде: s#123\.123\.123\.123#...#g
+    old_escaped = old_ip.replace('.', '\\.')
+    new_escaped = new_ip.replace('.', '\\.')
+    cmd = (
+        f"find /etc -type f -name \"*.conf\" "
+        f"-exec sed -i -e 's#{old_escaped}#{new_escaped}#g' '{{}}' \\;"
+    )
     out, err = checker.exec_command(cmd)
     if err.strip():
         lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
@@ -985,17 +987,13 @@ def replace_ipv4(checker, old_ip, new_ip):
 
 
 def replace_ipv6(checker, old_ip, new_ip):
+    """Замена старого IPv6 на новый во всех файлах в /etc (как в ручной команде)."""
     lines = [f"=== ЗАМЕНА IPv6: {old_ip} -> {new_ip} ==="]
-    old_escaped = _sed_escape(old_ip)
-    # Ограничиваем замену конфигами (не трогаем бинарные файлы/БД).
-    cmd = (
-        f"find /etc -type f \\( -name '*.conf' -o -name '*.ini' -o -name '*.cnf' \\) "
-        f"-exec sed -i 's#{old_escaped}#{new_ip}#g' '{{}}' + 2>/dev/null"
-    )
+    cmd = f"find /etc -type f -exec sed -i 's/{old_ip}/{new_ip}/g' {{}} +"
     out, err = checker.exec_command(cmd)
     if err.strip():
         lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
-    lines.append("✅ IPv6 заменён в конфигурационных файлах в /etc.")
+    lines.append("✅ IPv6 заменён во всех файлах в /etc.")
     lines.append("")
     lines.append("=== ПРОВЕРКА КОНФИГУРАЦИИ NGINX ===")
     out_nginx, _ = checker.exec_command('nginx -t 2>&1')
