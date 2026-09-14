@@ -1,0 +1,169 @@
+"""Работа с файлами/конфигами, замена IP, перезапуск служб."""
+from datetime import datetime
+
+from common import BACKUP_SUBDIRS, q, ensure_backup_dir, create_backup, write_remote_file
+
+
+# ==================== РАБОТА С ФАЙЛАМИ (С БЭКАПАМИ) ====================
+def write_file(checker, filepath, content):
+    """Записывает содержимое в файл с созданием резервной копии (через SFTP)."""
+    lines = []
+    lines.append(f"=== СОХРАНЕНИЕ ФАЙЛА: {filepath} ===")
+
+    backup_path = create_backup(checker, filepath, 'configs')
+    if backup_path:
+        lines.append(f"✅ Резервная копия создана: {backup_path}")
+    else:
+        lines.append("⚠️ Не удалось создать резервную копию файла")
+
+    ok, err = write_remote_file(checker, filepath, content)
+    if not ok:
+        lines.append(f"❌ Ошибка записи: {err}")
+        return "\n".join(lines)
+
+    lines.append("✅ Файл сохранён.")
+    return "\n".join(lines)
+
+
+def read_file(checker, filepath):
+    out, err = checker.exec_command(f'cat {q(filepath)} 2>/dev/null')
+    if err.strip():
+        return f"❌ Ошибка чтения файла: {err}"
+    return out
+
+
+def get_config_files(checker, panel_type):
+    files = []
+    common_paths = [
+        '/etc/nginx/nginx.conf',
+        '/etc/nginx/sites-available/',
+        '/etc/nginx/sites-enabled/',
+        '/etc/nginx/conf.d/',
+        '/etc/apache2/apache2.conf',
+        '/etc/apache2/sites-available/',
+        '/etc/apache2/sites-enabled/',
+        '/etc/apache2/conf-available/',
+        '/etc/apache2/conf-enabled/',
+        '/etc/httpd/conf/httpd.conf',
+        '/etc/httpd/conf.d/',
+        '/etc/php/*/php.ini',
+        '/etc/php/*/fpm/php.ini',
+        '/etc/php/*/cli/php.ini',
+        '/etc/mysql/mysql.conf.d/mysqld.cnf',
+        '/etc/mysql/my.cnf',
+    ]
+    panel_paths = {
+        'fastpanel': [
+            '/usr/local/fastpanel/etc/nginx/',
+            '/usr/local/fastpanel/etc/php/',
+            '/etc/nginx/fastpanel2-available/',
+        ],
+        'ispmanager': [
+            '/usr/local/mgr5/etc/nginx/',
+            '/usr/local/mgr5/etc/apache2/',
+            '/usr/local/mgr5/etc/php/',
+        ]
+    }
+    for path in common_paths:
+        out, _ = checker.exec_command(f'ls -d {q(path)} 2>/dev/null && echo "exists"')
+        if out.strip() == 'exists':
+            out2, _ = checker.exec_command(f'ls -1 {q(path)} 2>/dev/null | head -20')
+            if out2.strip():
+                for f in out2.splitlines():
+                    if f.strip():
+                        files.append(f"{path}{f}" if path.endswith('/') else path)
+            else:
+                files.append(path)
+    if panel_type in panel_paths:
+        for path in panel_paths[panel_type]:
+            out, _ = checker.exec_command(f'ls -d {q(path)} 2>/dev/null && echo "exists"')
+            if out.strip() == 'exists':
+                out2, _ = checker.exec_command(f'find {q(path)} -type f -name "*.conf" 2>/dev/null | head -20')
+                if out2.strip():
+                    for f in out2.splitlines():
+                        if f.strip():
+                            files.append(f)
+    return sorted(list(set(files)))[:50]
+
+
+# ==================== ЗАМЕНА IP ====================
+def replace_ipv4(checker, old_ip, new_ip):
+    """Замена старого IPv4 на новый во всех *.conf в /etc (как в ручной команде)."""
+    lines = [f"=== ЗАМЕНА IPv4: {old_ip} -> {new_ip} ==="]
+    # Экранируем точки, как в исходной команде: s#123\.123\.123\.123#...#g
+    old_escaped = old_ip.replace('.', '\\.')
+    new_escaped = new_ip.replace('.', '\\.')
+    cmd = (
+        f"find /etc -type f -name \"*.conf\" "
+        f"-exec sed -i -e 's#{old_escaped}#{new_escaped}#g' '{{}}' \\;"
+    )
+    out, err = checker.exec_command(cmd)
+    if err.strip():
+        lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
+    lines.append("✅ IPv4 заменён во всех .conf-файлах в /etc.")
+    lines.append("")
+    lines.append("=== ПРОВЕРКА КОНФИГУРАЦИИ NGINX ===")
+    out_nginx, _ = checker.exec_command('nginx -t 2>&1')
+    lines.append(out_nginx.strip() if out_nginx.strip() else "(вывод пуст)")
+    lines.append("")
+    lines.append("=== SYSTEMD DAEMON-RELOAD ===")
+    checker.exec_command('systemctl daemon-reload 2>&1')
+    lines.append("✅ daemon-reload выполнен")
+    lines.extend(restart_services(checker))
+    return "\n".join(lines)
+
+
+def replace_ipv6(checker, old_ip, new_ip):
+    """Замена старого IPv6 на новый во всех файлах в /etc (как в ручной команде)."""
+    lines = [f"=== ЗАМЕНА IPv6: {old_ip} -> {new_ip} ==="]
+    # Автобэкап /etc перед массовой заменой (сама команда замены не меняется)
+    ensure_backup_dir(checker)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    etc_backup = f"{BACKUP_SUBDIRS['configs']}/etc_{ts}.tar.gz"
+    _, _, brc = checker.run(f"tar czf {q(etc_backup)} /etc 2>/dev/null")
+    if brc == 0:
+        lines.append(f"✅ Резервная копия /etc создана: {etc_backup}")
+    else:
+        lines.append("⚠️ Не удалось создать резервную копию /etc (продолжаем)")
+    cmd = f"find /etc -type f -exec sed -i 's/{old_ip}/{new_ip}/g' {{}} +"
+    out, err, rc = checker.run(cmd)
+    if err.strip():
+        lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
+    lines.append("✅ IPv6 заменён во всех файлах в /etc.")
+    lines.append("")
+    lines.append("=== ПРОВЕРКА КОНФИГУРАЦИИ NGINX ===")
+    out_nginx, _ = checker.exec_command('nginx -t 2>&1')
+    lines.append(out_nginx.strip() if out_nginx.strip() else "(вывод пуст)")
+    lines.append("")
+    lines.append("=== SYSTEMD DAEMON-RELOAD ===")
+    checker.exec_command('systemctl daemon-reload 2>&1')
+    lines.append("✅ daemon-reload выполнен")
+    lines.extend(restart_services(checker))
+    return "\n".join(lines)
+
+
+# ==================== ПЕРЕЗАПУСК СЛУЖБ ====================
+def restart_services(checker):
+    lines = ["\n=== ПЕРЕЗАПУСК / ПЕРЕЗАГРУЗКА СЛУЖБ ==="]
+    services = {
+        'nginx': 'reload',
+        'mysql': 'restart',
+        'apache2': 'reload'
+    }
+    for svc, action in services.items():
+        out, _ = checker.exec_command(f'systemctl list-unit-files | grep -q "^{svc}.service" && echo "yes" || echo "no"')
+        if out.strip() == 'yes':
+            checker.exec_command(f'systemctl {action} {svc} 2>/dev/null')
+            status, _ = checker.exec_command(f'systemctl is-active {svc} 2>/dev/null')
+            if status.strip() == 'active':
+                lines.append(f"✅ {svc} ({action}) выполнен")
+            else:
+                checker.exec_command(f'systemctl restart {svc} 2>/dev/null')
+                status2, _ = checker.exec_command(f'systemctl is-active {svc} 2>/dev/null')
+                if status2.strip() == 'active':
+                    lines.append(f"✅ {svc} перезапущен (fallback)")
+                else:
+                    lines.append(f"❌ {svc} не запустился")
+        else:
+            lines.append(f"⏭️ {svc} не установлен")
+    return lines
