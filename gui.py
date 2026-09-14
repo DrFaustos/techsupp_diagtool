@@ -4,7 +4,6 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 import threading
 import re
-import os
 import subprocess
 from diagnostic import (
     detect_panel, full_diagnostic_report,
@@ -70,7 +69,7 @@ def detect_system_theme():
                 return 'darkly'
             else:
                 return 'flatly'
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         pass
     return 'darkly'
 
@@ -600,23 +599,41 @@ class DiagnosticApp:
         password = self.password_var.get().strip()
         key_path = self.key_var.get().strip()
 
+        # Не даём запустить повторное подключение поверх активного/идущего
+        with self._busy_lock:
+            if self._busy:
+                messagebox.showwarning("Занято", "Дождитесь завершения текущей операции.")
+                return
+            if self.checker is not None:
+                messagebox.showinfo("Подключение", "Сначала отключитесь от текущего сервера.")
+                return
+            self._busy = True
+
+        self.connect_btn.config(state=tk.DISABLED)
         self.log(f"\n=== Подключение к {ip}:{port} ...")
-        checker = ServerChecker(ip, port, user, password, key_path)
-        success, message = checker.connect()
 
-        if not success:
-            self.log(f"❌ {message}")
-            return
+        def worker():
+            checker = ServerChecker(ip, port, user, password, key_path)
+            success, message = checker.connect()
+            if success:
+                if self.panel_var.get() == 'auto':
+                    panel_type = detect_panel(checker)
+                else:
+                    panel_type = self.panel_var.get()
+                self.root.after(0, self._on_connect_success, checker, panel_type, message)
+            else:
+                self.root.after(0, self._on_connect_failure, message)
 
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_connect_success(self, checker, panel_type, message):
         self.checker = checker
+        self.panel_type = panel_type
         self.log(f"✅ {message}")
-
-        if self.panel_var.get() == 'auto':
-            self.panel_type = detect_panel(self.checker)
-        else:
-            self.panel_type = self.panel_var.get()
-
         self.log(f"Панель управления: {self.panel_type}")
+
+        # Очищаем пароль из памяти после успешного подключения
+        self.password_var.set("")
 
         # Активируем кнопки
         self.full_btn.config(state=tk.NORMAL)
@@ -657,7 +674,16 @@ class DiagnosticApp:
                 btn.config(state=tk.DISABLED)
 
         self.connect_btn.config(text="Отключиться", bootstyle="danger", command=self.disconnect)
+        self.connect_btn.config(state=tk.NORMAL)
         self.cmd_entry.focus_set()
+        with self._busy_lock:
+            self._busy = False
+
+    def _on_connect_failure(self, message):
+        self.log(f"❌ {message}")
+        self.connect_btn.config(state=tk.NORMAL)
+        with self._busy_lock:
+            self._busy = False
 
     # ---------- ФОНОВЫЕ ЗАДАЧИ ----------
     def _run_in_thread(self, target_func, btn=None, *args, **kwargs):
@@ -700,6 +726,42 @@ class DiagnosticApp:
         thread.daemon = True
         thread.start()
 
+    def _run_simple(self, fn, btn=None, on_done=None, *args, **kwargs):
+        """
+        Запускает произвольную функцию в потоке, результат отдаёт в on_done(result).
+        Используется для операций, чей вывод не является «отчётом» диагностики.
+        """
+        with self._busy_lock:
+            if self._busy:
+                messagebox.showwarning("Занято", "Дождитесь завершения текущей операции.")
+                return
+            if not self.checker:
+                return
+            self._busy = True
+
+        if btn:
+            btn.config(state=tk.DISABLED)
+        self.progress.pack(pady=5)
+        self.progress.start(10)
+
+        def wrapper():
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as e:
+                result = f"❌ Ошибка: {str(e)}"
+            finally:
+                self.root.after(0, self._stop_progress)
+                if btn:
+                    self.root.after(0, lambda b=btn: b.config(state=tk.NORMAL))
+                with self._busy_lock:
+                    self._busy = False
+            if on_done:
+                self.root.after(0, on_done, result)
+            else:
+                self.root.after(0, self._display_result, result)
+
+        threading.Thread(target=wrapper, daemon=True).start()
+
     def _stop_progress(self):
         self.progress.stop()
         self.progress.pack_forget()
@@ -735,14 +797,26 @@ class DiagnosticApp:
         if not self.checker:
             return
 
-        domains = get_domains(self.checker, self.panel_type)
+        # get_domains делает SSH-вызовы — грузим его в фоне, диалог откроем по готовности
+        self.log("Получение списка доменов...")
+        self._run_simple(
+            get_domains, None, self._open_access_dialog,
+            self.checker, self.panel_type
+        )
+
+    def _open_access_dialog(self, domains):
+        if isinstance(domains, str):
+            # пришла строка ошибки
+            self.log(domains)
+            domains = []
+
         domain_var = tk.StringVar()
         if domains:
             domain_var.set(domains[0])
 
         dialog = tb.Toplevel(self.root)
         dialog.title("Анализ логов доступа")
-        dialog.geometry("500x320")
+        dialog.geometry("520x360")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -784,12 +858,44 @@ class DiagnosticApp:
         row += 1
 
         last_result = [None]
-        save_btn_ref = [None]
+        status_var = tk.StringVar(value="Готово к анализу")
+
+        tb.Label(dialog, textvariable=status_var, bootstyle="inverse-secondary").grid(
+            row=row, column=0, columnspan=4, sticky='w', padx=5
+        )
+        row += 1
+
+        btn_frame = tb.Frame(dialog, bootstyle="secondary")
+        btn_frame.grid(row=row, column=0, columnspan=4, pady=10)
+
+        analyze_btn = tb.Button(btn_frame, text="Анализировать", bootstyle="success")
+        analyze_btn.pack(side='left', padx=5)
+        save_btn = tb.Button(btn_frame, text="Сохранить отчёт", bootstyle="primary", state=tk.DISABLED)
+        save_btn.pack(side='left', padx=5)
+
+        def on_save():
+            if last_result[0] is None:
+                messagebox.showwarning("Нет данных", "Сначала выполните анализ, чтобы сохранить отчёт.")
+                return
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                parent=dialog
+            )
+            if filename:
+                try:
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write(last_result[0])
+                    messagebox.showinfo("Успех", f"Отчёт сохранён в {filename}", parent=dialog)
+                except Exception as e:
+                    messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {e}", parent=dialog)
+
+        save_btn.config(command=on_save)
 
         def on_analyze():
             domain = domain_var.get().strip()
             if not domain:
-                messagebox.showerror("Ошибка", "Введите домен")
+                messagebox.showerror("Ошибка", "Введите домен", parent=dialog)
                 return
             try:
                 top_n = int(top_var.get().strip() or 10)
@@ -800,7 +906,7 @@ class DiagnosticApp:
                 month = int(month_var.get()) if month_var.get().strip() else None
                 day = int(day_var.get()) if day_var.get().strip() else None
             except ValueError:
-                messagebox.showerror("Ошибка", "Дата должна быть числом")
+                messagebox.showerror("Ошибка", "Дата должна быть числом", parent=dialog)
                 return
 
             for val, name in [(year, 'год'), (month, 'месяц'), (day, 'день')]:
@@ -808,72 +914,31 @@ class DiagnosticApp:
                     1 <= val <= 9999 if name == 'год' else
                     (1 <= val <= 12 if name == 'месяц' else 1 <= val <= 31)
                 ):
-                    messagebox.showerror("Ошибка", f"Некорректное значение для {name}")
+                    messagebox.showerror("Ошибка", f"Некорректное значение для {name}", parent=dialog)
                     return
 
-            dialog.destroy()
-            self._run_access_analysis(domain, top_n, year, month, day, last_result)
+            # Диалог НЕ закрываем — чтобы осталась доступна кнопка «Сохранить отчёт».
+            status_var.set("Анализ выполняется...")
+            analyze_btn.config(state=tk.DISABLED)
+            save_btn.config(state=tk.DISABLED)
 
-        def on_save():
-            if last_result[0] is None:
-                messagebox.showwarning("Нет данных", "Сначала выполните анализ, чтобы сохранить отчёт.")
-                return
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".txt",
-                filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+            def on_done(result):
+                last_result[0] = result
+                status_var.set("Анализ завершён — можно сохранить отчёт")
+                analyze_btn.config(state=tk.NORMAL)
+                save_btn.config(state=tk.NORMAL)
+                self._display_result(result)
+
+            self._run_simple(
+                analyze_access_log, None, on_done,
+                self.checker, self.panel_type, domain, top_n, year, month, day
             )
-            if filename:
-                try:
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        f.write(last_result[0])
-                    messagebox.showinfo("Успех", f"Отчёт сохранён в {filename}")
-                except Exception as e:
-                    messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {e}")
 
-        btn_frame = tb.Frame(dialog, bootstyle="secondary")
-        btn_frame.grid(row=row, column=0, columnspan=4, pady=10)
-        tb.Button(btn_frame, text="Анализировать", command=on_analyze, bootstyle="success").pack(side='left', padx=5)
-        save_btn = tb.Button(btn_frame, text="Сохранить отчёт", command=on_save, bootstyle="primary")
-        save_btn.pack(side='left', padx=5)
-        save_btn_ref[0] = save_btn
+        analyze_btn.config(command=on_analyze)
 
         dialog.columnconfigure(1, weight=1)
         dialog.columnconfigure(2, weight=1)
         dialog.columnconfigure(3, weight=1)
-
-    def _run_access_analysis(self, domain, top_n, year, month, day, last_result):
-        """Запускает анализ логов в потоке и сохраняет результат для кнопки 'Сохранить'."""
-        with self._busy_lock:
-            if self._busy:
-                messagebox.showwarning("Занято", "Дождитесь завершения текущей операции.")
-                return
-            if not self.checker:
-                return
-            self._busy = True
-
-        self.access_btn.config(state=tk.DISABLED)
-        self.progress.pack(pady=5)
-        self.progress.start(10)
-
-        checker = self.checker
-        panel_type = self.panel_type
-
-        def wrapper():
-            try:
-                result = analyze_access_log(checker, panel_type, domain, top_n, year, month, day)
-                last_result[0] = result
-                self.root.after(0, self._display_result, result)
-            except Exception as e:
-                self.root.after(0, self._display_result, f"❌ Ошибка: {str(e)}")
-            finally:
-                self.root.after(0, self._stop_progress)
-                self.root.after(0, lambda: self.access_btn.config(state=tk.NORMAL))
-                with self._busy_lock:
-                    self._busy = False
-
-        t = threading.Thread(target=wrapper)
-        t.daemon = True
-        t.start()
 
     # ---------- ОСТАЛЬНЫЕ ФУНКЦИИ ----------
     def create_swap(self):
@@ -892,13 +957,17 @@ class DiagnosticApp:
             messagebox.showerror("Ошибка", "Введите целое число")
             return
 
-        self.log(f"\n=== Создание swap файла размером {size_mb} МБ ===")
-        cmd = f"df -m / | awk 'NR==2 {{print $4}}'"
+        if messagebox.askyesno("Подтверждение", f"Создать swap файл размером {size_mb} МБ?", parent=self.root):
+            self._run_simple(self._do_create_swap, self.swap_btn, None, size_mb)
+
+    def _do_create_swap(self, size_mb):
+        lines = [f"=== Создание swap файла размером {size_mb} МБ ==="]
+        cmd = "df -m / | awk 'NR==2 {print $4}'"
         out, _ = self.checker.exec_command(cmd)
         free_mb = int(out.strip()) if out.strip().isdigit() else 0
         if free_mb < size_mb + 100:
-            self.log(f"❌ Недостаточно свободного места (доступно {free_mb} МБ, требуется ~{size_mb+100} МБ)")
-            return
+            lines.append(f"❌ Недостаточно свободного места (доступно {free_mb} МБ, требуется ~{size_mb+100} МБ)")
+            return "\n".join(lines)
 
         cmds = [
             f"fallocate -l {size_mb}M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count={size_mb}",
@@ -908,33 +977,38 @@ class DiagnosticApp:
         ]
         for c in cmds:
             out, err = self.checker.exec_command(c)
-            self.log(f"$ {c}")
+            lines.append(f"$ {c}")
             if out.strip():
-                self.log(out.strip())
+                lines.append(out.strip())
             if err.strip():
-                self.log("STDERR: " + err.strip())
+                lines.append("STDERR: " + err.strip())
 
         out, _ = self.checker.exec_command("swapon --show")
-        self.log("Текущие swap-разделы:\n" + out)
+        lines.append("Текущие swap-разделы:\n" + out)
+        return "\n".join(lines)
 
     def add_swap_to_fstab(self):
         if not self.checker:
             return
-        self.log("\n=== Добавление /swapfile в /etc/fstab ===")
+        self._run_simple(self._do_add_swap_to_fstab, self.fstab_btn)
+
+    def _do_add_swap_to_fstab(self):
+        lines = ["=== Добавление /swapfile в /etc/fstab ==="]
         out, _ = self.checker.exec_command("grep -q '/swapfile' /etc/fstab && echo 'yes' || echo 'no'")
         if out.strip() == 'yes':
-            self.log("Запись /swapfile уже присутствует в fstab.")
-            return
+            lines.append("Запись /swapfile уже присутствует в fstab.")
+            return "\n".join(lines)
 
         cmd = 'echo "/swapfile none swap sw 0 0" >> /etc/fstab'
         out, err = self.checker.exec_command(cmd)
-        self.log(f"$ {cmd}")
+        lines.append(f"$ {cmd}")
         if out.strip():
-            self.log(out.strip())
+            lines.append(out.strip())
         if err.strip():
-            self.log("STDERR: " + err.strip())
+            lines.append("STDERR: " + err.strip())
         out, _ = self.checker.exec_command("tail -3 /etc/fstab")
-        self.log("Последние строки /etc/fstab:\n" + out)
+        lines.append("Последние строки /etc/fstab:\n" + out)
+        return "\n".join(lines)
 
     def run_dns_check(self):
         if not self.checker:
@@ -974,13 +1048,13 @@ class DiagnosticApp:
             if not domain:
                 messagebox.showerror("Ошибка", "Введите домен или IP")
                 return
+            local = local_var.get()
             dialog.destroy()
             self.log("\n" + "="*60)
-            if local_var.get():
-                result = dns_report_local(domain)
+            if local:
+                self._run_simple(dns_report_local, self.dns_btn, None, domain)
             else:
-                result = dns_report(self.checker, domain)
-            self.log(result)
+                self._run_simple(dns_report, self.dns_btn, None, self.checker, domain)
 
         tb.Button(dialog, text="Проверить", command=on_check, bootstyle="success").grid(
             row=2, column=0, columnspan=2, pady=10
@@ -995,16 +1069,19 @@ class DiagnosticApp:
     def run_edit_dns(self):
         if not self.checker:
             return
-        current_ns = get_current_dns_resolvers(self.checker)
+        self.log("Получение текущих DNS-резолверов...")
+        self._run_simple(get_current_dns_resolvers, None, self._open_edit_dns_dialog, self.checker)
 
-        # === ДИАГНОСТИКА ===
-        self.log(f"\n=== DNS-резолверы, полученные с сервера: {current_ns}")
+    def _open_edit_dns_dialog(self, current_ns):
+        if isinstance(current_ns, str):
+            self.log(current_ns)
+            current_ns = []
+
+        self.log(f"=== DNS-резолверы, полученные с сервера: {current_ns}")
 
         if not current_ns:
-            # Попробуем прочитать /etc/resolv.conf напрямую
             out, _ = self.checker.exec_command('cat /etc/resolv.conf 2>/dev/null')
             self.log("Содержимое /etc/resolv.conf:\n" + out)
-            # Если файл пуст, попробуем resolvectl
             out2, _ = self.checker.exec_command('resolvectl status 2>/dev/null | grep "DNS Servers"')
             if out2.strip():
                 self.log("DNS из resolvectl:\n" + out2)
@@ -1132,8 +1209,10 @@ class DiagnosticApp:
             return
 
         if messagebox.askyesno(
-            "Подтверждение",
-            f"Заменить {old_ip} на {new_ip} в конфигурационных файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.",
+            "Подтверждение ⚠️",
+            f"Заменить {old_ip} на {new_ip} во ВСЕХ файлах в /etc?\n\n"
+            f"Внимание: обрабатываются ВСЕ файлы (включая бинарные/БД), "
+            f"а не только конфиги!\n\nБудут перезапущены nginx, mysql, apache.",
             parent=self.root
         ):
             self._run_in_thread(replace_ipv6, self.ipv6_btn, self.checker, old_ip, new_ip)
@@ -1167,21 +1246,25 @@ class DiagnosticApp:
         if not self.checker:
             messagebox.showwarning("Нет подключения", "Подключитесь к серверу, чтобы получить историю команд.")
             return
-        history = self.get_bash_history()
-        if not history:
-            messagebox.showinfo("История команд", "История команд на сервере не найдена или пуста.")
-            return
 
-        dialog = tb.Toplevel(self.root)
-        dialog.title("Bash История команд (с сервера)")
-        dialog.geometry("600x400")
-        dialog.transient(self.root)
-        dialog.grab_set()
+        def on_history(history):
+            if isinstance(history, str):
+                self.log(history)
+                return
+            if not history:
+                messagebox.showinfo("История команд", "История команд на сервере не найдена или пуста.")
+                return
+            dialog = tb.Toplevel(self.root)
+            dialog.title("Bash История команд (с сервера)")
+            dialog.geometry("600x400")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            text = scrolledtext.ScrolledText(dialog, wrap=tk.NONE, font=("Courier", 10))
+            text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            text.insert(tk.END, "\n".join(history))
+            text.config(state=tk.DISABLED)
 
-        text = scrolledtext.ScrolledText(dialog, wrap=tk.NONE, font=("Courier", 10))
-        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        text.insert(tk.END, "\n".join(history))
-        text.config(state=tk.DISABLED)
+        self._run_simple(self.get_bash_history, None, on_history)
 
     def run_config_editor(self):
         if not self.checker:
@@ -1216,7 +1299,7 @@ class DiagnosticApp:
                 messagebox.showwarning("Внимание", "Выберите файл")
                 return
             text_editor.config(state=tk.DISABLED)
-            self.root.update()
+            editor_dialog.update()
             content = read_file(self.checker, filepath)
             text_editor.delete(1.0, tk.END)
             text_editor.insert(tk.END, content)
@@ -1247,12 +1330,12 @@ class DiagnosticApp:
             content = text_editor.get(1.0, tk.END)
             if messagebox.askyesno("Подтверждение", f"Сохранить изменения в {filepath}?", parent=editor_dialog):
                 text_editor.config(state=tk.DISABLED)
-                self.root.update()
+                editor_dialog.update()
                 result = write_file(self.checker, filepath, content)
                 self._display_result(result)
                 text_editor.config(state=tk.NORMAL)
                 original_content[0] = content
-                messagebox.showinfo("Успех", "Файл сохранён")
+                messagebox.showinfo("Успех", "Файл сохранён", parent=editor_dialog)
 
         def reload_file():
             filepath = current_filepath[0]
@@ -1341,7 +1424,6 @@ class DiagnosticApp:
 
         self.cmd_history.append(cmd)
         self.history_index = len(self.cmd_history)
-
         self.cmd_entry.delete(0, tk.END)
 
         if cmd.lower() in ('exit', 'quit'):
@@ -1350,14 +1432,17 @@ class DiagnosticApp:
             return
 
         self.log(f"\n$ {cmd}")
-        try:
+
+        def run_cmd():
             stdout, stderr = self.checker.exec_command(cmd)
+            parts = []
             if stdout.strip():
-                self.log(stdout.strip())
+                parts.append(stdout.strip())
             if stderr.strip():
-                self.log("STDERR: " + stderr.strip())
-        except Exception as e:
-            self.log(f"Ошибка выполнения команды: {e}")
+                parts.append("STDERR: " + stderr.strip())
+            return "\n".join(parts) if parts else "(нет вывода)"
+
+        self._run_simple(run_cmd, self.send_btn)
 
     def disconnect(self):
         with self._busy_lock:

@@ -1,5 +1,6 @@
 import paramiko
 import os
+import threading
 
 
 class ServerChecker:
@@ -50,7 +51,8 @@ class ServerChecker:
             )
             return False, error_msg
 
-    def exec_command(self, command):
+    def _exec(self, command):
+        """Низкоуровневый запуск: возвращает (stdout, stderr, exit_status)."""
         if not self.client:
             raise Exception("Нет активного соединения")
         stdin, stdout, stderr = self.client.exec_command(command)
@@ -64,7 +66,6 @@ class ServerChecker:
             except Exception:
                 pass
 
-        import threading
         t_out = threading.Thread(target=_read, args=(stdout, stdout_chunks))
         t_err = threading.Thread(target=_read, args=(stderr, stderr_chunks))
         t_out.start()
@@ -72,9 +73,24 @@ class ServerChecker:
         t_out.join()
         t_err.join()
 
+        # Код возврата команды (0 = успех).
+        try:
+            exit_status = stdout.channel.recv_exit_status()
+        except Exception:
+            exit_status = -1
+
         out = b''.join(stdout_chunks).decode('utf-8', errors='ignore')
         err = b''.join(stderr_chunks).decode('utf-8', errors='ignore')
+        return out, err, exit_status
+
+    def exec_command(self, command):
+        """Обратная совместимость: возвращает (stdout, stderr)."""
+        out, err, _ = self._exec(command)
         return out, err
+
+    def run(self, command):
+        """Возвращает (stdout, stderr, exit_status)."""
+        return self._exec(command)
 
     def close(self):
         if self.client:
