@@ -853,13 +853,13 @@ def get_config_files(checker, panel_type):
 # ==================== УПРАВЛЕНИЕ ISPmanager ====================
 def ispmanager_restart(checker):
     lines = ["=== ПЕРЕЗАПУСК ISPmanager ==="]
-    out, err = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr exit 2>&1')
-    if err.strip():
-        lines.append(f"❌ Ошибка: {err}")
+    out, err, rc = checker.run('/usr/local/mgr5/sbin/mgrctl -m ispmgr exit 2>&1')
+    if rc != 0:
+        lines.append(f"❌ Ошибка (rc={rc}): {err.strip() or out.strip()}")
     else:
         lines.append("✅ Команда на перезапуск отправлена через mgrctl")
     checker.exec_command('sleep 3')
-    out2, _ = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr sysinfo 2>&1 | head -1')
+    out2, _, _ = checker.run('/usr/local/mgr5/sbin/mgrctl -m ispmgr sysinfo 2>&1 | head -1')
     lines.append("✅ Панель работает" if 'error' not in out2.lower() else "⚠️ Панель возможно не запустилась")
     return "\n".join(lines)
 
@@ -877,16 +877,16 @@ def ispmanager_kill_core(checker):
 def ispmanager_update(checker):
     lines = ["=== ОБНОВЛЕНИЕ ISPmanager ==="]
     lines.append("⚠️ Обновление может занять несколько минут...")
-    out, err = checker.exec_command('/usr/local/mgr5/sbin/pkgupgrade.sh coremanager 2>&1')
-    lines.append("✅ Обновление завершено" if not err.strip() else f"❌ Ошибка обновления: {err}")
+    out, err, rc = checker.run('/usr/local/mgr5/sbin/pkgupgrade.sh coremanager 2>&1')
+    lines.append("✅ Обновление завершено" if rc == 0 else f"❌ Ошибка обновления (rc={rc}): {err.strip() or out.strip()}")
     return "\n".join(lines)
 
 
 def ispmanager_ssl_issue(checker):
     lines = ["=== ПРИНУДИТЕЛЬНЫЙ ВЫПУСК LET'S ENCRYPT ==="]
     lines.append("⚠️ Процесс может занять несколько минут...")
-    out, err = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr letsencrypt.periodic 2>&1')
-    lines.append("✅ Команда выполнена" if not err.strip() else f"❌ Ошибка: {err}")
+    out, err, rc = checker.run('/usr/local/mgr5/sbin/mgrctl -m ispmgr letsencrypt.periodic 2>&1')
+    lines.append("✅ Команда выполнена" if rc == 0 else f"❌ Ошибка (rc={rc}): {err.strip() or out.strip()}")
     return "\n".join(lines)
 
 
@@ -903,8 +903,8 @@ def ispmanager_disable(checker):
 
 def ispmanager_disable_geoip(checker):
     lines = ["=== ОТКЛЮЧЕНИЕ GEOIP В ISPmanager ==="]
-    out, err = checker.exec_command('/usr/local/mgr5/sbin/mgrctl -m ispmgr usrparam setgeoip=off sok=ok 2>&1')
-    lines.append("✅ GeoIP отключён" if not err.strip() else f"❌ Ошибка: {err}")
+    out, err, rc = checker.run('/usr/local/mgr5/sbin/mgrctl -m ispmgr usrparam setgeoip=off sok=ok 2>&1')
+    lines.append("✅ GeoIP отключён" if rc == 0 else f"❌ Ошибка (rc={rc}): {err.strip() or out.strip()}")
     return "\n".join(lines)
 
 
@@ -925,8 +925,8 @@ def ispmanager_fix_cron_path(checker):
     else:
         lines.append("⚠️ Не удалось создать резервную копию crontab")
 
-    out, err = checker.exec_command("crontab -l 2>/dev/null | sed 's/^PATH=/#PATH=/' | crontab - 2>&1")
-    lines.append("✅ Переменная PATH закомментирована" if not err.strip() else f"❌ Ошибка: {err}")
+    out, err, rc = checker.run("crontab -l 2>/dev/null | sed 's/^PATH=/#PATH=/' | crontab - 2>&1")
+    lines.append("✅ Переменная PATH закомментирована" if rc == 0 else f"❌ Ошибка (rc={rc}): {err.strip() or out.strip()}")
     return "\n".join(lines)
 
 
@@ -989,8 +989,17 @@ def replace_ipv4(checker, old_ip, new_ip):
 def replace_ipv6(checker, old_ip, new_ip):
     """Замена старого IPv6 на новый во всех файлах в /etc (как в ручной команде)."""
     lines = [f"=== ЗАМЕНА IPv6: {old_ip} -> {new_ip} ==="]
+    # Автобэкап /etc перед массовой заменой (сама команда замены не меняется)
+    ensure_backup_dir(checker)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    etc_backup = f"{BACKUP_SUBDIRS['configs']}/etc_{ts}.tar.gz"
+    _, _, brc = checker.run(f"tar czf {q(etc_backup)} /etc 2>/dev/null")
+    if brc == 0:
+        lines.append(f"✅ Резервная копия /etc создана: {etc_backup}")
+    else:
+        lines.append("⚠️ Не удалось создать резервную копию /etc (продолжаем)")
     cmd = f"find /etc -type f -exec sed -i 's/{old_ip}/{new_ip}/g' {{}} +"
-    out, err = checker.exec_command(cmd)
+    out, err, rc = checker.run(cmd)
     if err.strip():
         lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
     lines.append("✅ IPv6 заменён во всех файлах в /etc.")

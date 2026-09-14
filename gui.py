@@ -4,6 +4,8 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 import threading
 import re
+import os
+import logging
 import subprocess
 from diagnostic import (
     detect_panel, full_diagnostic_report,
@@ -99,6 +101,15 @@ class DiagnosticApp:
         # Флаг занятости: защита от параллельных задач и отключения во время задачи
         self._busy = False
         self._busy_lock = threading.Lock()
+
+        # Логирование в файл (история сохраняется после закрытия окна)
+        self._log_path = os.path.expanduser("~/.techsupp_diagtool.log")
+        self._logger = logging.getLogger("techsupp_diagtool")
+        if not self._logger.handlers:
+            self._logger.setLevel(logging.INFO)
+            fh = logging.FileHandler(self._log_path, encoding="utf-8")
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            self._logger.addHandler(fh)
 
         self.create_widgets()
         self.cmd_entry.focus_set()
@@ -566,6 +577,10 @@ class DiagnosticApp:
     def log(self, text):
         self.output.insert(tk.END, text + "\n")
         self.output.see(tk.END)
+        try:
+            self._logger.info(text)
+        except Exception:
+            pass
 
     def history_up(self, event):
         if not self.cmd_history:

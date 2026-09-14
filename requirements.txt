@@ -1,2 +1,2 @@
-paramiko
-ttkbootstrap
+paramiko==5.0.0
+ttkbootstrap==2.2.2

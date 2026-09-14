@@ -6,3 +6,8 @@ __pycache__/
 .DS_Store
 *.swp
 *.swo
+
+# PyInstaller / build artifacts
+dist/
+build/
+*.spec
