@@ -1,7 +1,12 @@
 import tkinter as tk
-import re
-import threading
 from tkinter import messagebox, filedialog, scrolledtext, simpledialog, ttk
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+import threading
+import re
+import os
+import logging
+import subprocess
 from diagnostic import (
     detect_panel, full_diagnostic_report,
     metrics_report, firewall_report,
@@ -29,14 +34,55 @@ from diagnostic import (
 )
 from ssh_client import ServerChecker
 
+
+# ==================== НАСТРОЙКИ ТЕМ ====================
+DARK_THEMES = ['darkly', 'cyborg', 'superhero', 'vapor', 'solar']
+LIGHT_THEMES = ['flatly', 'litera', 'minty', 'pulse', 'cosmo', 'sandstone']
+
+def get_theme_colors(theme_name):
+    """Возвращает цвета для поля вывода в зависимости от темы"""
+    if theme_name in DARK_THEMES:
+        return {
+            'bg': '#1a1a1a',
+            'fg': '#d3d7cf',
+            'insertbackground': 'white',
+            'selectbackground': '#3465a4'
+        }
+    else:
+        return {
+            'bg': '#ffffff',
+            'fg': '#000000',
+            'insertbackground': 'black',
+            'selectbackground': '#3465a4'
+        }
+
+def detect_system_theme():
+    """
+    Определяет тему ОС (Linux/GNOME) и возвращает имя темы для ttkbootstrap.
+    """
+    try:
+        result = subprocess.run(
+            ['gsettings', 'get', 'org.gnome.desktop.interface', 'gtk-theme'],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            theme = result.stdout.strip().strip("'")
+            if 'dark' in theme.lower() or 'black' in theme.lower():
+                return 'darkly'
+            else:
+                return 'flatly'
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return 'darkly'
+
+
 class DiagnosticApp:
-    def __init__(self, root):
-        self.root = root
+    def __init__(self):
+        self.initial_theme = detect_system_theme()
+        self.root = tb.Window(themename=self.initial_theme)
         self.root.title("SSH Диагностика сервера")
         self.root.geometry("1100x720")
         self.root.minsize(1000, 650)
-
-        self.setup_theme()
 
         self.ip_var = tk.StringVar()
         self.port_var = tk.StringVar(value="22")
@@ -50,209 +96,478 @@ class DiagnosticApp:
 
         self.cmd_history = []
         self.history_index = -1
+        self.current_theme = self.initial_theme
+
+        # Флаг занятости: защита от параллельных задач и отключения во время задачи
+        self._busy = False
+        self._busy_lock = threading.Lock()
+
+        # Логирование в файл (история сохраняется после закрытия окна)
+        self._log_path = os.path.expanduser("~/.techsupp_diagtool.log")
+        self._logger = logging.getLogger("techsupp_diagtool")
+        if not self._logger.handlers:
+            self._logger.setLevel(logging.INFO)
+            fh = logging.FileHandler(self._log_path, encoding="utf-8")
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            self._logger.addHandler(fh)
 
         self.create_widgets()
-
         self.cmd_entry.focus_set()
 
-    def setup_theme(self):
-        self.bg = "#2e3436"
-        self.fg = "#eeeeee"
-        self.select_bg = "#3465a4"
-        self.btn_bg = "#3c3f41"
-        self.btn_fg = "#ffffff"
-        self.btn_active_bg = "#555753"
-        self.entry_bg = "#2c2e30"
-        self.entry_fg = "#ffffff"
-        self.output_bg = "#1a1a1a"
-        self.output_fg = "#d3d7cf"
+    def update_output_colors(self, theme_name=None):
+        if theme_name is None:
+            theme_name = self.root.style.theme.name
+        colors = get_theme_colors(theme_name)
+        self.output.config(
+            bg=colors['bg'],
+            fg=colors['fg'],
+            insertbackground=colors['insertbackground'],
+            selectbackground=colors['selectbackground']
+        )
 
-        self.root.configure(bg=self.bg)
+    def apply_scrollbar_style(self, theme_name=None):
+        """Настраивает ширину и цвет вертикальной полосы прокрутки (для tk.Scrollbar)"""
+        if theme_name is None:
+            theme_name = self.root.style.theme.name
 
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('TButton', background=self.btn_bg, foreground=self.btn_fg, bordercolor='#555753', focuscolor='none')
-        style.map('TButton', background=[('active', self.btn_active_bg), ('pressed', '#204a87')])
+        # Настраиваем скроллбар напрямую (это tk.Scrollbar, не ttk)
+        if hasattr(self, 'output') and hasattr(self.output, 'vbar'):
+            self.output.vbar.config(
+                width=20,
+                bg='#0078d4',
+                activebackground='#1084d4',
+                troughcolor='#2a2a2a' if theme_name in DARK_THEMES else '#e0e0e0'
+            )
+            
+    def switch_theme(self, theme_name):
+        try:
+            self.root.style.theme_use(theme_name)
+            self.update_output_colors(theme_name)
+            self.apply_scrollbar_style(theme_name)
+            self.current_theme = theme_name
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось переключить тему: {e}")
 
     def create_widgets(self):
-        # Верхняя панель: ввод данных
-        top_frame = tk.Frame(self.root, bg=self.bg)
+        top_frame = tb.Frame(self.root, bootstyle="secondary")
         top_frame.pack(fill=tk.X, padx=10, pady=5)
 
         # IP
-        tk.Label(top_frame, text="IP:", bg=self.bg, fg=self.fg).grid(row=0, column=0, sticky='e', padx=5)
-        self.ip_entry = tk.Entry(top_frame, textvariable=self.ip_var, width=15, bg=self.entry_bg, fg=self.entry_fg, insertbackground='white')
+        tb.Label(top_frame, text="IP:", bootstyle="inverse-secondary").grid(
+            row=0, column=0, sticky='e', padx=5
+        )
+        self.ip_entry = tb.Entry(top_frame, textvariable=self.ip_var, width=15)
         self.ip_entry.grid(row=0, column=1, padx=5)
 
         # Порт
-        tk.Label(top_frame, text="Порт:", bg=self.bg, fg=self.fg).grid(row=0, column=2, sticky='e', padx=5)
-        tk.Entry(top_frame, textvariable=self.port_var, width=6, bg=self.entry_bg, fg=self.entry_fg, insertbackground='white').grid(row=0, column=3, padx=5)
+        tb.Label(top_frame, text="Порт:", bootstyle="inverse-secondary").grid(
+            row=0, column=2, sticky='e', padx=5
+        )
+        tb.Entry(top_frame, textvariable=self.port_var, width=6).grid(
+            row=0, column=3, padx=5
+        )
 
         # Пользователь
-        tk.Label(top_frame, text="Пользователь:", bg=self.bg, fg=self.fg).grid(row=0, column=4, sticky='e', padx=5)
-        tk.Entry(top_frame, textvariable=self.user_var, width=12, bg=self.entry_bg, fg=self.entry_fg, insertbackground='white').grid(row=0, column=5, padx=5)
+        tb.Label(top_frame, text="Пользователь:", bootstyle="inverse-secondary").grid(
+            row=0, column=4, sticky='e', padx=5
+        )
+        tb.Entry(top_frame, textvariable=self.user_var, width=12).grid(
+            row=0, column=5, padx=5
+        )
 
         # Пароль
-        tk.Label(top_frame, text="Пароль:", bg=self.bg, fg=self.fg).grid(row=0, column=6, sticky='e', padx=5)
-        tk.Entry(top_frame, textvariable=self.password_var, show="*", width=12, bg=self.entry_bg, fg=self.entry_fg, insertbackground='white').grid(row=0, column=7, padx=5)
+        tb.Label(top_frame, text="Пароль:", bootstyle="inverse-secondary").grid(
+            row=0, column=6, sticky='e', padx=5
+        )
+        tb.Entry(top_frame, textvariable=self.password_var, show="*", width=12).grid(
+            row=0, column=7, padx=5
+        )
 
         # Ключ
-        tk.Label(top_frame, text="Ключ:", bg=self.bg, fg=self.fg).grid(row=1, column=0, sticky='e', padx=5)
-        tk.Entry(top_frame, textvariable=self.key_var, width=30, bg=self.entry_bg, fg=self.entry_fg, insertbackground='white').grid(row=1, column=1, columnspan=6, sticky='ew', padx=5)
-        tk.Button(top_frame, text="Обзор", command=self.browse_key, bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg).grid(row=1, column=7, padx=5)
+        tb.Label(top_frame, text="Ключ:", bootstyle="inverse-secondary").grid(
+            row=1, column=0, sticky='e', padx=5
+        )
+        tb.Entry(top_frame, textvariable=self.key_var, width=30).grid(
+            row=1, column=1, columnspan=6, sticky='ew', padx=5
+        )
+        tb.Button(
+            top_frame,
+            text="Обзор",
+            command=self.browse_key,
+            bootstyle="secondary-outline"
+        ).grid(row=1, column=7, padx=5)
 
         # Тип панели
-        tk.Label(top_frame, text="Панель:", bg=self.bg, fg=self.fg).grid(row=2, column=0, sticky='e', padx=5)
-        panel_frame = tk.Frame(top_frame, bg=self.bg)
+        tb.Label(top_frame, text="Панель:", bootstyle="inverse-secondary").grid(
+            row=2, column=0, sticky='e', padx=5
+        )
+        panel_frame = tb.Frame(top_frame, bootstyle="secondary")
         panel_frame.grid(row=2, column=1, columnspan=4, sticky='w', padx=5)
-        for text, value in [("Авто", "auto"), ("FastPanel", "fastpanel"), ("ISPmanager", "ispmanager"), ("Нет", "none")]:
-            rb = tk.Radiobutton(panel_frame, text=text, variable=self.panel_var, value=value,
-                                bg=self.bg, fg=self.fg, selectcolor=self.select_bg, activebackground=self.bg)
+
+        for text, value in [
+            ("Авто", "auto"),
+            ("FastPanel", "fastpanel"),
+            ("ISPmanager", "ispmanager"),
+            ("Нет", "none")
+        ]:
+            rb = tb.Radiobutton(
+                panel_frame,
+                text=text,
+                variable=self.panel_var,
+                value=value,
+                bootstyle="secondary-outline-toolbutton"
+            )
             rb.pack(side='left', padx=5)
 
         # Кнопки диагностики (первый ряд)
-        btn_frame = tk.Frame(self.root, bg=self.bg)
+        btn_frame = tb.Frame(self.root, bootstyle="secondary")
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        self.connect_btn = tk.Button(btn_frame, text="Подключиться", command=self.connect, bg="#4e9a06", fg=self.btn_fg, activebackground="#73d216")
+        # Подключение
+        self.connect_btn = tb.Button(
+            btn_frame,
+            text="Подключиться",
+            command=self.connect,
+            bootstyle="success"
+        )
         self.connect_btn.pack(side=tk.LEFT, padx=5)
 
-        self.full_btn = tk.Button(btn_frame, text="Полная диагностика", command=self.run_full, state=tk.DISABLED,
-                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        # Основные кнопки (используем solid для лучшей видимости)
+        self.full_btn = tb.Button(
+            btn_frame,
+            text="Полная диагностика",
+            command=self.run_full,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.full_btn.pack(side=tk.LEFT, padx=5)
 
-        self.disk_btn = tk.Button(btn_frame, text="Диски и память", command=self.run_disk_memory, state=tk.DISABLED,
-                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.disk_btn = tb.Button(
+            btn_frame,
+            text="Диски и память",
+            command=self.run_disk_memory,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.disk_btn.pack(side=tk.LEFT, padx=5)
 
-        self.network_btn = tk.Button(btn_frame, text="Сеть", command=self.run_network, state=tk.DISABLED,
-                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.network_btn = tb.Button(
+            btn_frame,
+            text="Сеть",
+            command=self.run_network,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.network_btn.pack(side=tk.LEFT, padx=5)
 
-        self.firewall_btn = tk.Button(btn_frame, text="Фаервол", command=self.run_firewall, state=tk.DISABLED,
-                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.firewall_btn = tb.Button(
+            btn_frame,
+            text="Фаервол",
+            command=self.run_firewall,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.firewall_btn.pack(side=tk.LEFT, padx=5)
 
-        self.config_btn = tk.Button(btn_frame, text="Конфиги веб", command=self.run_config, state=tk.DISABLED,
-                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.config_btn = tb.Button(
+            btn_frame,
+            text="Конфиги веб",
+            command=self.run_config,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.config_btn.pack(side=tk.LEFT, padx=5)
 
-        self.logs_btn = tk.Button(btn_frame, text="Логи сайтов", command=self.run_logs, state=tk.DISABLED,
-                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.logs_btn = tb.Button(
+            btn_frame,
+            text="Логи сайтов",
+            command=self.run_logs,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.logs_btn.pack(side=tk.LEFT, padx=5)
 
-        self.access_btn = tk.Button(btn_frame, text="Анализ логов доступа", command=self.run_access_analysis, state=tk.DISABLED,
-                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.access_btn = tb.Button(
+            btn_frame,
+            text="Анализ логов доступа",
+            command=self.run_access_analysis,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.access_btn.pack(side=tk.LEFT, padx=5)
 
-        self.oom_btn = tk.Button(btn_frame, text="Поиск OOM", command=self.run_oom_search, state=tk.DISABLED,
-                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.oom_btn = tb.Button(
+            btn_frame,
+            text="Поиск OOM",
+            command=self.run_oom_search,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.oom_btn.pack(side=tk.LEFT, padx=5)
 
-        self.dns_btn = tk.Button(btn_frame, text="DNS-проверка", command=self.run_dns_check, state=tk.DISABLED,
-                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.dns_btn = tb.Button(
+            btn_frame,
+            text="DNS-проверка",
+            command=self.run_dns_check,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.dns_btn.pack(side=tk.LEFT, padx=5)
 
-        self.resolv_btn = tk.Button(btn_frame, text="DNS-резолверы", command=self.run_dns_resolvers, state=tk.DISABLED,
-                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.resolv_btn = tb.Button(
+            btn_frame,
+            text="DNS-резолверы",
+            command=self.run_dns_resolvers,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.resolv_btn.pack(side=tk.LEFT, padx=5)
 
-        self.edit_dns_btn = tk.Button(btn_frame, text="Изменить DNS", command=self.run_edit_dns, state=tk.DISABLED,
-                              bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.edit_dns_btn = tb.Button(
+            btn_frame,
+            text="Изменить DNS",
+            command=self.run_edit_dns,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.edit_dns_btn.pack(side=tk.LEFT, padx=5)
 
-        # Кнопки замены IP
-        self.ipv4_btn = tk.Button(btn_frame, text="Заменить IPv4", command=self.run_replace_ipv4, state=tk.DISABLED,
-                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.ipv4_btn = tb.Button(
+            btn_frame,
+            text="Заменить IPv4",
+            command=self.run_replace_ipv4,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.ipv4_btn.pack(side=tk.LEFT, padx=5)
 
-        self.ipv6_btn = tk.Button(btn_frame, text="Заменить IPv6", command=self.run_replace_ipv6, state=tk.DISABLED,
-                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.ipv6_btn = tb.Button(
+            btn_frame,
+            text="Заменить IPv6",
+            command=self.run_replace_ipv6,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.ipv6_btn.pack(side=tk.LEFT, padx=5)
 
-        self.restart_btn = tk.Button(btn_frame, text="Перезапустить службы", command=self.run_restart_services, state=tk.DISABLED,
-                                    bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.restart_btn = tb.Button(
+            btn_frame,
+            text="Перезапустить службы",
+            command=self.run_restart_services,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.restart_btn.pack(side=tk.LEFT, padx=5)
 
-        # Кнопки редактора конфигов
-        self.config_editor_btn = tk.Button(btn_frame, text="Редактор конфигов", command=self.run_config_editor, state=tk.DISABLED,
-                                   bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.config_editor_btn = tb.Button(
+            btn_frame,
+            text="Редактор конфигов",
+            command=self.run_config_editor,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.config_editor_btn.pack(side=tk.LEFT, padx=5)
 
-        # Кнопки управления ISPmanager
-        self.ispmanager_frame = tk.Frame(btn_frame, bg=self.bg)
+        # ---------- ПЕРЕКЛЮЧАТЕЛЬ ТЕМ ----------
+        theme_frame = tb.Frame(btn_frame, bootstyle="secondary")
+        theme_frame.pack(side=tk.RIGHT, padx=10)
+
+        tb.Label(theme_frame, text="Тема:", bootstyle="inverse-secondary").pack(side=tk.LEFT, padx=5)
+
+        available_themes = DARK_THEMES + LIGHT_THEMES
+        self.theme_var = tk.StringVar(value=self.initial_theme)
+
+        theme_combo = ttk.Combobox(
+            theme_frame,
+            textvariable=self.theme_var,
+            values=available_themes,
+            state='readonly',
+            width=12
+        )
+        theme_combo.pack(side=tk.LEFT, padx=5)
+        theme_combo.bind('<<ComboboxSelected>>', lambda e: self.switch_theme(self.theme_var.get()))
+
+        self.toggle_theme_btn = tb.Button(
+            theme_frame,
+            text="🌓",
+            command=self.toggle_theme,
+            bootstyle="secondary",
+            width=3
+        )
+        self.toggle_theme_btn.pack(side=tk.LEFT, padx=5)
+
+        # ---------- КНОПКИ ISPmanager ----------
+        self.ispmanager_frame = tb.Frame(btn_frame, bootstyle="secondary")
         self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
         self.ispmanager_frame.pack_forget()
 
-        self.isp_restart_btn = tk.Button(self.ispmanager_frame, text="Перезапустить панель", command=self.run_isp_restart, state=tk.DISABLED,
-                                 bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.isp_restart_btn = tb.Button(
+            self.ispmanager_frame,
+            text="Перезапустить панель",
+            command=self.run_isp_restart,
+            state=tk.DISABLED,
+            bootstyle="warning"
+        )
         self.isp_restart_btn.pack(side=tk.LEFT, padx=2)
 
-        self.isp_kill_btn = tk.Button(self.ispmanager_frame, text="Kill core", command=self.run_isp_kill, state=tk.DISABLED,
-                              bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.isp_kill_btn = tb.Button(
+            self.ispmanager_frame,
+            text="Kill core",
+            command=self.run_isp_kill,
+            state=tk.DISABLED,
+            bootstyle="danger"
+        )
         self.isp_kill_btn.pack(side=tk.LEFT, padx=2)
 
-        self.isp_update_btn = tk.Button(self.ispmanager_frame, text="Обновить панель", command=self.run_isp_update, state=tk.DISABLED,
-                                bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.isp_update_btn = tb.Button(
+            self.ispmanager_frame,
+            text="Обновить панель",
+            command=self.run_isp_update,
+            state=tk.DISABLED,
+            bootstyle="info"
+        )
         self.isp_update_btn.pack(side=tk.LEFT, padx=2)
 
-        self.isp_ssl_btn = tk.Button(self.ispmanager_frame, text="Выпуск SSL", command=self.run_isp_ssl, state=tk.DISABLED,
-                             bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.isp_ssl_btn = tb.Button(
+            self.ispmanager_frame,
+            text="Выпуск SSL",
+            command=self.run_isp_ssl,
+            state=tk.DISABLED,
+            bootstyle="primary"
+        )
         self.isp_ssl_btn.pack(side=tk.LEFT, padx=2)
 
-        self.isp_disable_btn = tk.Button(self.ispmanager_frame, text="Отключить панель", command=self.run_isp_disable, state=tk.DISABLED,
-                                 bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.isp_disable_btn = tb.Button(
+            self.ispmanager_frame,
+            text="Отключить панель",
+            command=self.run_isp_disable,
+            state=tk.DISABLED,
+            bootstyle="danger"
+        )
         self.isp_disable_btn.pack(side=tk.LEFT, padx=2)
 
-        self.isp_geoip_btn = tk.Button(self.ispmanager_frame, text="Отключить GeoIP", command=self.run_isp_geoip, state=tk.DISABLED,
-                               bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.isp_geoip_btn = tb.Button(
+            self.ispmanager_frame,
+            text="Отключить GeoIP",
+            command=self.run_isp_geoip,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.isp_geoip_btn.pack(side=tk.LEFT, padx=2)
 
-        self.isp_cron_btn = tk.Button(self.ispmanager_frame, text="Проверить CRON", command=self.run_isp_cron, state=tk.DISABLED,
-                              bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.isp_cron_btn = tb.Button(
+            self.ispmanager_frame,
+            text="Проверить CRON",
+            command=self.run_isp_cron,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.isp_cron_btn.pack(side=tk.LEFT, padx=2)
 
-        self.isp_fix_cron_btn = tk.Button(self.ispmanager_frame, text="Исправить CRON", command=self.run_isp_fix_cron, state=tk.DISABLED,
-                                  bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.isp_fix_cron_btn = tb.Button(
+            self.ispmanager_frame,
+            text="Исправить CRON",
+            command=self.run_isp_fix_cron,
+            state=tk.DISABLED,
+            bootstyle="warning"
+        )
         self.isp_fix_cron_btn.pack(side=tk.LEFT, padx=2)
 
-        # Кнопки управления swap (второй ряд)
-        swap_frame = tk.Frame(self.root, bg=self.bg)
+        # ---------- КНОПКИ SWAP ----------
+        swap_frame = tb.Frame(self.root, bootstyle="secondary")
         swap_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        self.swap_btn = tk.Button(swap_frame, text="Создать swap файл", command=self.create_swap, state=tk.DISABLED,
-                                  bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.swap_btn = tb.Button(
+            swap_frame,
+            text="Создать swap файл",
+            command=self.create_swap,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.swap_btn.pack(side=tk.LEFT, padx=5)
 
-        self.fstab_btn = tk.Button(swap_frame, text="Прописать swap в fstab", command=self.add_swap_to_fstab, state=tk.DISABLED,
-                                   bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.fstab_btn = tb.Button(
+            swap_frame,
+            text="Прописать swap в fstab",
+            command=self.add_swap_to_fstab,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
         self.fstab_btn.pack(side=tk.LEFT, padx=5)
 
-        # Текстовое поле для вывода
-        self.output = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, font=("Courier", 10),
-                                                bg=self.output_bg, fg=self.output_fg, insertbackground='white')
-        self.output.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # ---------- ПРОГРЕСС-БАР ----------
+        self.progress = tb.Progressbar(
+            self.root,
+            bootstyle="info-striped",
+            mode='indeterminate',
+            length=200
+        )
+        self.progress.pack(pady=5)
+        self.progress.pack_forget()
 
-        # Нижняя панель: интерактивная командная строка
-        cmd_frame = tk.Frame(self.root, bg=self.bg)
+        # ---------- ТЕКСТОВОЕ ПОЛЕ ВЫВОДА ----------
+        self.output = scrolledtext.ScrolledText(
+            self.root,
+            wrap=tk.WORD,
+            font=("Courier", 10)
+        )
+        self.output.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.update_output_colors(self.initial_theme)
+        self.apply_scrollbar_style(self.initial_theme)
+
+        # ---------- ИНТЕРАКТИВНЫЙ ТЕРМИНАЛ ----------
+        cmd_frame = tb.Frame(self.root, bootstyle="secondary")
         cmd_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        tk.Label(cmd_frame, text="Команда:", bg=self.bg, fg=self.fg).pack(side=tk.LEFT, padx=5)
-        self.cmd_entry = tk.Entry(cmd_frame, bg=self.entry_bg, fg=self.entry_fg, insertbackground='white')
+        tb.Label(cmd_frame, text="Команда:", bootstyle="inverse-secondary").pack(
+            side=tk.LEFT, padx=5
+        )
+        self.cmd_entry = tb.Entry(cmd_frame)
         self.cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         self.cmd_entry.bind("<Return>", self.send_command)
         self.cmd_entry.bind("<Up>", self.history_up)
         self.cmd_entry.bind("<Down>", self.history_down)
+        self.cmd_entry.bind("<Tab>", self.autocomplete)
 
-        self.send_btn = tk.Button(cmd_frame, text="Send", command=self.send_command, state=tk.DISABLED,
-                                  bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active_bg)
+        self.send_btn = tb.Button(
+            cmd_frame,
+            text="Send",
+            command=self.send_command,
+            state=tk.DISABLED,
+            bootstyle="primary"
+        )
         self.send_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.history_btn = tk.Button(cmd_frame, text="История", command=self.show_bash_history,
-                             bg=self.btn_bg, fg=self.btn_fg)
+
+        self.history_btn = tb.Button(
+            cmd_frame,
+            text="История",
+            command=self.show_bash_history,
+            bootstyle="secondary"
+        )
         self.history_btn.pack(side=tk.LEFT, padx=5)
 
         self.log("Ожидание подключения...")
+
+    # ---------- АВТОДОПОЛНЕНИЕ ----------
+    def autocomplete(self, event):
+        """Простое автодополнение по истории команд при нажатии Tab"""
+        current = self.cmd_entry.get()
+        if not current:
+            return None
+        matches = [cmd for cmd in self.cmd_history if cmd.startswith(current)]
+        if matches:
+            self.cmd_entry.delete(0, tk.END)
+            self.cmd_entry.insert(0, matches[0])
+        return "break"
+
+    def toggle_theme(self):
+        current_theme = self.root.style.theme.name
+        if current_theme in DARK_THEMES:
+            new_theme = 'flatly'
+        else:
+            new_theme = 'darkly'
+        self.switch_theme(new_theme)
+        self.theme_var.set(new_theme)
 
     def browse_key(self):
         filename = filedialog.askopenfilename()
@@ -262,8 +577,14 @@ class DiagnosticApp:
     def log(self, text):
         self.output.insert(tk.END, text + "\n")
         self.output.see(tk.END)
+        try:
+            self._logger.info(text)
+        except Exception:
+            pass
 
     def history_up(self, event):
+        if not self.cmd_history:
+            return "break"
         if self.history_index > 0:
             self.history_index -= 1
             self.cmd_entry.delete(0, tk.END)
@@ -293,25 +614,43 @@ class DiagnosticApp:
         password = self.password_var.get().strip()
         key_path = self.key_var.get().strip()
 
+        # Не даём запустить повторное подключение поверх активного/идущего
+        with self._busy_lock:
+            if self._busy:
+                messagebox.showwarning("Занято", "Дождитесь завершения текущей операции.")
+                return
+            if self.checker is not None:
+                messagebox.showinfo("Подключение", "Сначала отключитесь от текущего сервера.")
+                return
+            self._busy = True
+
+        self.connect_btn.config(state=tk.DISABLED)
         self.log(f"\n=== Подключение к {ip}:{port} ...")
-        self.checker = ServerChecker(ip, port, user, password, key_path)
-        success, message = self.checker.connect()
-        
-        if not success:
-            self.log(f"❌ {message}")
-            self.checker = None
-            return
 
+        def worker():
+            checker = ServerChecker(ip, port, user, password, key_path)
+            success, message = checker.connect()
+            if success:
+                if self.panel_var.get() == 'auto':
+                    panel_type = detect_panel(checker)
+                else:
+                    panel_type = self.panel_var.get()
+                self.root.after(0, self._on_connect_success, checker, panel_type, message)
+            else:
+                self.root.after(0, self._on_connect_failure, message)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_connect_success(self, checker, panel_type, message):
+        self.checker = checker
+        self.panel_type = panel_type
         self.log(f"✅ {message}")
-
-        if self.panel_var.get() == 'auto':
-            self.panel_type = detect_panel(self.checker)
-        else:
-            self.panel_type = self.panel_var.get()
-
         self.log(f"Панель управления: {self.panel_type}")
 
-        # Активируем кнопки диагностики
+        # Очищаем пароль из памяти после успешного подключения
+        self.password_var.set("")
+
+        # Активируем кнопки
         self.full_btn.config(state=tk.NORMAL)
         self.disk_btn.config(state=tk.NORMAL)
         self.network_btn.config(state=tk.NORMAL)
@@ -331,32 +670,59 @@ class DiagnosticApp:
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
 
-        # Показываем/скрываем кнопки ISPmanager
+        # ISPmanager кнопки
         if self.panel_type == 'ispmanager':
             self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
-            for btn in [self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
-                        self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
-                        self.isp_cron_btn, self.isp_fix_cron_btn]:
+            for btn in [
+                self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
+                self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
+                self.isp_cron_btn, self.isp_fix_cron_btn
+            ]:
                 btn.config(state=tk.NORMAL)
         else:
             self.ispmanager_frame.pack_forget()
-            for btn in [self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
-                        self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
-                        self.isp_cron_btn, self.isp_fix_cron_btn]:
+            for btn in [
+                self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
+                self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
+                self.isp_cron_btn, self.isp_fix_cron_btn
+            ]:
                 btn.config(state=tk.DISABLED)
 
-        self.connect_btn.config(text="Отключиться", bg="#cc0000", state=tk.NORMAL, command=self.disconnect)
+        self.connect_btn.config(text="Отключиться", bootstyle="danger", command=self.disconnect)
+        self.connect_btn.config(state=tk.NORMAL)
         self.cmd_entry.focus_set()
+        with self._busy_lock:
+            self._busy = False
 
-    # ==================== ФУНКЦИИ ДЛЯ ФОНОВЫХ ПОТОКОВ ====================
+    def _on_connect_failure(self, message):
+        self.log(f"❌ {message}")
+        self.connect_btn.config(state=tk.NORMAL)
+        with self._busy_lock:
+            self._busy = False
+
+    # ---------- ФОНОВЫЕ ЗАДАЧИ ----------
     def _run_in_thread(self, target_func, btn=None, *args, **kwargs):
-        """Запускает функцию в фоновом потоке"""
-        if not self.checker:
-            return
-        
+        """
+        Запускает target_func в фоновом потоке.
+        Защищает от параллельного запуска нескольких задач и от гонки
+        с disconnect(): пока задача выполняется, соединение не закрывается.
+        """
+        with self._busy_lock:
+            if self._busy:
+                messagebox.showwarning("Занято", "Дождитесь завершения текущей операции.")
+                return
+            if not self.checker:
+                return
+            self._busy = True
+
         if btn:
-            btn.config(state=tk.DISABLED, text="Выполняется...")
-        
+            btn.config(state=tk.DISABLED)
+        self.progress.pack(pady=5)
+        self.progress.start(10)
+
+        # Запоминаем checker на время задачи, чтобы disconnect его не обнулил
+        active_checker = self.checker
+
         def wrapper():
             try:
                 result = target_func(*args, **kwargs)
@@ -364,21 +730,62 @@ class DiagnosticApp:
             except Exception as e:
                 self.root.after(0, self._display_result, f"❌ Ошибка: {str(e)}")
             finally:
+                self.root.after(0, self._stop_progress)
                 if btn:
-                    # Восстанавливаем кнопку после завершения
-                    original_text = btn.cget('text').replace(' (Выполняется...)', '')
-                    self.root.after(0, lambda: btn.config(state=tk.NORMAL, text=original_text))
-        
+                    self.root.after(0, lambda b=btn: b.config(state=tk.NORMAL))
+                with self._busy_lock:
+                    self._busy = False
+                del active_checker
+
         thread = threading.Thread(target=wrapper)
         thread.daemon = True
         thread.start()
 
+    def _run_simple(self, fn, btn=None, on_done=None, *args, **kwargs):
+        """
+        Запускает произвольную функцию в потоке, результат отдаёт в on_done(result).
+        Используется для операций, чей вывод не является «отчётом» диагностики.
+        """
+        with self._busy_lock:
+            if self._busy:
+                messagebox.showwarning("Занято", "Дождитесь завершения текущей операции.")
+                return
+            if not self.checker:
+                return
+            self._busy = True
+
+        if btn:
+            btn.config(state=tk.DISABLED)
+        self.progress.pack(pady=5)
+        self.progress.start(10)
+
+        def wrapper():
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as e:
+                result = f"❌ Ошибка: {str(e)}"
+            finally:
+                self.root.after(0, self._stop_progress)
+                if btn:
+                    self.root.after(0, lambda b=btn: b.config(state=tk.NORMAL))
+                with self._busy_lock:
+                    self._busy = False
+            if on_done:
+                self.root.after(0, on_done, result)
+            else:
+                self.root.after(0, self._display_result, result)
+
+        threading.Thread(target=wrapper, daemon=True).start()
+
+    def _stop_progress(self):
+        self.progress.stop()
+        self.progress.pack_forget()
+
     def _display_result(self, text):
-        """Безопасно выводит результат в GUI из любого потока"""
         self.log("\n" + "="*60)
         self.log(text)
 
-    # ==================== ДИАГНОСТИКИ ====================
+    # ---------- ДИАГНОСТИКИ ----------
     def run_full(self):
         self._run_in_thread(full_diagnostic_report, self.full_btn, self.checker, self.panel_type)
 
@@ -400,103 +807,163 @@ class DiagnosticApp:
     def run_oom_search(self):
         self._run_in_thread(search_oom_logs, self.oom_btn, self.checker)
 
-    # ==================== АНАЛИЗ ЛОГОВ ДОСТУПА ====================
+    # ---------- АНАЛИЗ ЛОГОВ ДОСТУПА ----------
     def run_access_analysis(self):
         if not self.checker:
             return
-        
-        domains = get_domains(self.checker, self.panel_type)
+
+        # get_domains делает SSH-вызовы — грузим его в фоне, диалог откроем по готовности
+        self.log("Получение списка доменов...")
+        self._run_simple(
+            get_domains, None, self._open_access_dialog,
+            self.checker, self.panel_type
+        )
+
+    def _open_access_dialog(self, domains):
+        if isinstance(domains, str):
+            # пришла строка ошибки
+            self.log(domains)
+            domains = []
+
         domain_var = tk.StringVar()
         if domains:
             domain_var.set(domains[0])
 
-        dialog = tk.Toplevel(self.root)
+        dialog = tb.Toplevel(self.root)
         dialog.title("Анализ логов доступа")
-        dialog.geometry("500x320")
-        dialog.configure(bg=self.bg)
+        dialog.geometry("520x360")
         dialog.transient(self.root)
         dialog.grab_set()
 
         row = 0
-        tk.Label(dialog, text="Домен:", bg=self.bg, fg=self.fg).grid(row=row, column=0, sticky='e', padx=5, pady=5)
-        domain_combo = ttk.Combobox(dialog, textvariable=domain_var, values=domains, state='normal')
+        tb.Label(dialog, text="Домен:", bootstyle="inverse-secondary").grid(
+            row=row, column=0, sticky='e', padx=5, pady=5
+        )
+        domain_combo = ttk.Combobox(
+            dialog, textvariable=domain_var, values=domains, state='normal'
+        )
         domain_combo.grid(row=row, column=1, columnspan=3, padx=5, pady=5, sticky='ew')
         if not domains:
             domain_combo.set('')
         row += 1
 
-        tk.Label(dialog, text="Топ-Х:", bg=self.bg, fg=self.fg).grid(row=row, column=0, sticky='e', padx=5, pady=5)
+        tb.Label(dialog, text="Топ-Х:", bootstyle="inverse-secondary").grid(
+            row=row, column=0, sticky='e', padx=5, pady=5
+        )
         top_var = tk.StringVar(value="10")
-        tk.Entry(dialog, textvariable=top_var, width=10, bg=self.entry_bg, fg=self.entry_fg, insertbackground='white').grid(row=row, column=1, sticky='w', padx=5, pady=5)
+        tb.Entry(dialog, textvariable=top_var, width=10).grid(
+            row=row, column=1, sticky='w', padx=5, pady=5
+        )
         row += 1
 
-        tk.Label(dialog, text="Фильтр по дате (опционально):", bg=self.bg, fg=self.fg).grid(row=row, column=0, sticky='e', padx=5, pady=5)
+        tb.Label(dialog, text="Фильтр по дате (опционально):", bootstyle="inverse-secondary").grid(
+            row=row, column=0, sticky='e', padx=5, pady=5
+        )
         year_var = tk.StringVar()
         month_var = tk.StringVar()
         day_var = tk.StringVar()
-        frame_date = tk.Frame(dialog, bg=self.bg)
+        frame_date = tb.Frame(dialog, bootstyle="secondary")
         frame_date.grid(row=row, column=1, columnspan=3, sticky='w', padx=5, pady=5)
-        tk.Entry(frame_date, textvariable=year_var, width=5, bg=self.entry_bg, fg=self.entry_fg, insertbackground='white').pack(side='left', padx=2)
-        tk.Label(frame_date, text="ГГГГ", bg=self.bg, fg=self.fg).pack(side='left', padx=2)
-        tk.Entry(frame_date, textvariable=month_var, width=3, bg=self.entry_bg, fg=self.entry_fg, insertbackground='white').pack(side='left', padx=2)
-        tk.Label(frame_date, text="ММ", bg=self.bg, fg=self.fg).pack(side='left', padx=2)
-        tk.Entry(frame_date, textvariable=day_var, width=3, bg=self.entry_bg, fg=self.entry_fg, insertbackground='white').pack(side='left', padx=2)
-        tk.Label(frame_date, text="ДД", bg=self.bg, fg=self.fg).pack(side='left', padx=2)
+        tb.Entry(frame_date, textvariable=year_var, width=5).pack(side='left', padx=2)
+        tb.Label(frame_date, text="ГГГГ", bootstyle="inverse-secondary").pack(side='left', padx=2)
+        tb.Entry(frame_date, textvariable=month_var, width=3).pack(side='left', padx=2)
+        tb.Label(frame_date, text="ММ", bootstyle="inverse-secondary").pack(side='left', padx=2)
+        tb.Entry(frame_date, textvariable=day_var, width=3).pack(side='left', padx=2)
+        tb.Label(frame_date, text="ДД", bootstyle="inverse-secondary").pack(side='left', padx=2)
         row += 1
 
         last_result = [None]
+        status_var = tk.StringVar(value="Готово к анализу")
 
-        def on_analyze():
-            domain = domain_var.get().strip()
-            if not domain:
-                messagebox.showerror("Ошибка", "Введите домен")
-                return
-            try:
-                top_n = int(top_var.get().strip() or 10)
-            except ValueError:
-                top_n = 10
-            year = int(year_var.get()) if year_var.get().strip() else None
-            month = int(month_var.get()) if month_var.get().strip() else None
-            day = int(day_var.get()) if day_var.get().strip() else None
+        tb.Label(dialog, textvariable=status_var, bootstyle="inverse-secondary").grid(
+            row=row, column=0, columnspan=4, sticky='w', padx=5
+        )
+        row += 1
 
-            for val, name in [(year, 'год'), (month, 'месяц'), (day, 'день')]:
-                if val is not None and not (1 <= val <= 9999 if name=='год' else (1 <= val <= 12 if name=='месяц' else 1 <= val <= 31)):
-                    messagebox.showerror("Ошибка", f"Некорректное значение для {name}")
-                    return
+        btn_frame = tb.Frame(dialog, bootstyle="secondary")
+        btn_frame.grid(row=row, column=0, columnspan=4, pady=10)
 
-            dialog.destroy()
-            self._run_in_thread(
-                analyze_access_log, self.access_btn,
-                self.checker, self.panel_type, domain, top_n, year, month, day
-            )
+        analyze_btn = tb.Button(btn_frame, text="Анализировать", bootstyle="success")
+        analyze_btn.pack(side='left', padx=5)
+        save_btn = tb.Button(btn_frame, text="Сохранить отчёт", bootstyle="primary", state=tk.DISABLED)
+        save_btn.pack(side='left', padx=5)
 
         def on_save():
             if last_result[0] is None:
                 messagebox.showwarning("Нет данных", "Сначала выполните анализ, чтобы сохранить отчёт.")
                 return
-            filename = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                parent=dialog
+            )
             if filename:
                 try:
                     with open(filename, 'w', encoding='utf-8') as f:
                         f.write(last_result[0])
-                    messagebox.showinfo("Успех", f"Отчёт сохранён в {filename}")
+                    messagebox.showinfo("Успех", f"Отчёт сохранён в {filename}", parent=dialog)
                 except Exception as e:
-                    messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {e}")
+                    messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {e}", parent=dialog)
 
-        btn_frame = tk.Frame(dialog, bg=self.bg)
-        btn_frame.grid(row=row, column=0, columnspan=4, pady=10)
-        tk.Button(btn_frame, text="Анализировать", command=on_analyze, bg="#4e9a06", fg="white", activebackground="#73d216").pack(side='left', padx=5)
-        tk.Button(btn_frame, text="Сохранить отчёт", command=on_save, bg="#3465a4", fg="white", activebackground="#204a87").pack(side='left', padx=5)
+        save_btn.config(command=on_save)
+
+        def on_analyze():
+            domain = domain_var.get().strip()
+            if not domain:
+                messagebox.showerror("Ошибка", "Введите домен", parent=dialog)
+                return
+            try:
+                top_n = int(top_var.get().strip() or 10)
+            except ValueError:
+                top_n = 10
+            try:
+                year = int(year_var.get()) if year_var.get().strip() else None
+                month = int(month_var.get()) if month_var.get().strip() else None
+                day = int(day_var.get()) if day_var.get().strip() else None
+            except ValueError:
+                messagebox.showerror("Ошибка", "Дата должна быть числом", parent=dialog)
+                return
+
+            for val, name in [(year, 'год'), (month, 'месяц'), (day, 'день')]:
+                if val is not None and not (
+                    1 <= val <= 9999 if name == 'год' else
+                    (1 <= val <= 12 if name == 'месяц' else 1 <= val <= 31)
+                ):
+                    messagebox.showerror("Ошибка", f"Некорректное значение для {name}", parent=dialog)
+                    return
+
+            # Диалог НЕ закрываем — чтобы осталась доступна кнопка «Сохранить отчёт».
+            status_var.set("Анализ выполняется...")
+            analyze_btn.config(state=tk.DISABLED)
+            save_btn.config(state=tk.DISABLED)
+
+            def on_done(result):
+                last_result[0] = result
+                status_var.set("Анализ завершён — можно сохранить отчёт")
+                analyze_btn.config(state=tk.NORMAL)
+                save_btn.config(state=tk.NORMAL)
+                self._display_result(result)
+
+            self._run_simple(
+                analyze_access_log, None, on_done,
+                self.checker, self.panel_type, domain, top_n, year, month, day
+            )
+
+        analyze_btn.config(command=on_analyze)
 
         dialog.columnconfigure(1, weight=1)
         dialog.columnconfigure(2, weight=1)
         dialog.columnconfigure(3, weight=1)
 
-    # ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
+    # ---------- ОСТАЛЬНЫЕ ФУНКЦИИ ----------
     def create_swap(self):
         if not self.checker:
             return
-        size = simpledialog.askstring("Размер swap", "Введите размер swap файла в МБ (например, 1024):", parent=self.root)
+        size = simpledialog.askstring(
+            "Размер swap",
+            "Введите размер swap файла в МБ (например, 1024):",
+            parent=self.root
+        )
         if not size:
             return
         try:
@@ -505,13 +972,17 @@ class DiagnosticApp:
             messagebox.showerror("Ошибка", "Введите целое число")
             return
 
-        self.log(f"\n=== Создание swap файла размером {size_mb} МБ ===")
-        cmd = f"df -m / | awk 'NR==2 {{print $4}}'"
+        if messagebox.askyesno("Подтверждение", f"Создать swap файл размером {size_mb} МБ?", parent=self.root):
+            self._run_simple(self._do_create_swap, self.swap_btn, None, size_mb)
+
+    def _do_create_swap(self, size_mb):
+        lines = [f"=== Создание swap файла размером {size_mb} МБ ==="]
+        cmd = "df -m / | awk 'NR==2 {print $4}'"
         out, _ = self.checker.exec_command(cmd)
         free_mb = int(out.strip()) if out.strip().isdigit() else 0
         if free_mb < size_mb + 100:
-            self.log(f"❌ Недостаточно свободного места (доступно {free_mb} МБ, требуется ~{size_mb+100} МБ)")
-            return
+            lines.append(f"❌ Недостаточно свободного места (доступно {free_mb} МБ, требуется ~{size_mb+100} МБ)")
+            return "\n".join(lines)
 
         cmds = [
             f"fallocate -l {size_mb}M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count={size_mb}",
@@ -521,33 +992,38 @@ class DiagnosticApp:
         ]
         for c in cmds:
             out, err = self.checker.exec_command(c)
-            self.log(f"$ {c}")
+            lines.append(f"$ {c}")
             if out.strip():
-                self.log(out.strip())
+                lines.append(out.strip())
             if err.strip():
-                self.log("STDERR: " + err.strip())
+                lines.append("STDERR: " + err.strip())
 
         out, _ = self.checker.exec_command("swapon --show")
-        self.log("Текущие swap-разделы:\n" + out)
+        lines.append("Текущие swap-разделы:\n" + out)
+        return "\n".join(lines)
 
     def add_swap_to_fstab(self):
         if not self.checker:
             return
-        self.log("\n=== Добавление /swapfile в /etc/fstab ===")
+        self._run_simple(self._do_add_swap_to_fstab, self.fstab_btn)
+
+    def _do_add_swap_to_fstab(self):
+        lines = ["=== Добавление /swapfile в /etc/fstab ==="]
         out, _ = self.checker.exec_command("grep -q '/swapfile' /etc/fstab && echo 'yes' || echo 'no'")
         if out.strip() == 'yes':
-            self.log("Запись /swapfile уже присутствует в fstab.")
-            return
+            lines.append("Запись /swapfile уже присутствует в fstab.")
+            return "\n".join(lines)
 
         cmd = 'echo "/swapfile none swap sw 0 0" >> /etc/fstab'
         out, err = self.checker.exec_command(cmd)
-        self.log(f"$ {cmd}")
+        lines.append(f"$ {cmd}")
         if out.strip():
-            self.log(out.strip())
+            lines.append(out.strip())
         if err.strip():
-            self.log("STDERR: " + err.strip())
+            lines.append("STDERR: " + err.strip())
         out, _ = self.checker.exec_command("tail -3 /etc/fstab")
-        self.log("Последние строки /etc/fstab:\n" + out)
+        lines.append("Последние строки /etc/fstab:\n" + out)
+        return "\n".join(lines)
 
     def run_dns_check(self):
         if not self.checker:
@@ -557,22 +1033,29 @@ class DiagnosticApp:
         if domains:
             domain_var.set(domains[0])
 
-        dialog = tk.Toplevel(self.root)
+        dialog = tb.Toplevel(self.root)
         dialog.title("DNS-проверка")
         dialog.geometry("450x230")
-        dialog.configure(bg=self.bg)
         dialog.transient(self.root)
         dialog.grab_set()
 
-        tk.Label(dialog, text="Домен/IP:", bg=self.bg, fg=self.fg).grid(row=0, column=0, sticky='e', padx=5, pady=5)
-        domain_combo = ttk.Combobox(dialog, textvariable=domain_var, values=domains, state='normal')
+        tb.Label(dialog, text="Домен/IP:", bootstyle="inverse-secondary").grid(
+            row=0, column=0, sticky='e', padx=5, pady=5
+        )
+        domain_combo = ttk.Combobox(
+            dialog, textvariable=domain_var, values=domains, state='normal'
+        )
         domain_combo.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
         if not domains:
             domain_combo.set('')
 
         local_var = tk.BooleanVar(value=False)
-        cb = tk.Checkbutton(dialog, text="Выполнить локально (A и PTR, NS только с сервера)",
-                            variable=local_var, bg=self.bg, fg=self.fg, selectcolor=self.select_bg)
+        cb = tb.Checkbutton(
+            dialog,
+            text="Выполнить локально (A и PTR, NS только с сервера)",
+            variable=local_var,
+            bootstyle="secondary-round-toggle"
+        )
         cb.grid(row=1, column=0, columnspan=2, sticky='w', padx=5, pady=5)
 
         def on_check():
@@ -580,16 +1063,17 @@ class DiagnosticApp:
             if not domain:
                 messagebox.showerror("Ошибка", "Введите домен или IP")
                 return
+            local = local_var.get()
             dialog.destroy()
             self.log("\n" + "="*60)
-            if local_var.get():
-                result = dns_report_local(domain)
+            if local:
+                self._run_simple(dns_report_local, self.dns_btn, None, domain)
             else:
-                result = dns_report(self.checker, domain)
-            self.log(result)
+                self._run_simple(dns_report, self.dns_btn, None, self.checker, domain)
 
-        tk.Button(dialog, text="Проверить", command=on_check, bg="#4e9a06", fg="white", activebackground="#73d216")\
-            .grid(row=2, column=0, columnspan=2, pady=10)
+        tb.Button(dialog, text="Проверить", command=on_check, bootstyle="success").grid(
+            row=2, column=0, columnspan=2, pady=10
+        )
         dialog.columnconfigure(1, weight=1)
 
     def run_dns_resolvers(self):
@@ -600,23 +1084,51 @@ class DiagnosticApp:
     def run_edit_dns(self):
         if not self.checker:
             return
-        current_ns = get_current_dns_resolvers(self.checker)
+        self.log("Получение текущих DNS-резолверов...")
+        self._run_simple(get_current_dns_resolvers, None, self._open_edit_dns_dialog, self.checker)
 
-        dialog = tk.Toplevel(self.root)
+    def _open_edit_dns_dialog(self, current_ns):
+        if isinstance(current_ns, str):
+            self.log(current_ns)
+            current_ns = []
+
+        self.log(f"=== DNS-резолверы, полученные с сервера: {current_ns}")
+
+        if not current_ns:
+            out, _ = self.checker.exec_command('cat /etc/resolv.conf 2>/dev/null')
+            self.log("Содержимое /etc/resolv.conf:\n" + out)
+            out2, _ = self.checker.exec_command('resolvectl status 2>/dev/null | grep "DNS Servers"')
+            if out2.strip():
+                self.log("DNS из resolvectl:\n" + out2)
+            messagebox.showwarning(
+                "DNS не найдены",
+                "Не удалось получить текущие DNS-серверы.\n"
+                "Проверьте вывод в главном окне."
+            )
+            return
+
+        dialog = tb.Toplevel(self.root)
         dialog.title("Редактирование DNS-резолверов")
         dialog.geometry("500x400")
-        dialog.configure(bg=self.bg)
         dialog.transient(self.root)
         dialog.grab_set()
 
-        tk.Label(dialog, text="DNS-серверы (нажмите для редактирования):", bg=self.bg, fg=self.fg).pack(pady=5)
+        tb.Label(dialog, text="DNS-серверы (нажмите для редактирования):", bootstyle="inverse-secondary").pack(pady=5)
 
-        listbox = tk.Listbox(dialog, selectmode=tk.SINGLE, bg=self.entry_bg, fg=self.entry_fg, selectbackground=self.select_bg)
+        colors = get_theme_colors(self.current_theme)
+
+        listbox = tk.Listbox(
+            dialog,
+            selectmode=tk.SINGLE,
+            bg=colors['bg'],
+            fg=colors['fg'],
+            selectbackground='#3465a4'
+        )
         listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         for ns in current_ns:
             listbox.insert(tk.END, ns)
 
-        btn_frame = tk.Frame(dialog, bg=self.bg)
+        btn_frame = tb.Frame(dialog, bootstyle="secondary")
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
         def add_ns():
@@ -651,16 +1163,16 @@ class DiagnosticApp:
             for ns in preset_list:
                 listbox.insert(tk.END, ns)
 
-        tk.Button(btn_frame, text="Добавить", command=add_ns, bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(btn_frame, text="Редактировать", command=edit_ns, bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(btn_frame, text="Удалить", command=delete_ns, bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
+        tb.Button(btn_frame, text="Добавить", command=add_ns, bootstyle="success").pack(side=tk.LEFT, padx=2)
+        tb.Button(btn_frame, text="Редактировать", command=edit_ns, bootstyle="primary").pack(side=tk.LEFT, padx=2)
+        tb.Button(btn_frame, text="Удалить", command=delete_ns, bootstyle="danger").pack(side=tk.LEFT, padx=2)
 
-        preset_frame = tk.Frame(dialog, bg=self.bg)
+        preset_frame = tb.Frame(dialog, bootstyle="secondary")
         preset_frame.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(preset_frame, text="Предустановленные наборы:", bg=self.bg, fg=self.fg).pack(side=tk.LEFT, padx=5)
-        tk.Button(preset_frame, text="Google", command=lambda: set_preset(['8.8.8.8', '8.8.4.4']), bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(preset_frame, text="Cloudflare", command=lambda: set_preset(['1.1.1.1', '1.0.0.1']), bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(preset_frame, text="OpenDNS", command=lambda: set_preset(['208.67.222.222', '208.67.220.220']), bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=2)
+        tb.Label(preset_frame, text="Предустановленные наборы:", bootstyle="inverse-secondary").pack(side=tk.LEFT, padx=5)
+        tb.Button(preset_frame, text="Google", command=lambda: set_preset(['8.8.8.8', '8.8.4.4']), bootstyle="info").pack(side=tk.LEFT, padx=2)
+        tb.Button(preset_frame, text="Cloudflare", command=lambda: set_preset(['1.1.1.1', '1.0.0.1']), bootstyle="info").pack(side=tk.LEFT, padx=2)
+        tb.Button(preset_frame, text="OpenDNS", command=lambda: set_preset(['208.67.222.222', '208.67.220.220']), bootstyle="info").pack(side=tk.LEFT, padx=2)
 
         def apply_changes():
             new_list = []
@@ -675,8 +1187,8 @@ class DiagnosticApp:
                 dialog.destroy()
                 self._run_in_thread(set_dns_resolvers, self.edit_dns_btn, self.checker, new_list)
 
-        tk.Button(dialog, text="Применить изменения", command=apply_changes, bg="#4e9a06", fg="white").pack(pady=10)
-        tk.Button(dialog, text="Отмена", command=dialog.destroy, bg=self.btn_bg, fg=self.btn_fg).pack(pady=5)
+        tb.Button(dialog, text="Применить изменения", command=apply_changes, bootstyle="success").pack(pady=10)
+        tb.Button(dialog, text="Отмена", command=dialog.destroy, bootstyle="secondary").pack(pady=5)
 
     def run_replace_ipv4(self):
         if not self.checker:
@@ -693,8 +1205,12 @@ class DiagnosticApp:
         if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', new_ip):
             messagebox.showerror("Ошибка", "Неверный формат IPv4-адреса")
             return
-        
-        if messagebox.askyesno("Подтверждение", f"Заменить {old_ip} на {new_ip} во всех .conf-файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.", parent=self.root):
+
+        if messagebox.askyesno(
+            "Подтверждение",
+            f"Заменить {old_ip} на {new_ip} во всех .conf-файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.",
+            parent=self.root
+        ):
             self._run_in_thread(replace_ipv4, self.ipv4_btn, self.checker, old_ip, new_ip)
 
     def run_replace_ipv6(self):
@@ -706,8 +1222,14 @@ class DiagnosticApp:
         new_ip = simpledialog.askstring("Замена IPv6", f"Введите новый IPv6-адрес (вместо {old_ip}):", parent=self.root)
         if not new_ip:
             return
-        
-        if messagebox.askyesno("Подтверждение", f"Заменить {old_ip} на {new_ip} во всех файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.", parent=self.root):
+
+        if messagebox.askyesno(
+            "Подтверждение ⚠️",
+            f"Заменить {old_ip} на {new_ip} во ВСЕХ файлах в /etc?\n\n"
+            f"Внимание: обрабатываются ВСЕ файлы (включая бинарные/БД), "
+            f"а не только конфиги!\n\nБудут перезапущены nginx, mysql, apache.",
+            parent=self.root
+        ):
             self._run_in_thread(replace_ipv6, self.ipv6_btn, self.checker, old_ip, new_ip)
 
     def run_restart_services(self):
@@ -717,90 +1239,104 @@ class DiagnosticApp:
             self._run_in_thread(restart_services, self.restart_btn, self.checker)
 
     def get_bash_history(self):
+        """Получает историю команд из ~/.bash_history на удалённом сервере"""
         if not self.checker:
+            self.log("⚠️ Нет подключения к серверу")
             return []
-        out, _ = self.checker.exec_command('cat ~/.bash_history 2>/dev/null | tail -100')
+        out, err = self.checker.exec_command('cat ~/.bash_history 2>/dev/null | tail -100')
+        if err.strip():
+            self.log(f"⚠️ Ошибка при чтении истории: {err}")
+            return []
         if out.strip():
-            return [line.strip() for line in out.splitlines() if line.strip()]
-        return []
+            lines = [line.strip() for line in out.splitlines() if line.strip()]
+            if not lines:
+                self.log("ℹ️ История команд на сервере пуста.")
+            return lines
+        else:
+            self.log("ℹ️ История команд на сервере не найдена или пуста.")
+            return []
 
     def show_bash_history(self):
+        """Открывает окно с историей команд с удалённого сервера"""
         if not self.checker:
+            messagebox.showwarning("Нет подключения", "Подключитесь к серверу, чтобы получить историю команд.")
             return
-        history = self.get_bash_history()
-        if not history:
-            messagebox.showinfo("История команд", "История команд не найдена или пуста.")
-            return
-        
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Bash История команд")
-        dialog.geometry("600x400")
-        dialog.configure(bg=self.bg)
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        text = scrolledtext.ScrolledText(dialog, wrap=tk.NONE, font=("Courier", 10),
-                                        bg=self.entry_bg, fg=self.entry_fg)
-        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        text.insert(tk.END, "\n".join(history))
-        text.config(state=tk.DISABLED)
+
+        def on_history(history):
+            if isinstance(history, str):
+                self.log(history)
+                return
+            if not history:
+                messagebox.showinfo("История команд", "История команд на сервере не найдена или пуста.")
+                return
+            dialog = tb.Toplevel(self.root)
+            dialog.title("Bash История команд (с сервера)")
+            dialog.geometry("600x400")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            text = scrolledtext.ScrolledText(dialog, wrap=tk.NONE, font=("Courier", 10))
+            text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            text.insert(tk.END, "\n".join(history))
+            text.config(state=tk.DISABLED)
+
+        self._run_simple(self.get_bash_history, None, on_history)
 
     def run_config_editor(self):
         if not self.checker:
             return
-        
+
         files = get_config_files(self.checker, self.panel_type)
         if not files:
             messagebox.showinfo("Информация", "Конфигурационные файлы не найдены.")
             return
-        
-        editor_dialog = tk.Toplevel(self.root)
+
+        editor_dialog = tb.Toplevel(self.root)
         editor_dialog.title("Редактор конфигурационных файлов")
         editor_dialog.geometry("800x600")
         editor_dialog.minsize(700, 500)
-        editor_dialog.configure(bg=self.bg)
         editor_dialog.transient(self.root)
         editor_dialog.grab_set()
-        
-        top_frame = tk.Frame(editor_dialog, bg=self.bg)
+
+        top_frame = tb.Frame(editor_dialog, bootstyle="secondary")
         top_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        tk.Label(top_frame, text="Файл:", bg=self.bg, fg=self.fg).pack(side=tk.LEFT, padx=5)
-        
+
+        tb.Label(top_frame, text="Файл:", bootstyle="inverse-secondary").pack(side=tk.LEFT, padx=5)
+
         file_var = tk.StringVar()
         file_combo = ttk.Combobox(top_frame, textvariable=file_var, values=files, width=60)
         file_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        def load_file():
-            filepath = file_var.get().strip()
+
+        current_filepath = [""]
+        original_content = [""]
+
+        def _load(filepath):
             if not filepath:
                 messagebox.showwarning("Внимание", "Выберите файл")
                 return
-            # Блокируем редактирование во время загрузки
             text_editor.config(state=tk.DISABLED)
-            self.root.update()
+            editor_dialog.update()
             content = read_file(self.checker, filepath)
             text_editor.delete(1.0, tk.END)
             text_editor.insert(tk.END, content)
             text_editor.config(state=tk.NORMAL)
             current_filepath[0] = filepath
-        
-        load_btn = tk.Button(top_frame, text="Загрузить", command=load_file, bg=self.btn_bg, fg=self.btn_fg)
+            original_content[0] = content
+
+        def load_file():
+            _load(file_var.get().strip())
+
+        load_btn = tb.Button(top_frame, text="Загрузить", command=load_file, bootstyle="primary")
         load_btn.pack(side=tk.LEFT, padx=5)
-        
-        editor_frame = tk.Frame(editor_dialog, bg=self.bg)
+
+        editor_frame = tb.Frame(editor_dialog, bootstyle="secondary")
         editor_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        
-        text_editor = scrolledtext.ScrolledText(editor_frame, wrap=tk.NONE, font=("Courier", 10),
-                                                bg=self.entry_bg, fg=self.entry_fg,
-                                                insertbackground='white')
+
+        text_editor = scrolledtext.ScrolledText(editor_frame, wrap=tk.NONE, font=("Courier", 10))
         text_editor.pack(fill=tk.BOTH, expand=True)
-        
-        current_filepath = [""]
-        
-        bottom_frame = tk.Frame(editor_dialog, bg=self.bg)
+
+        bottom_frame = tb.Frame(editor_dialog, bootstyle="secondary")
         bottom_frame.pack(fill=tk.X, padx=10, pady=5)
-        
+
         def save_file():
             filepath = current_filepath[0]
             if not filepath:
@@ -808,47 +1344,36 @@ class DiagnosticApp:
                 return
             content = text_editor.get(1.0, tk.END)
             if messagebox.askyesno("Подтверждение", f"Сохранить изменения в {filepath}?", parent=editor_dialog):
-                # Блокируем на время сохранения
                 text_editor.config(state=tk.DISABLED)
-                self.root.update()
+                editor_dialog.update()
                 result = write_file(self.checker, filepath, content)
                 self._display_result(result)
                 text_editor.config(state=tk.NORMAL)
-                messagebox.showinfo("Успех", "Файл сохранён")
-        
+                original_content[0] = content
+                messagebox.showinfo("Успех", "Файл сохранён", parent=editor_dialog)
+
         def reload_file():
             filepath = current_filepath[0]
             if not filepath:
                 messagebox.showwarning("Внимание", "Сначала загрузите файл")
                 return
-            text_editor.config(state=tk.DISABLED)
-            self.root.update()
-            content = read_file(self.checker, filepath)
-            text_editor.delete(1.0, tk.END)
-            text_editor.insert(tk.END, content)
-            text_editor.config(state=tk.NORMAL)
-        
+            _load(filepath)
+
         def close_editor():
-            if text_editor.get(1.0, tk.END).strip():
+            if text_editor.get(1.0, tk.END) != original_content[0]:
                 if messagebox.askyesno("Подтверждение", "Закрыть редактор без сохранения изменений?", parent=editor_dialog):
                     editor_dialog.destroy()
             else:
                 editor_dialog.destroy()
-        
-        tk.Button(bottom_frame, text="Сохранить", command=save_file, bg="#4e9a06", fg="white").pack(side=tk.LEFT, padx=5)
-        tk.Button(bottom_frame, text="Перезагрузить", command=reload_file, bg=self.btn_bg, fg=self.btn_fg).pack(side=tk.LEFT, padx=5)
-        tk.Button(bottom_frame, text="Закрыть", command=close_editor, bg="#cc0000", fg="white").pack(side=tk.RIGHT, padx=5)
-        
-        if files:
-            file_combo.set(files[0])
-            text_editor.config(state=tk.DISABLED)
-            self.root.update()
-            content = read_file(self.checker, files[0])
-            text_editor.insert(tk.END, content)
-            text_editor.config(state=tk.NORMAL)
-            current_filepath[0] = files[0]
 
-    # ==================== УПРАВЛЕНИЕ ISPmanager ====================
+        tb.Button(bottom_frame, text="Сохранить", command=save_file, bootstyle="success").pack(side=tk.LEFT, padx=5)
+        tb.Button(bottom_frame, text="Перезагрузить", command=reload_file, bootstyle="warning").pack(side=tk.LEFT, padx=5)
+        tb.Button(bottom_frame, text="Закрыть", command=close_editor, bootstyle="danger").pack(side=tk.RIGHT, padx=5)
+
+        file_combo.set(files[0])
+        _load(files[0])
+
+    # ---------- УПРАВЛЕНИЕ ISPmanager ----------
     def run_isp_restart(self):
         if not self.checker:
             return
@@ -858,7 +1383,11 @@ class DiagnosticApp:
     def run_isp_kill(self):
         if not self.checker:
             return
-        if messagebox.askyesno("Подтверждение", "Принудительно завершить процесс core (панель)?\n⚠️ Это может привести к потере данных!", parent=self.root):
+        if messagebox.askyesno(
+            "Подтверждение",
+            "Принудительно завершить процесс core (панель)?\n⚠️ Это может привести к потере данных!",
+            parent=self.root
+        ):
             self._run_in_thread(ispmanager_kill_core, self.isp_kill_btn, self.checker)
 
     def run_isp_update(self):
@@ -870,7 +1399,11 @@ class DiagnosticApp:
     def run_isp_ssl(self):
         if not self.checker:
             return
-        if messagebox.askyesno("Подтверждение", "Принудительно запустить выпуск Let's Encrypt сертификатов?\n⚠️ Процесс может занять несколько минут!", parent=self.root):
+        if messagebox.askyesno(
+            "Подтверждение",
+            "Принудительно запустить выпуск Let's Encrypt сертификатов?\n⚠️ Процесс может занять несколько минут!",
+            parent=self.root
+        ):
             self._run_in_thread(ispmanager_ssl_issue, self.isp_ssl_btn, self.checker)
 
     def run_isp_disable(self):
@@ -896,7 +1429,7 @@ class DiagnosticApp:
         if messagebox.askyesno("Подтверждение", "Закомментировать переменную PATH в crontab?\n⚠️ Это может повлиять на другие cron-задания!", parent=self.root):
             self._run_in_thread(ispmanager_fix_cron_path, self.isp_fix_cron_btn, self.checker)
 
-    # ==================== ОТПРАВКА КОМАНД ====================
+    # ---------- ОТПРАВКА КОМАНД ----------
     def send_command(self, event=None):
         if not self.checker:
             return
@@ -906,7 +1439,6 @@ class DiagnosticApp:
 
         self.cmd_history.append(cmd)
         self.history_index = len(self.cmd_history)
-
         self.cmd_entry.delete(0, tk.END)
 
         if cmd.lower() in ('exit', 'quit'):
@@ -915,21 +1447,32 @@ class DiagnosticApp:
             return
 
         self.log(f"\n$ {cmd}")
-        try:
+
+        def run_cmd():
             stdout, stderr = self.checker.exec_command(cmd)
+            parts = []
             if stdout.strip():
-                self.log(stdout.strip())
+                parts.append(stdout.strip())
             if stderr.strip():
-                self.log("STDERR: " + stderr.strip())
-        except Exception as e:
-            self.log(f"Ошибка выполнения команды: {e}")
+                parts.append("STDERR: " + stderr.strip())
+            return "\n".join(parts) if parts else "(нет вывода)"
+
+        self._run_simple(run_cmd, self.send_btn)
 
     def disconnect(self):
+        with self._busy_lock:
+            if self._busy:
+                messagebox.showwarning(
+                    "Идёт операция",
+                    "Дождитесь завершения текущей операции перед отключением."
+                )
+                return
+
         if self.checker:
             self.checker.close()
             self.checker = None
             self.panel_type = None
-        
+
         self.full_btn.config(state=tk.DISABLED)
         self.disk_btn.config(state=tk.DISABLED)
         self.network_btn.config(state=tk.DISABLED)
@@ -949,11 +1492,18 @@ class DiagnosticApp:
         self.fstab_btn.config(state=tk.DISABLED)
         self.send_btn.config(state=tk.DISABLED)
 
-        for btn in [self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
-                    self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
-                    self.isp_cron_btn, self.isp_fix_cron_btn]:
+        for btn in [
+            self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
+            self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
+            self.isp_cron_btn, self.isp_fix_cron_btn
+        ]:
             btn.config(state=tk.DISABLED)
         self.ispmanager_frame.pack_forget()
 
-        self.connect_btn.config(text="Подключиться", bg="#4e9a06", state=tk.NORMAL, command=self.connect)
+        self.connect_btn.config(text="Подключиться", bootstyle="success", command=self.connect)
         self.log("Соединение закрыто.")
+
+
+if __name__ == "__main__":
+    app = DiagnosticApp()
+    app.root.mainloop()
