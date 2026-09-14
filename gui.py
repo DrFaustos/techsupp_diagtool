@@ -97,6 +97,10 @@ class DiagnosticApp:
         self.history_index = -1
         self.current_theme = self.initial_theme
 
+        # Флаг занятости: защита от параллельных задач и отключения во время задачи
+        self._busy = False
+        self._busy_lock = threading.Lock()
+
         self.create_widgets()
         self.cmd_entry.focus_set()
 
@@ -539,7 +543,7 @@ class DiagnosticApp:
         """Простое автодополнение по истории команд при нажатии Tab"""
         current = self.cmd_entry.get()
         if not current:
-            return "break"
+            return None
         matches = [cmd for cmd in self.cmd_history if cmd.startswith(current)]
         if matches:
             self.cmd_entry.delete(0, tk.END)
@@ -565,6 +569,8 @@ class DiagnosticApp:
         self.output.see(tk.END)
 
     def history_up(self, event):
+        if not self.cmd_history:
+            return "break"
         if self.history_index > 0:
             self.history_index -= 1
             self.cmd_entry.delete(0, tk.END)
@@ -595,14 +601,14 @@ class DiagnosticApp:
         key_path = self.key_var.get().strip()
 
         self.log(f"\n=== Подключение к {ip}:{port} ...")
-        self.checker = ServerChecker(ip, port, user, password, key_path)
-        success, message = self.checker.connect()
+        checker = ServerChecker(ip, port, user, password, key_path)
+        success, message = checker.connect()
 
         if not success:
             self.log(f"❌ {message}")
-            self.checker = None
             return
 
+        self.checker = checker
         self.log(f"✅ {message}")
 
         if self.panel_var.get() == 'auto':
@@ -655,12 +661,26 @@ class DiagnosticApp:
 
     # ---------- ФОНОВЫЕ ЗАДАЧИ ----------
     def _run_in_thread(self, target_func, btn=None, *args, **kwargs):
-        if not self.checker:
-            return
+        """
+        Запускает target_func в фоновом потоке.
+        Защищает от параллельного запуска нескольких задач и от гонки
+        с disconnect(): пока задача выполняется, соединение не закрывается.
+        """
+        with self._busy_lock:
+            if self._busy:
+                messagebox.showwarning("Занято", "Дождитесь завершения текущей операции.")
+                return
+            if not self.checker:
+                return
+            self._busy = True
+
         if btn:
             btn.config(state=tk.DISABLED)
         self.progress.pack(pady=5)
         self.progress.start(10)
+
+        # Запоминаем checker на время задачи, чтобы disconnect его не обнулил
+        active_checker = self.checker
 
         def wrapper():
             try:
@@ -671,7 +691,10 @@ class DiagnosticApp:
             finally:
                 self.root.after(0, self._stop_progress)
                 if btn:
-                    self.root.after(0, lambda: btn.config(state=tk.NORMAL))
+                    self.root.after(0, lambda b=btn: b.config(state=tk.NORMAL))
+                with self._busy_lock:
+                    self._busy = False
+                del active_checker
 
         thread = threading.Thread(target=wrapper)
         thread.daemon = True
@@ -761,6 +784,7 @@ class DiagnosticApp:
         row += 1
 
         last_result = [None]
+        save_btn_ref = [None]
 
         def on_analyze():
             domain = domain_var.get().strip()
@@ -771,9 +795,13 @@ class DiagnosticApp:
                 top_n = int(top_var.get().strip() or 10)
             except ValueError:
                 top_n = 10
-            year = int(year_var.get()) if year_var.get().strip() else None
-            month = int(month_var.get()) if month_var.get().strip() else None
-            day = int(day_var.get()) if day_var.get().strip() else None
+            try:
+                year = int(year_var.get()) if year_var.get().strip() else None
+                month = int(month_var.get()) if month_var.get().strip() else None
+                day = int(day_var.get()) if day_var.get().strip() else None
+            except ValueError:
+                messagebox.showerror("Ошибка", "Дата должна быть числом")
+                return
 
             for val, name in [(year, 'год'), (month, 'месяц'), (day, 'день')]:
                 if val is not None and not (
@@ -784,10 +812,7 @@ class DiagnosticApp:
                     return
 
             dialog.destroy()
-            self._run_in_thread(
-                analyze_access_log, self.access_btn,
-                self.checker, self.panel_type, domain, top_n, year, month, day
-            )
+            self._run_access_analysis(domain, top_n, year, month, day, last_result)
 
         def on_save():
             if last_result[0] is None:
@@ -808,11 +833,47 @@ class DiagnosticApp:
         btn_frame = tb.Frame(dialog, bootstyle="secondary")
         btn_frame.grid(row=row, column=0, columnspan=4, pady=10)
         tb.Button(btn_frame, text="Анализировать", command=on_analyze, bootstyle="success").pack(side='left', padx=5)
-        tb.Button(btn_frame, text="Сохранить отчёт", command=on_save, bootstyle="primary").pack(side='left', padx=5)
+        save_btn = tb.Button(btn_frame, text="Сохранить отчёт", command=on_save, bootstyle="primary")
+        save_btn.pack(side='left', padx=5)
+        save_btn_ref[0] = save_btn
 
         dialog.columnconfigure(1, weight=1)
         dialog.columnconfigure(2, weight=1)
         dialog.columnconfigure(3, weight=1)
+
+    def _run_access_analysis(self, domain, top_n, year, month, day, last_result):
+        """Запускает анализ логов в потоке и сохраняет результат для кнопки 'Сохранить'."""
+        with self._busy_lock:
+            if self._busy:
+                messagebox.showwarning("Занято", "Дождитесь завершения текущей операции.")
+                return
+            if not self.checker:
+                return
+            self._busy = True
+
+        self.access_btn.config(state=tk.DISABLED)
+        self.progress.pack(pady=5)
+        self.progress.start(10)
+
+        checker = self.checker
+        panel_type = self.panel_type
+
+        def wrapper():
+            try:
+                result = analyze_access_log(checker, panel_type, domain, top_n, year, month, day)
+                last_result[0] = result
+                self.root.after(0, self._display_result, result)
+            except Exception as e:
+                self.root.after(0, self._display_result, f"❌ Ошибка: {str(e)}")
+            finally:
+                self.root.after(0, self._stop_progress)
+                self.root.after(0, lambda: self.access_btn.config(state=tk.NORMAL))
+                with self._busy_lock:
+                    self._busy = False
+
+        t = threading.Thread(target=wrapper)
+        t.daemon = True
+        t.start()
 
     # ---------- ОСТАЛЬНЫЕ ФУНКЦИИ ----------
     def create_swap(self):
@@ -1072,7 +1133,7 @@ class DiagnosticApp:
 
         if messagebox.askyesno(
             "Подтверждение",
-            f"Заменить {old_ip} на {new_ip} во всех файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.",
+            f"Заменить {old_ip} на {new_ip} в конфигурационных файлах в /etc?\n\nБудут перезапущены nginx, mysql, apache.",
             parent=self.root
         ):
             self._run_in_thread(replace_ipv6, self.ipv6_btn, self.checker, old_ip, new_ip)
@@ -1147,8 +1208,10 @@ class DiagnosticApp:
         file_combo = ttk.Combobox(top_frame, textvariable=file_var, values=files, width=60)
         file_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
-        def load_file():
-            filepath = file_var.get().strip()
+        current_filepath = [""]
+        original_content = [""]
+
+        def _load(filepath):
             if not filepath:
                 messagebox.showwarning("Внимание", "Выберите файл")
                 return
@@ -1159,6 +1222,10 @@ class DiagnosticApp:
             text_editor.insert(tk.END, content)
             text_editor.config(state=tk.NORMAL)
             current_filepath[0] = filepath
+            original_content[0] = content
+
+        def load_file():
+            _load(file_var.get().strip())
 
         load_btn = tb.Button(top_frame, text="Загрузить", command=load_file, bootstyle="primary")
         load_btn.pack(side=tk.LEFT, padx=5)
@@ -1168,8 +1235,6 @@ class DiagnosticApp:
 
         text_editor = scrolledtext.ScrolledText(editor_frame, wrap=tk.NONE, font=("Courier", 10))
         text_editor.pack(fill=tk.BOTH, expand=True)
-
-        current_filepath = [""]
 
         bottom_frame = tb.Frame(editor_dialog, bootstyle="secondary")
         bottom_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -1186,6 +1251,7 @@ class DiagnosticApp:
                 result = write_file(self.checker, filepath, content)
                 self._display_result(result)
                 text_editor.config(state=tk.NORMAL)
+                original_content[0] = content
                 messagebox.showinfo("Успех", "Файл сохранён")
 
         def reload_file():
@@ -1193,15 +1259,10 @@ class DiagnosticApp:
             if not filepath:
                 messagebox.showwarning("Внимание", "Сначала загрузите файл")
                 return
-            text_editor.config(state=tk.DISABLED)
-            self.root.update()
-            content = read_file(self.checker, filepath)
-            text_editor.delete(1.0, tk.END)
-            text_editor.insert(tk.END, content)
-            text_editor.config(state=tk.NORMAL)
+            _load(filepath)
 
         def close_editor():
-            if text_editor.get(1.0, tk.END).strip():
+            if text_editor.get(1.0, tk.END) != original_content[0]:
                 if messagebox.askyesno("Подтверждение", "Закрыть редактор без сохранения изменений?", parent=editor_dialog):
                     editor_dialog.destroy()
             else:
@@ -1211,14 +1272,8 @@ class DiagnosticApp:
         tb.Button(bottom_frame, text="Перезагрузить", command=reload_file, bootstyle="warning").pack(side=tk.LEFT, padx=5)
         tb.Button(bottom_frame, text="Закрыть", command=close_editor, bootstyle="danger").pack(side=tk.RIGHT, padx=5)
 
-        if files:
-            file_combo.set(files[0])
-            text_editor.config(state=tk.DISABLED)
-            self.root.update()
-            content = read_file(self.checker, files[0])
-            text_editor.insert(tk.END, content)
-            text_editor.config(state=tk.NORMAL)
-            current_filepath[0] = files[0]
+        file_combo.set(files[0])
+        _load(files[0])
 
     # ---------- УПРАВЛЕНИЕ ISPmanager ----------
     def run_isp_restart(self):
@@ -1305,6 +1360,14 @@ class DiagnosticApp:
             self.log(f"Ошибка выполнения команды: {e}")
 
     def disconnect(self):
+        with self._busy_lock:
+            if self._busy:
+                messagebox.showwarning(
+                    "Идёт операция",
+                    "Дождитесь завершения текущей операции перед отключением."
+                )
+                return
+
         if self.checker:
             self.checker.close()
             self.checker = None
