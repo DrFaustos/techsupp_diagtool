@@ -6,12 +6,17 @@ from common import DOMAIN_PATHS, q, find_files, read_file_content, get_domain_fr
 from metrics import detect_panel  # noqa: F401 (реэкспорт для удобства)
 
 
+def _safe_name(name):
+    """Оставляет только безопасные для имени/glob символы (без shell-метасимволов)."""
+    return re.sub(r'[^A-Za-z0-9._-]', '', name or '')
+
+
 # ==================== ПОИСК ЛОГОВ ====================
 def find_logs(checker, panel_type, domain, log_type='error'):
     """Находит логи для домена (унифицированная функция)"""
     log_files = []
     limit = 20
-    safe_domain = domain.replace('/', '').replace('..', '').replace('*', '').replace('?', '')
+    safe_domain = _safe_name(domain)
 
     if panel_type == 'fastpanel':
         patterns = [
@@ -222,7 +227,7 @@ def site_logs_report(checker, panel):
 def search_oom_logs(checker):
     """Поиск событий Out-Of-Memory в системных логах"""
     cmd = "zgrep -B 5 -A 5 -i 'out of memory\\|killed process\\|oom-killer' /var/log/kern.log* /var/log/syslog* 2>/dev/null"
-    out, err = checker.exec_command(cmd)
+    out, _, _ = checker.run(cmd)
     if not out.strip():
         return "OOM-событий в логах не найдено."
     lines = out.splitlines()

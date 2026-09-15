@@ -99,8 +99,8 @@ def dns_resolvers_report(checker):
     lines = []
     lines.append("=== DNS-РЕЗОЛВЕРЫ НА СЕРВЕРЕ ===")
 
-    out, _, rc = checker.run('cat /etc/resolv.conf 2>/dev/null')
-    if rc != 0 or not out.strip():
+    out, _, _ = checker.run('cat /etc/resolv.conf 2>/dev/null')
+    if not out.strip():
         lines.append("❌ Не удалось прочитать /etc/resolv.conf")
         return "\n".join(lines)
 
@@ -141,7 +141,7 @@ def dns_resolvers_report(checker):
 
 
 def get_current_dns_resolvers(checker):
-    out, _, rc = checker.run('grep -E "^nameserver" /etc/resolv.conf 2>/dev/null | awk \'{print $2}\'')
+    out, _, _ = checker.run('grep -E "^nameserver" /etc/resolv.conf 2>/dev/null | awk \'{print $2}\'')
     if out.strip():
         return [ns.strip() for ns in out.splitlines() if ns.strip()]
     return []

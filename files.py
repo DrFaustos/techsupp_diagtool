@@ -153,7 +153,7 @@ def restart_services(checker):
     for svc, action in services.items():
         out, _, _ = checker.run(f'systemctl list-unit-files | grep -q "^{svc}.service" && echo "yes" || echo "no"')
         if out.strip() == 'yes':
-            _, _, _ = checker.run(f'systemctl {action} {svc} 2>/dev/null')
+            _, _, arc = checker.run(f'systemctl {action} {svc} 2>/dev/null')
             status, _, _ = checker.run(f'systemctl is-active {svc} 2>/dev/null')
             if status.strip() == 'active':
                 lines.append(f"✅ {svc} ({action}) выполнен")
@@ -163,7 +163,7 @@ def restart_services(checker):
                 if status2.strip() == 'active':
                     lines.append(f"✅ {svc} перезапущен (fallback)")
                 else:
-                    lines.append(f"❌ {svc} не запустился (rc={rrc})")
+                    lines.append(f"❌ {svc} не запустился (rc={rrc}, reload rc={arc})")
         else:
             lines.append(f"⏭️ {svc} не установлен")
     return lines

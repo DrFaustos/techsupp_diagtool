@@ -198,7 +198,7 @@ class DiagnosticApp:
             ("Перезапуск nginx", "systemctl restart nginx"),
             ("Перезапуск php-fpm", "systemctl restart php*-fpm"),
             ("Последние 50 строк error.log", "tail -n 50 /var/log/nginx/error.log"),
-            ("Поиск 5xx ошибок сегодня", "grep '\[5[0-9][0-9]\]' /var/log/nginx/access.log | tail -n 20"),
+            ("Поиск 5xx ошибок сегодня", r"grep '\[5[0-9][0-9]\]' /var/log/nginx/access.log | tail -n 20"),
             ("Свободное место", "df -h"),
             ("Использование памяти", "free -m"),
             ("Топ процессов по CPU", "ps aux --sort=-%cpu | head -n 15"),
