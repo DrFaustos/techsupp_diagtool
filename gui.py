@@ -104,14 +104,22 @@ class DiagnosticApp:
         self._busy = False
         self._busy_lock = threading.Lock()
 
-        # Логирование в файл (история сохраняется после закрытия окна)
+        # Логирование в файл с ротацией (история сохраняется после закрытия окна).
+        # Файл создаётся с правами 0600 — в логе могут быть чувствительные данные.
         self._log_path = os.path.expanduser("~/.techsupp_diagtool.log")
         self._logger = logging.getLogger("techsupp_diagtool")
         if not self._logger.handlers:
             self._logger.setLevel(logging.INFO)
-            fh = logging.FileHandler(self._log_path, encoding="utf-8")
-            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-            self._logger.addHandler(fh)
+            try:
+                from logging.handlers import RotatingFileHandler
+                fh = RotatingFileHandler(self._log_path, maxBytes=1_000_000,
+                                         backupCount=3, encoding="utf-8")
+                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+                self._logger.addHandler(fh)
+                if os.path.exists(self._log_path):
+                    os.chmod(self._log_path, 0o600)
+            except Exception:
+                pass
 
         self.conn_history_file = os.path.expanduser("~/.techsupp_diagtool_connections.json")
         self.conn_history = self._load_conn_history()
@@ -173,6 +181,7 @@ class DiagnosticApp:
         try:
             with open(self.conn_history_file, 'w', encoding='utf-8') as f:
                 json.dump(self.conn_history, f, indent=2)
+            os.chmod(self.conn_history_file, 0o600)
         except Exception:
             pass
 
@@ -686,9 +695,24 @@ class DiagnosticApp:
         self.output.insert(tk.END, text + "\n")
         self.output.see(tk.END)
         try:
-            self._logger.info(text)
+            self._logger.info(self._mask_secrets(text))
         except Exception:
             pass
+
+    @staticmethod
+    def _mask_secrets(text):
+        """Маскирует типовые секреты перед записью в лог-файл."""
+        if not text:
+            return text
+        patterns = [
+            (r'(?i)(pass(word|wd)?\s*[=:]\s*)\S+', r'\1***'),
+            (r'(?i)(token\s*[=:]\s*)\S+', r'\1***'),
+            (r'(?i)(api[_-]?key\s*[=:]\s*)\S+', r'\1***'),
+            (r'(?i)(secret\s*[=:]\s*)\S+', r'\1***'),
+        ]
+        for pat, rep in patterns:
+            text = re.sub(pat, rep, text)
+        return text
 
     def copy_output(self):
         text = self.output.get(1.0, tk.END)
@@ -1361,15 +1385,31 @@ class DiagnosticApp:
         ):
             self._run_in_thread(replace_ipv4, self.ipv4_btn, self.checker, old_ip, new_ip)
 
+    def _valid_ipv6(self, value):
+        import ipaddress
+        try:
+            ipaddress.IPv6Address(value)
+            return True
+        except (ipaddress.AddressValueError, ValueError):
+            return False
+
     def run_replace_ipv6(self):
         if not self.checker:
             return
         old_ip = simpledialog.askstring("Замена IPv6", "Введите старый IPv6-адрес (который нужно заменить):", parent=self.root)
         if not old_ip:
             return
+        if not self._valid_ipv6(old_ip.strip()):
+            messagebox.showerror("Ошибка", "Неверный формат IPv6-адреса")
+            return
+        old_ip = old_ip.strip()
         new_ip = simpledialog.askstring("Замена IPv6", f"Введите новый IPv6-адрес (вместо {old_ip}):", parent=self.root)
         if not new_ip:
             return
+        if not self._valid_ipv6(new_ip.strip()):
+            messagebox.showerror("Ошибка", "Неверный формат IPv6-адреса")
+            return
+        new_ip = new_ip.strip()
 
         if messagebox.askyesno(
             "Подтверждение ⚠️",

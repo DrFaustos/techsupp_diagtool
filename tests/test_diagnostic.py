@@ -127,12 +127,21 @@ class FakeChecker:
 class TestReplaceIp:
     def test_ipv4_command_escapes_both_ips(self):
         c = FakeChecker()
-        files_mod.replace_ipv4(c, '123.123.123.123', '321.321.321.321')
+        files_mod.replace_ipv4(c, '123.123.123.123', '10.20.30.40')
         cmd = c._find_cmd('find /etc')
         assert cmd is not None
         assert r'123\.123\.123\.123' in cmd
-        assert r'321\.321\.321\.321' in cmd
+        assert r'10\.20\.30\.40' in cmd
         assert "-name \"*.conf\"" in cmd
+
+    def test_ipv4_rejects_invalid(self):
+        c = FakeChecker()
+        # 321 — недопустимый октет; также попытка инъекции через ;
+        for bad in ('321.321.321.321', '1.1.1.1; rm -rf /', 'not-an-ip'):
+            c.commands.clear()
+            out = files_mod.replace_ipv4(c, bad, '10.0.0.1')
+            assert c._find_cmd('find /etc') is None
+            assert '❌' in out
 
     def test_ipv6_command_basic(self):
         c = FakeChecker()
@@ -142,6 +151,12 @@ class TestReplaceIp:
         assert 'fff:fff:fff:fff:fff::fff' in cmd
         assert 'ddd:ddd:ddd:ddd:ddd::ddd' in cmd
         assert cmd.endswith('{} +')
+
+    def test_ipv6_rejects_injection(self):
+        c = FakeChecker()
+        out = files_mod.replace_ipv6(c, "a::a/ -e 's/.*/pwned/; #", 'b::b')
+        assert c._find_cmd('find /etc') is None
+        assert '❌' in out
 
     def test_ipv6_makes_etc_backup(self):
         c = FakeChecker()

@@ -1,4 +1,5 @@
 """Работа с файлами/конфигами, замена IP, перезапуск служб."""
+import ipaddress
 from datetime import datetime
 
 from common import BACKUP_SUBDIRS, q, ensure_backup_dir, create_backup, write_remote_file
@@ -87,9 +88,28 @@ def get_config_files(checker, panel_type):
 
 
 # ==================== ЗАМЕНА IP ====================
+def _valid_ipv4(value):
+    try:
+        ipaddress.IPv4Address(value)
+        return True
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+
+
+def _valid_ipv6(value):
+    try:
+        ipaddress.IPv6Address(value)
+        return True
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+
+
 def replace_ipv4(checker, old_ip, new_ip):
     """Замена старого IPv4 на новый во всех *.conf в /etc (как в ручной команде)."""
     lines = [f"=== ЗАМЕНА IPv4: {old_ip} -> {new_ip} ==="]
+    if not (_valid_ipv4(old_ip) and _valid_ipv4(new_ip)):
+        lines.append("❌ Некорректный IPv4-адрес — операция отменена.")
+        return "\n".join(lines)
     # Экранируем точки, как в исходной команде: s#123\.123\.123\.123#...#g
     old_escaped = old_ip.replace('.', '\\.')
     new_escaped = new_ip.replace('.', '\\.')
@@ -114,8 +134,16 @@ def replace_ipv4(checker, old_ip, new_ip):
 
 
 def replace_ipv6(checker, old_ip, new_ip):
-    """Замена старого IPv6 на новый во всех файлах в /etc (как в ручной команде)."""
+    """Замена старого IPv6 на новый во всех файлах в /etc (как в ручной команде).
+
+    old_ip/new_ip строго валидируются как IPv6 — это исключает инъекцию команд,
+    поскольку в shell подставляются только проверенные [0-9a-fA-F:].
+    """
     lines = [f"=== ЗАМЕНА IPv6: {old_ip} -> {new_ip} ==="]
+    if not (_valid_ipv6(old_ip) and _valid_ipv6(new_ip)):
+        lines.append("❌ Некорректный IPv6-адрес — операция отменена.")
+        return "\n".join(lines)
+
     # Автобэкап /etc перед массовой заменой (сама команда замены не меняется)
     ensure_backup_dir(checker)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -125,6 +153,8 @@ def replace_ipv6(checker, old_ip, new_ip):
         lines.append(f"✅ Резервная копия /etc создана: {etc_backup}")
     else:
         lines.append("⚠️ Не удалось создать резервную копию /etc (продолжаем)")
+
+    # old_ip/new_ip прошли строгую проверку IPv6Address -> метасимволы невозможны.
     cmd = f"find /etc -type f -exec sed -i 's/{old_ip}/{new_ip}/g' {{}} +"
     out, err, rc = checker.run(cmd)
     if rc != 0:

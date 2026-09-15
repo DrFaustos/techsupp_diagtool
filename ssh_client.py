@@ -39,12 +39,17 @@ class ServerChecker:
                 self.client.connect(key_filename=self.key_filename, **common_kwargs)
             else:
                 self.client.connect(password=self.password or '', **common_kwargs)
+            # Пароль больше не нужен — очищаем из памяти.
+            self.password = None
             return True, "Подключено"
         except paramiko.AuthenticationException:
+            self.password = None
             return False, "Ошибка аутентификации: проверьте логин/пароль или ключ"
         except paramiko.SSHException as e:
+            self.password = None
             return False, f"SSH ошибка: {str(e)}"
         except Exception as e:
+            self.password = None
             error_msg = (
                 f"Ошибка подключения к {self.host}:{self.port}\n"
                 f"Тип: {type(e).__name__}\nСообщение: {str(e)}"
