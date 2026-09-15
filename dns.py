@@ -1,12 +1,12 @@
 """DNS-функции: проверка записей, работа с резолверами."""
 import re
+import socket
 
 from common import q, create_backup, write_remote_file
 
 
 # ==================== DNS ФУНКЦИИ ====================
 def dns_report_local(domain):
-    import socket
     lines = []
     lines.append(f"=== ЛОКАЛЬНАЯ DNS-ПРОВЕРКА ДЛЯ {domain} ===")
 
@@ -53,6 +53,8 @@ def dns_report(checker, domain, ip=None):
     ip_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
     is_ip = bool(ip_pattern.match(domain))
 
+    # Внимание: dig возвращает rc!=0 при отсутствии записи (NXDOMAIN),
+    # поэтому здесь по-прежнему используем exec_command и судим по выводу.
     if is_ip:
         cmd = f"dig +short -x {q(domain)} 2>/dev/null"
         out, _ = checker.exec_command(cmd)
@@ -97,7 +99,7 @@ def dns_resolvers_report(checker):
     lines = []
     lines.append("=== DNS-РЕЗОЛВЕРЫ НА СЕРВЕРЕ ===")
 
-    out, _ = checker.exec_command('cat /etc/resolv.conf 2>/dev/null')
+    out, _, _ = checker.run('cat /etc/resolv.conf 2>/dev/null')
     if not out.strip():
         lines.append("❌ Не удалось прочитать /etc/resolv.conf")
         return "\n".join(lines)
@@ -119,6 +121,7 @@ def dns_resolvers_report(checker):
     lines.append("Проверка доступности:")
 
     for ns in nameservers:
+        # dig: rc!=0 при NXDOMAIN — судим по выводу grep, а не по rc.
         cmd = f"dig +timeout=2 +tries=1 @{q(ns)} google.com A 2>/dev/null | grep -q 'NOERROR' && echo 'доступен' || echo 'недоступен'"
         out, _ = checker.exec_command(cmd)
         status = out.strip() if out.strip() else "недоступен"
@@ -138,7 +141,7 @@ def dns_resolvers_report(checker):
 
 
 def get_current_dns_resolvers(checker):
-    out, _ = checker.exec_command('grep -E "^nameserver" /etc/resolv.conf 2>/dev/null | awk \'{print $2}\'')
+    out, _, _ = checker.run('grep -E "^nameserver" /etc/resolv.conf 2>/dev/null | awk \'{print $2}\'')
     if out.strip():
         return [ns.strip() for ns in out.splitlines() if ns.strip()]
     return []
@@ -157,7 +160,7 @@ def set_dns_resolvers(checker, nameservers):
         lines.append("❌ Не передано ни одного корректного DNS-адреса.")
         return "\n".join(lines)
 
-    out, _ = checker.exec_command('systemctl is-active systemd-resolved 2>/dev/null')
+    out, _, _ = checker.run('systemctl is-active systemd-resolved 2>/dev/null')
     if out.strip() != 'active':
         lines.append("systemd-resolved не активен. Редактируем /etc/resolv.conf напрямую.")
         backup_path = create_backup(checker, '/etc/resolv.conf', 'dns')
@@ -180,7 +183,7 @@ def set_dns_resolvers(checker, nameservers):
         return "\n".join(lines)
 
     lines.append("Обнаружен systemd-resolved. Настраиваем глобальные DNS и интерфейсы.")
-    out_conf, _ = checker.exec_command('cat /etc/systemd/resolved.conf 2>/dev/null')
+    out_conf, _, _ = checker.run('cat /etc/systemd/resolved.conf 2>/dev/null')
     new_conf_lines = []
     dns_found = False
     for line in out_conf.splitlines():
@@ -207,18 +210,18 @@ def set_dns_resolvers(checker, nameservers):
     else:
         lines.append("✅ /etc/systemd/resolved.conf обновлён.")
 
-    out_ifaces, _ = checker.exec_command("ip -o link show | awk -F': ' '{print $2}' | grep -v lo")
+    out_ifaces, _, _ = checker.run("ip -o link show | awk -F': ' '{print $2}' | grep -v lo")
     interfaces = [iface.strip() for iface in out_ifaces.splitlines() if iface.strip()]
     for iface in interfaces:
-        checker.exec_command(f'resolvectl dns {q(iface)} "" 2>/dev/null')
+        checker.run(f'resolvectl dns {q(iface)} "" 2>/dev/null')
         cmd = 'resolvectl dns ' + q(iface) + ' ' + ' '.join(q(ns) for ns in valid_ns)
-        out, err = checker.exec_command(cmd + ' 2>&1')
-        if err.strip() and 'error' in err.lower():
-            lines.append(f"❌ Ошибка для {iface}: {err.strip()}")
+        out, err, rc = checker.run(cmd + ' 2>&1')
+        if rc != 0:
+            lines.append(f"❌ Ошибка для {iface} (rc={rc}): {err.strip() or out.strip()}")
         else:
             lines.append(f"✅ DNS для {iface}: {', '.join(valid_ns)}")
 
-    checker.exec_command('systemctl restart systemd-resolved 2>/dev/null')
+    checker.run('systemctl restart systemd-resolved 2>/dev/null')
     lines.append("Перезапущен systemd-resolved.")
 
     out_check, _ = checker.exec_command('resolvectl status | grep -E "Global|DNS Servers"')

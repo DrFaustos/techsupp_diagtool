@@ -26,9 +26,9 @@ def write_file(checker, filepath, content):
 
 
 def read_file(checker, filepath):
-    out, err = checker.exec_command(f'cat {q(filepath)} 2>/dev/null')
-    if err.strip():
-        return f"❌ Ошибка чтения файла: {err}"
+    out, err, rc = checker.run(f'cat {q(filepath)} 2>/dev/null')
+    if rc != 0:
+        return f"❌ Ошибка чтения файла (rc={rc}): {err.strip()}"
     return out
 
 
@@ -97,9 +97,9 @@ def replace_ipv4(checker, old_ip, new_ip):
         f"find /etc -type f -name \"*.conf\" "
         f"-exec sed -i -e 's#{old_escaped}#{new_escaped}#g' '{{}}' \\;"
     )
-    out, err = checker.exec_command(cmd)
-    if err.strip():
-        lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
+    out, err, rc = checker.run(cmd)
+    if rc != 0:
+        lines.append(f"⚠️ Возможны ошибки (rc={rc}): {err.strip() or out.strip()}")
     lines.append("✅ IPv4 заменён во всех .conf-файлах в /etc.")
     lines.append("")
     lines.append("=== ПРОВЕРКА КОНФИГУРАЦИИ NGINX ===")
@@ -107,8 +107,8 @@ def replace_ipv4(checker, old_ip, new_ip):
     lines.append(out_nginx.strip() if out_nginx.strip() else "(вывод пуст)")
     lines.append("")
     lines.append("=== SYSTEMD DAEMON-RELOAD ===")
-    checker.exec_command('systemctl daemon-reload 2>&1')
-    lines.append("✅ daemon-reload выполнен")
+    _, _, drc = checker.run('systemctl daemon-reload 2>&1')
+    lines.append("✅ daemon-reload выполнен" if drc == 0 else f"⚠️ daemon-reload вернул rc={drc}")
     lines.extend(restart_services(checker))
     return "\n".join(lines)
 
@@ -127,8 +127,8 @@ def replace_ipv6(checker, old_ip, new_ip):
         lines.append("⚠️ Не удалось создать резервную копию /etc (продолжаем)")
     cmd = f"find /etc -type f -exec sed -i 's/{old_ip}/{new_ip}/g' {{}} +"
     out, err, rc = checker.run(cmd)
-    if err.strip():
-        lines.append(f"⚠️ Возможны ошибки: {err.strip()}")
+    if rc != 0:
+        lines.append(f"⚠️ Возможны ошибки (rc={rc}): {err.strip() or out.strip()}")
     lines.append("✅ IPv6 заменён во всех файлах в /etc.")
     lines.append("")
     lines.append("=== ПРОВЕРКА КОНФИГУРАЦИИ NGINX ===")
@@ -136,8 +136,8 @@ def replace_ipv6(checker, old_ip, new_ip):
     lines.append(out_nginx.strip() if out_nginx.strip() else "(вывод пуст)")
     lines.append("")
     lines.append("=== SYSTEMD DAEMON-RELOAD ===")
-    checker.exec_command('systemctl daemon-reload 2>&1')
-    lines.append("✅ daemon-reload выполнен")
+    _, _, drc = checker.run('systemctl daemon-reload 2>&1')
+    lines.append("✅ daemon-reload выполнен" if drc == 0 else f"⚠️ daemon-reload вернул rc={drc}")
     lines.extend(restart_services(checker))
     return "\n".join(lines)
 
@@ -151,19 +151,19 @@ def restart_services(checker):
         'apache2': 'reload'
     }
     for svc, action in services.items():
-        out, _ = checker.exec_command(f'systemctl list-unit-files | grep -q "^{svc}.service" && echo "yes" || echo "no"')
+        out, _, _ = checker.run(f'systemctl list-unit-files | grep -q "^{svc}.service" && echo "yes" || echo "no"')
         if out.strip() == 'yes':
-            checker.exec_command(f'systemctl {action} {svc} 2>/dev/null')
-            status, _ = checker.exec_command(f'systemctl is-active {svc} 2>/dev/null')
+            _, _, arc = checker.run(f'systemctl {action} {svc} 2>/dev/null')
+            status, _, _ = checker.run(f'systemctl is-active {svc} 2>/dev/null')
             if status.strip() == 'active':
                 lines.append(f"✅ {svc} ({action}) выполнен")
             else:
-                checker.exec_command(f'systemctl restart {svc} 2>/dev/null')
-                status2, _ = checker.exec_command(f'systemctl is-active {svc} 2>/dev/null')
+                _, _, rrc = checker.run(f'systemctl restart {svc} 2>/dev/null')
+                status2, _, _ = checker.run(f'systemctl is-active {svc} 2>/dev/null')
                 if status2.strip() == 'active':
                     lines.append(f"✅ {svc} перезапущен (fallback)")
                 else:
-                    lines.append(f"❌ {svc} не запустился")
+                    lines.append(f"❌ {svc} не запустился (rc={rrc}, reload rc={arc})")
         else:
             lines.append(f"⏭️ {svc} не установлен")
     return lines

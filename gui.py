@@ -7,6 +7,8 @@ import re
 import os
 import logging
 import subprocess
+import json
+import time
 from diagnostic import (
     detect_panel, full_diagnostic_report,
     metrics_report, firewall_report,
@@ -111,8 +113,14 @@ class DiagnosticApp:
             fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             self._logger.addHandler(fh)
 
+        self.conn_history_file = os.path.expanduser("~/.techsupp_diagtool_connections.json")
+        self.conn_history = self._load_conn_history()
+        self._diag_cache = {}
+
         self.create_widgets()
         self.cmd_entry.focus_set()
+        self.output.bind("<Control-c>", lambda e: self.copy_output())
+        self.output.bind("<Control-s>", lambda e: self.save_report())
 
     def update_output_colors(self, theme_name=None):
         if theme_name is None:
@@ -148,61 +156,137 @@ class DiagnosticApp:
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось переключить тему: {e}")
 
+    def _load_conn_history(self):
+        try:
+            if os.path.exists(self.conn_history_file):
+                with open(self.conn_history_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)[:10]
+        except Exception:
+            pass
+        return []
+
+    def _save_conn_history(self, ip, port, user):
+        entry = {"ip": ip, "port": str(port), "user": user}
+        self.conn_history = [e for e in self.conn_history if e["ip"] != ip or e["port"] != str(port) or e["user"] != user]
+        self.conn_history.insert(0, entry)
+        self.conn_history = self.conn_history[:10]
+        try:
+            with open(self.conn_history_file, 'w', encoding='utf-8') as f:
+                json.dump(self.conn_history, f, indent=2)
+        except Exception:
+            pass
+
+    def _on_history_select(self, event):
+        sel = self.history_combo.get()
+        for entry in self.conn_history:
+            if f"{entry['ip']}:{entry['port']} ({entry['user']})" == sel:
+                self.ip_var.set(entry['ip'])
+                self.port_var.set(entry['port'])
+                self.user_var.set(entry['user'])
+                break
+
+    def show_cheatsheet(self):
+        dialog = tb.Toplevel(self.root)
+        dialog.title("📖 Шпаргалка техподдержки")
+        dialog.geometry("500x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tb.Label(dialog, text="Частые команды (нажмите 'Вставить' для копирования в терминал):", bootstyle="inverse-secondary").pack(pady=5)
+
+        cheats = [
+            ("Перезапуск nginx", "systemctl restart nginx"),
+            ("Перезапуск php-fpm", "systemctl restart php*-fpm"),
+            ("Последние 50 строк error.log", "tail -n 50 /var/log/nginx/error.log"),
+            ("Поиск 5xx ошибок сегодня", r"grep '\[5[0-9][0-9]\]' /var/log/nginx/access.log | tail -n 20"),
+            ("Свободное место", "df -h"),
+            ("Использование памяти", "free -m"),
+            ("Топ процессов по CPU", "ps aux --sort=-%cpu | head -n 15"),
+            ("Активные соединения", "ss -tulnp | grep -E ':(80|443)'"),
+            ("Очистка кэша systemd", "systemctl daemon-reload"),
+            ("Проверка синтаксиса nginx", "nginx -t")
+        ]
+
+        for name, cmd in cheats:
+            frame = tb.Frame(dialog, bootstyle="secondary")
+            frame.pack(fill=tk.X, padx=10, pady=2)
+            tb.Label(frame, text=name, width=30, anchor='w').pack(side=tk.LEFT, padx=5)
+            tb.Label(frame, text=cmd, font=("Courier", 9), foreground="gray").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+            tb.Button(frame, text="Вставить", bootstyle="info-outline", 
+                      command=lambda c=cmd: self._insert_cheat(c, dialog)).pack(side=tk.RIGHT, padx=5)
+
+        tb.Button(dialog, text="Закрыть", command=dialog.destroy, bootstyle="secondary").pack(pady=10)
+
+    def _insert_cheat(self, cmd, dialog):
+        self.cmd_entry.delete(0, tk.END)
+        self.cmd_entry.insert(0, cmd)
+        self.cmd_entry.focus_set()
+        dialog.destroy()
+
     def create_widgets(self):
         top_frame = tb.Frame(self.root, bootstyle="secondary")
         top_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        # IP
-        tb.Label(top_frame, text="IP:", bootstyle="inverse-secondary").grid(
+        # История подключений
+        tb.Label(top_frame, text="История:", bootstyle="inverse-secondary").grid(
             row=0, column=0, sticky='e', padx=5
         )
+        history_vals = [f"{e['ip']}:{e['port']} ({e['user']})" for e in self.conn_history]
+        self.history_combo = ttk.Combobox(top_frame, values=history_vals, width=25, state='readonly')
+        self.history_combo.grid(row=0, column=1, padx=5)
+        self.history_combo.bind('<<ComboboxSelected>>', self._on_history_select)
+
+        # IP
+        tb.Label(top_frame, text="IP:", bootstyle="inverse-secondary").grid(
+            row=1, column=0, sticky='e', padx=5
+        )
         self.ip_entry = tb.Entry(top_frame, textvariable=self.ip_var, width=15)
-        self.ip_entry.grid(row=0, column=1, padx=5)
+        self.ip_entry.grid(row=1, column=1, padx=5)
 
         # Порт
         tb.Label(top_frame, text="Порт:", bootstyle="inverse-secondary").grid(
-            row=0, column=2, sticky='e', padx=5
+            row=1, column=2, sticky='e', padx=5
         )
         tb.Entry(top_frame, textvariable=self.port_var, width=6).grid(
-            row=0, column=3, padx=5
+            row=1, column=3, padx=5
         )
 
         # Пользователь
         tb.Label(top_frame, text="Пользователь:", bootstyle="inverse-secondary").grid(
-            row=0, column=4, sticky='e', padx=5
+            row=1, column=4, sticky='e', padx=5
         )
         tb.Entry(top_frame, textvariable=self.user_var, width=12).grid(
-            row=0, column=5, padx=5
+            row=1, column=5, padx=5
         )
 
         # Пароль
         tb.Label(top_frame, text="Пароль:", bootstyle="inverse-secondary").grid(
-            row=0, column=6, sticky='e', padx=5
+            row=1, column=6, sticky='e', padx=5
         )
         tb.Entry(top_frame, textvariable=self.password_var, show="*", width=12).grid(
-            row=0, column=7, padx=5
+            row=1, column=7, padx=5
         )
 
         # Ключ
         tb.Label(top_frame, text="Ключ:", bootstyle="inverse-secondary").grid(
-            row=1, column=0, sticky='e', padx=5
+            row=2, column=0, sticky='e', padx=5
         )
         tb.Entry(top_frame, textvariable=self.key_var, width=30).grid(
-            row=1, column=1, columnspan=6, sticky='ew', padx=5
+            row=2, column=1, columnspan=6, sticky='ew', padx=5
         )
         tb.Button(
             top_frame,
             text="Обзор",
             command=self.browse_key,
             bootstyle="secondary-outline"
-        ).grid(row=1, column=7, padx=5)
+        ).grid(row=2, column=7, padx=5)
 
         # Тип панели
         tb.Label(top_frame, text="Панель:", bootstyle="inverse-secondary").grid(
-            row=2, column=0, sticky='e', padx=5
+            row=3, column=0, sticky='e', padx=5
         )
         panel_frame = tb.Frame(top_frame, bootstyle="secondary")
-        panel_frame.grid(row=2, column=1, columnspan=4, sticky='w', padx=5)
+        panel_frame.grid(row=3, column=1, columnspan=4, sticky='w', padx=5)
 
         for text, value in [
             ("Авто", "auto"),
@@ -304,6 +388,14 @@ class DiagnosticApp:
             bootstyle="secondary"
         )
         self.oom_btn.pack(side=tk.LEFT, padx=5)
+
+        self.cheat_btn = tb.Button(
+            btn_frame,
+            text="📖 Шпаргалка",
+            command=self.show_cheatsheet,
+            bootstyle="secondary-outline"
+        )
+        self.cheat_btn.pack(side=tk.LEFT, padx=5)
 
         self.dns_btn = tb.Button(
             btn_frame,
@@ -505,6 +597,22 @@ class DiagnosticApp:
         self.progress.pack(pady=5)
         self.progress.pack_forget()
 
+        # ---------- КНОПКИ ДЕЙСТВИЙ ----------
+        action_frame = tb.Frame(self.root, bootstyle="secondary")
+        action_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+        tb.Button(
+            action_frame,
+            text="📋 Копировать вывод (Ctrl+C)",
+            command=self.copy_output,
+            bootstyle="secondary-outline"
+        ).pack(side=tk.RIGHT, padx=5)
+        tb.Button(
+            action_frame,
+            text="💾 Сохранить отчёт (Ctrl+S)",
+            command=self.save_report,
+            bootstyle="secondary-outline"
+        ).pack(side=tk.RIGHT, padx=5)
+
         # ---------- ТЕКСТОВОЕ ПОЛЕ ВЫВОДА ----------
         self.output = scrolledtext.ScrolledText(
             self.root,
@@ -582,6 +690,27 @@ class DiagnosticApp:
         except Exception:
             pass
 
+    def copy_output(self):
+        text = self.output.get(1.0, tk.END)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        self.log("✅ Вывод скопирован в буфер обмена")
+
+    def save_report(self):
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            parent=self.root
+        )
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(self.output.get(1.0, tk.END))
+                self.log(f"✅ Отчёт сохранён в {filename}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {e}", parent=self.root)
+
     def history_up(self, event):
         if not self.cmd_history:
             return "break"
@@ -647,6 +776,11 @@ class DiagnosticApp:
         self.log(f"✅ {message}")
         self.log(f"Панель управления: {self.panel_type}")
 
+        # Сохраняем в историю
+        self._save_conn_history(self.ip_var.get().strip(), self.port_var.get().strip(), self.user_var.get().strip())
+        # Обновляем комбобокс
+        self.history_combo['values'] = [f"{e['ip']}:{e['port']} ({e['user']})" for e in self.conn_history]
+
         # Очищаем пароль из памяти после успешного подключения
         self.password_var.set("")
 
@@ -707,6 +841,15 @@ class DiagnosticApp:
         Защищает от параллельного запуска нескольких задач и от гонки
         с disconnect(): пока задача выполняется, соединение не закрывается.
         """
+        cache_key = kwargs.pop('cache_key', None)
+        
+        # Проверка кеша (60 секунд)
+        if cache_key and cache_key in self._diag_cache:
+            ts, cached_result = self._diag_cache[cache_key]
+            if time.time() - ts < 60:
+                self.root.after(0, lambda: self._display_result(cached_result + "\n\n⚡ [Показан результат из кеша (< 60 сек). Нажмите ещё раз для обновления.]"))
+                return
+
         with self._busy_lock:
             if self._busy:
                 messagebox.showwarning("Занято", "Дождитесь завершения текущей операции.")
@@ -726,6 +869,8 @@ class DiagnosticApp:
         def wrapper():
             try:
                 result = target_func(*args, **kwargs)
+                if cache_key:
+                    self._diag_cache[cache_key] = (time.time(), result)
                 self.root.after(0, self._display_result, result)
             except Exception as e:
                 self.root.after(0, self._display_result, f"❌ Ошибка: {str(e)}")
@@ -787,25 +932,25 @@ class DiagnosticApp:
 
     # ---------- ДИАГНОСТИКИ ----------
     def run_full(self):
-        self._run_in_thread(full_diagnostic_report, self.full_btn, self.checker, self.panel_type)
+        self._run_in_thread(full_diagnostic_report, self.full_btn, self.checker, self.panel_type, cache_key='full')
 
     def run_disk_memory(self):
-        self._run_in_thread(disk_memory_report, self.disk_btn, self.checker)
+        self._run_in_thread(disk_memory_report, self.disk_btn, self.checker, cache_key='disk')
 
     def run_network(self):
-        self._run_in_thread(network_report, self.network_btn, self.checker)
+        self._run_in_thread(network_report, self.network_btn, self.checker, cache_key='network')
 
     def run_firewall(self):
-        self._run_in_thread(firewall_report, self.firewall_btn, self.checker)
+        self._run_in_thread(firewall_report, self.firewall_btn, self.checker, cache_key='firewall')
 
     def run_config(self):
-        self._run_in_thread(web_config_report, self.config_btn, self.checker)
+        self._run_in_thread(web_config_report, self.config_btn, self.checker, cache_key='webconfig')
 
     def run_logs(self):
-        self._run_in_thread(site_logs_report, self.logs_btn, self.checker, self.panel_type)
+        self._run_in_thread(site_logs_report, self.logs_btn, self.checker, self.panel_type, cache_key='logs')
 
     def run_oom_search(self):
-        self._run_in_thread(search_oom_logs, self.oom_btn, self.checker)
+        self._run_in_thread(search_oom_logs, self.oom_btn, self.checker, cache_key='oom')
 
     # ---------- АНАЛИЗ ЛОГОВ ДОСТУПА ----------
     def run_access_analysis(self):
@@ -977,8 +1122,7 @@ class DiagnosticApp:
 
     def _do_create_swap(self, size_mb):
         lines = [f"=== Создание swap файла размером {size_mb} МБ ==="]
-        cmd = "df -m / | awk 'NR==2 {print $4}'"
-        out, _ = self.checker.exec_command(cmd)
+        out, err, rc = self.checker.run("df -m / | awk 'NR==2 {print $4}'")
         free_mb = int(out.strip()) if out.strip().isdigit() else 0
         if free_mb < size_mb + 100:
             lines.append(f"❌ Недостаточно свободного места (доступно {free_mb} МБ, требуется ~{size_mb+100} МБ)")
@@ -991,14 +1135,14 @@ class DiagnosticApp:
             "swapon /swapfile"
         ]
         for c in cmds:
-            out, err = self.checker.exec_command(c)
+            out, err, rc = self.checker.run(c)
             lines.append(f"$ {c}")
             if out.strip():
                 lines.append(out.strip())
-            if err.strip():
+            if rc != 0 and err.strip():
                 lines.append("STDERR: " + err.strip())
 
-        out, _ = self.checker.exec_command("swapon --show")
+        out, err, rc = self.checker.run("swapon --show")
         lines.append("Текущие swap-разделы:\n" + out)
         return "\n".join(lines)
 
@@ -1009,26 +1153,30 @@ class DiagnosticApp:
 
     def _do_add_swap_to_fstab(self):
         lines = ["=== Добавление /swapfile в /etc/fstab ==="]
-        out, _ = self.checker.exec_command("grep -q '/swapfile' /etc/fstab && echo 'yes' || echo 'no'")
+        out, err, rc = self.checker.run("grep -q '/swapfile' /etc/fstab && echo 'yes' || echo 'no'")
         if out.strip() == 'yes':
             lines.append("Запись /swapfile уже присутствует в fstab.")
             return "\n".join(lines)
 
         cmd = 'echo "/swapfile none swap sw 0 0" >> /etc/fstab'
-        out, err = self.checker.exec_command(cmd)
+        out, err, rc = self.checker.run(cmd)
         lines.append(f"$ {cmd}")
-        if out.strip():
-            lines.append(out.strip())
-        if err.strip():
+        if rc != 0 and err.strip():
             lines.append("STDERR: " + err.strip())
-        out, _ = self.checker.exec_command("tail -3 /etc/fstab")
+        out, err, rc = self.checker.run("tail -3 /etc/fstab")
         lines.append("Последние строки /etc/fstab:\n" + out)
         return "\n".join(lines)
 
     def run_dns_check(self):
         if not self.checker:
             return
-        domains = get_domains(self.checker, self.panel_type)
+        self.log("Получение списка доменов...")
+        self._run_simple(get_domains, None, self._open_dns_check_dialog, self.checker, self.panel_type)
+
+    def _open_dns_check_dialog(self, domains):
+        if isinstance(domains, str):
+            self.log(domains)
+            domains = []
         domain_var = tk.StringVar()
         if domains:
             domain_var.set(domains[0])
@@ -1079,7 +1227,7 @@ class DiagnosticApp:
     def run_dns_resolvers(self):
         if not self.checker:
             return
-        self._run_in_thread(dns_resolvers_report, self.resolv_btn, self.checker)
+        self._run_in_thread(dns_resolvers_report, self.resolv_btn, self.checker, cache_key='dns_resolvers')
 
     def run_edit_dns(self):
         if not self.checker:
@@ -1449,12 +1597,12 @@ class DiagnosticApp:
         self.log(f"\n$ {cmd}")
 
         def run_cmd():
-            stdout, stderr = self.checker.exec_command(cmd)
+            out, err, rc = self.checker.run(cmd)
             parts = []
-            if stdout.strip():
-                parts.append(stdout.strip())
-            if stderr.strip():
-                parts.append("STDERR: " + stderr.strip())
+            if out.strip():
+                parts.append(out.strip())
+            if rc != 0 and err.strip():
+                parts.append("STDERR: " + err.strip())
             return "\n".join(parts) if parts else "(нет вывода)"
 
         self._run_simple(run_cmd, self.send_btn)
