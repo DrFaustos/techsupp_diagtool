@@ -1,12 +1,12 @@
 """DNS-функции: проверка записей, работа с резолверами."""
 import re
+import socket
 
 from common import q, create_backup, write_remote_file
 
 
 # ==================== DNS ФУНКЦИИ ====================
 def dns_report_local(domain):
-    import socket
     lines = []
     lines.append(f"=== ЛОКАЛЬНАЯ DNS-ПРОВЕРКА ДЛЯ {domain} ===")
 
@@ -100,7 +100,7 @@ def dns_resolvers_report(checker):
     lines.append("=== DNS-РЕЗОЛВЕРЫ НА СЕРВЕРЕ ===")
 
     out, _, rc = checker.run('cat /etc/resolv.conf 2>/dev/null')
-    if not out.strip():
+    if rc != 0 or not out.strip():
         lines.append("❌ Не удалось прочитать /etc/resolv.conf")
         return "\n".join(lines)
 
