@@ -113,6 +113,8 @@ class DiagnosticApp:
 
         self.create_widgets()
         self.cmd_entry.focus_set()
+        self.output.bind("<Control-c>", lambda e: self.copy_output())
+        self.output.bind("<Control-s>", lambda e: self.save_report())
 
     def update_output_colors(self, theme_name=None):
         if theme_name is None:
@@ -505,6 +507,22 @@ class DiagnosticApp:
         self.progress.pack(pady=5)
         self.progress.pack_forget()
 
+        # ---------- КНОПКИ ДЕЙСТВИЙ ----------
+        action_frame = tb.Frame(self.root, bootstyle="secondary")
+        action_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+        tb.Button(
+            action_frame,
+            text="📋 Копировать вывод (Ctrl+C)",
+            command=self.copy_output,
+            bootstyle="secondary-outline"
+        ).pack(side=tk.RIGHT, padx=5)
+        tb.Button(
+            action_frame,
+            text="💾 Сохранить отчёт (Ctrl+S)",
+            command=self.save_report,
+            bootstyle="secondary-outline"
+        ).pack(side=tk.RIGHT, padx=5)
+
         # ---------- ТЕКСТОВОЕ ПОЛЕ ВЫВОДА ----------
         self.output = scrolledtext.ScrolledText(
             self.root,
@@ -581,6 +599,27 @@ class DiagnosticApp:
             self._logger.info(text)
         except Exception:
             pass
+
+    def copy_output(self):
+        text = self.output.get(1.0, tk.END)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        self.log("✅ Вывод скопирован в буфер обмена")
+
+    def save_report(self):
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            parent=self.root
+        )
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(self.output.get(1.0, tk.END))
+                self.log(f"✅ Отчёт сохранён в {filename}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {e}", parent=self.root)
 
     def history_up(self, event):
         if not self.cmd_history:
@@ -977,8 +1016,7 @@ class DiagnosticApp:
 
     def _do_create_swap(self, size_mb):
         lines = [f"=== Создание swap файла размером {size_mb} МБ ==="]
-        cmd = "df -m / | awk 'NR==2 {print $4}'"
-        out, _ = self.checker.exec_command(cmd)
+        out, err, rc = self.checker.run("df -m / | awk 'NR==2 {print $4}'")
         free_mb = int(out.strip()) if out.strip().isdigit() else 0
         if free_mb < size_mb + 100:
             lines.append(f"❌ Недостаточно свободного места (доступно {free_mb} МБ, требуется ~{size_mb+100} МБ)")
@@ -991,14 +1029,14 @@ class DiagnosticApp:
             "swapon /swapfile"
         ]
         for c in cmds:
-            out, err = self.checker.exec_command(c)
+            out, err, rc = self.checker.run(c)
             lines.append(f"$ {c}")
             if out.strip():
                 lines.append(out.strip())
-            if err.strip():
+            if rc != 0 and err.strip():
                 lines.append("STDERR: " + err.strip())
 
-        out, _ = self.checker.exec_command("swapon --show")
+        out, err, rc = self.checker.run("swapon --show")
         lines.append("Текущие swap-разделы:\n" + out)
         return "\n".join(lines)
 
@@ -1009,26 +1047,30 @@ class DiagnosticApp:
 
     def _do_add_swap_to_fstab(self):
         lines = ["=== Добавление /swapfile в /etc/fstab ==="]
-        out, _ = self.checker.exec_command("grep -q '/swapfile' /etc/fstab && echo 'yes' || echo 'no'")
+        out, err, rc = self.checker.run("grep -q '/swapfile' /etc/fstab && echo 'yes' || echo 'no'")
         if out.strip() == 'yes':
             lines.append("Запись /swapfile уже присутствует в fstab.")
             return "\n".join(lines)
 
         cmd = 'echo "/swapfile none swap sw 0 0" >> /etc/fstab'
-        out, err = self.checker.exec_command(cmd)
+        out, err, rc = self.checker.run(cmd)
         lines.append(f"$ {cmd}")
-        if out.strip():
-            lines.append(out.strip())
-        if err.strip():
+        if rc != 0 and err.strip():
             lines.append("STDERR: " + err.strip())
-        out, _ = self.checker.exec_command("tail -3 /etc/fstab")
+        out, err, rc = self.checker.run("tail -3 /etc/fstab")
         lines.append("Последние строки /etc/fstab:\n" + out)
         return "\n".join(lines)
 
     def run_dns_check(self):
         if not self.checker:
             return
-        domains = get_domains(self.checker, self.panel_type)
+        self.log("Получение списка доменов...")
+        self._run_simple(get_domains, None, self._open_dns_check_dialog, self.checker, self.panel_type)
+
+    def _open_dns_check_dialog(self, domains):
+        if isinstance(domains, str):
+            self.log(domains)
+            domains = []
         domain_var = tk.StringVar()
         if domains:
             domain_var.set(domains[0])
@@ -1449,12 +1491,12 @@ class DiagnosticApp:
         self.log(f"\n$ {cmd}")
 
         def run_cmd():
-            stdout, stderr = self.checker.exec_command(cmd)
+            out, err, rc = self.checker.run(cmd)
             parts = []
-            if stdout.strip():
-                parts.append(stdout.strip())
-            if stderr.strip():
-                parts.append("STDERR: " + stderr.strip())
+            if out.strip():
+                parts.append(out.strip())
+            if rc != 0 and err.strip():
+                parts.append("STDERR: " + err.strip())
             return "\n".join(parts) if parts else "(нет вывода)"
 
         self._run_simple(run_cmd, self.send_btn)
