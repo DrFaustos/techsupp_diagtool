@@ -495,6 +495,10 @@ class DiagnosticApp:
         )
         self.logs_btn.pack(side=tk.LEFT, padx=5)
 
+        # --- Ряд ---
+        btn_frame = tb.Frame(self.root, bootstyle="secondary")
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+
         self.access_btn = tb.Button(
             btn_frame,
             text="Анализ логов доступа",
@@ -536,6 +540,10 @@ class DiagnosticApp:
             bootstyle="secondary-outline"
         )
         self.cheat_btn.pack(side=tk.LEFT, padx=5)
+
+        # --- Ряд ---
+        btn_frame = tb.Frame(self.root, bootstyle="secondary")
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
 
         self.dns_btn = tb.Button(
             btn_frame,
@@ -581,6 +589,10 @@ class DiagnosticApp:
             bootstyle="secondary"
         )
         self.ipv6_btn.pack(side=tk.LEFT, padx=5)
+
+        # --- Ряд ---
+        btn_frame = tb.Frame(self.root, bootstyle="secondary")
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
 
         self.restart_btn = tb.Button(
             btn_frame,
@@ -628,6 +640,10 @@ class DiagnosticApp:
         )
         self.toggle_theme_btn.pack(side=tk.LEFT, padx=5)
 
+        # --- Ряд ---
+        btn_frame = tb.Frame(self.root, bootstyle="secondary")
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+
         # ---------- КНОПКИ ISPmanager ----------
         self.ispmanager_frame = tb.Frame(btn_frame, bootstyle="secondary")
         self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
@@ -669,8 +685,13 @@ class DiagnosticApp:
         )
         self.isp_ssl_btn.pack(side=tk.LEFT, padx=2)
 
+        # Второй ряд ISP-кнопок (чтобы не переполнять строку)
+        self.ispmanager_frame2 = tb.Frame(btn_frame, bootstyle="secondary")
+        self.ispmanager_frame2.pack(side=tk.LEFT, padx=5)
+        self.ispmanager_frame2.pack_forget()
+
         self.isp_disable_btn = tb.Button(
-            self.ispmanager_frame,
+            self.ispmanager_frame2,
             text="Отключить панель",
             command=self.run_isp_disable,
             state=tk.DISABLED,
@@ -679,7 +700,7 @@ class DiagnosticApp:
         self.isp_disable_btn.pack(side=tk.LEFT, padx=2)
 
         self.isp_geoip_btn = tb.Button(
-            self.ispmanager_frame,
+            self.ispmanager_frame2,
             text="Отключить GeoIP",
             command=self.run_isp_geoip,
             state=tk.DISABLED,
@@ -688,7 +709,7 @@ class DiagnosticApp:
         self.isp_geoip_btn.pack(side=tk.LEFT, padx=2)
 
         self.isp_cron_btn = tb.Button(
-            self.ispmanager_frame,
+            self.ispmanager_frame2,
             text="Проверить CRON",
             command=self.run_isp_cron,
             state=tk.DISABLED,
@@ -697,7 +718,7 @@ class DiagnosticApp:
         self.isp_cron_btn.pack(side=tk.LEFT, padx=2)
 
         self.isp_fix_cron_btn = tb.Button(
-            self.ispmanager_frame,
+            self.ispmanager_frame2,
             text="Исправить CRON",
             command=self.run_isp_fix_cron,
             state=tk.DISABLED,
@@ -966,6 +987,7 @@ class DiagnosticApp:
         # ISPmanager кнопки
         if self.panel_type == 'ispmanager':
             self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
+            self.ispmanager_frame2.pack(side=tk.LEFT, padx=5)
             for btn in [
                 self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
                 self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
@@ -974,6 +996,7 @@ class DiagnosticApp:
                 btn.config(state=tk.NORMAL)
         else:
             self.ispmanager_frame.pack_forget()
+            self.ispmanager_frame2.pack_forget()
             for btn in [
                 self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
                 self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
@@ -1908,6 +1931,7 @@ class DiagnosticApp:
         ]:
             btn.config(state=tk.DISABLED)
         self.ispmanager_frame.pack_forget()
+        self.ispmanager_frame2.pack_forget()
 
         self.connect_btn.config(text="Подключиться", bootstyle="success", command=self.connect)
         self.log("Соединение закрыто.")
