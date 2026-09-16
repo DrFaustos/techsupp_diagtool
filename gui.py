@@ -912,6 +912,10 @@ class DiagnosticApp:
 
         # Запоминаем checker на время задачи, чтобы disconnect его не обнулил
         active_checker = self.checker
+        try:
+            active_checker.reset_cancel()
+        except Exception:
+            pass
 
         def wrapper():
             try:
@@ -948,8 +952,15 @@ class DiagnosticApp:
                 return
             self._busy = True
 
+        # Сбрасываем возможную прошлую отмену, иначе следующая команда упадёт.
+        try:
+            self.checker.reset_cancel()
+        except Exception:
+            pass
+
         if btn:
             btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.NORMAL)
         self.progress.pack(pady=5)
         self.progress.start(10)
 
@@ -962,6 +973,7 @@ class DiagnosticApp:
                 self.root.after(0, self._stop_progress)
                 if btn:
                     self.root.after(0, lambda b=btn: b.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.cancel_btn.config(state=tk.DISABLED))
                 with self._busy_lock:
                     self._busy = False
             if on_done:
