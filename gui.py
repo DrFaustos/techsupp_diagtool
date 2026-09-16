@@ -95,6 +95,7 @@ class DiagnosticApp:
         self.password_var = tk.StringVar()
         self.key_var = tk.StringVar(value="~/.ssh/id_rsa")
         self.panel_var = tk.StringVar(value="auto")
+        self.profile_var = tk.StringVar()
 
         self.checker = None
         self.panel_type = None
@@ -132,6 +133,7 @@ class DiagnosticApp:
         self.cmd_entry.focus_set()
         self.output.bind("<Control-c>", lambda e: self.copy_output())
         self.output.bind("<Control-s>", lambda e: self.save_report())
+        self.output.bind("<Control-f>", lambda e: self.find_in_output())
 
     def update_output_colors(self, theme_name=None):
         if theme_name is None:
@@ -166,6 +168,101 @@ class DiagnosticApp:
             self.current_theme = theme_name
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось переключить тему: {e}")
+
+    # ---------- ПРОФИЛИ СЕРВЕРОВ ----------
+    def _profiles_file(self):
+        return os.path.expanduser("~/.techsupp_diagtool_profiles.json")
+
+    def _load_profiles(self):
+        try:
+            if os.path.exists(self._profiles_file()):
+                with open(self._profiles_file(), 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_profiles(self, profiles):
+        try:
+            with open(self._profiles_file(), 'w', encoding='utf-8') as f:
+                json.dump(profiles, f, indent=2)
+            os.chmod(self._profiles_file(), 0o600)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить профили: {e}", parent=self.root)
+
+    def save_profile(self):
+        ip = self.ip_var.get().strip()
+        if not ip:
+            messagebox.showerror("Ошибка", "Введите IP перед сохранением профиля", parent=self.root)
+            return
+        name = simpledialog.askstring("Профиль", "Имя профиля:", parent=self.root)
+        if not name:
+            return
+        profiles = self._load_profiles()
+        profiles[name.strip()] = {
+            "ip": ip,
+            "port": self.port_var.get().strip(),
+            "user": self.user_var.get().strip(),
+            "key": self.key_var.get().strip(),
+            "panel": self.panel_var.get(),
+        }
+        self._save_profiles(profiles)
+        self._refresh_profiles()
+        self.log(f"✅ Профиль '{name}' сохранён")
+
+    def load_profile(self):
+        name = self.profile_var.get().strip()
+        if not name:
+            return
+        profiles = self._load_profiles()
+        p = profiles.get(name)
+        if not p:
+            return
+        self.ip_var.set(p.get("ip", ""))
+        self.port_var.set(p.get("port", "22"))
+        self.user_var.set(p.get("user", "root"))
+        self.key_var.set(p.get("key", "~/.ssh/id_rsa"))
+        self.panel_var.set(p.get("panel", "auto"))
+        self.log(f"Профиль '{name}' загружен")
+
+    def delete_profile(self):
+        name = self.profile_var.get().strip()
+        if not name:
+            return
+        if not messagebox.askyesno("Удалить", f"Удалить профиль '{name}'?", parent=self.root):
+            return
+        profiles = self._load_profiles()
+        profiles.pop(name, None)
+        self._save_profiles(profiles)
+        self._refresh_profiles()
+
+    def _refresh_profiles(self):
+        names = sorted(self._load_profiles().keys())
+        if hasattr(self, 'profile_combo'):
+            self.profile_combo['values'] = names
+
+    # ---------- ПОИСК В ВЫВОДЕ ----------
+    def find_in_output(self):
+        query = simpledialog.askstring("Поиск", "Найти в выводе:", parent=self.root)
+        if not query:
+            return
+        self.output.tag_remove('search_hit', '1.0', tk.END)
+        self.output.tag_config('search_hit', background='#ffd54f', foreground='#000000')
+        start = '1.0'
+        count = 0
+        while True:
+            pos = self.output.search(query, start, stopindex=tk.END, nocase=True)
+            if not pos:
+                break
+            end = f"{pos}+{len(query)}c"
+            self.output.tag_add('search_hit', pos, end)
+            start = end
+            count += 1
+        if count:
+            self.log(f"🔍 Найдено совпадений: {count}")
+            self.output.see(self.output.tag_ranges('search_hit')[0] if self.output.tag_ranges('search_hit') else tk.END)
+        else:
+            self.log(f"🔍 '{query}' не найдено")
 
     def _load_conn_history(self):
         try:
@@ -247,6 +344,21 @@ class DiagnosticApp:
         self.history_combo = ttk.Combobox(top_frame, values=history_vals, width=25, state='readonly')
         self.history_combo.grid(row=0, column=1, padx=5)
         self.history_combo.bind('<<ComboboxSelected>>', self._on_history_select)
+
+        # Профили серверов
+        tb.Label(top_frame, text="Профиль:", bootstyle="inverse-secondary").grid(
+            row=0, column=2, sticky='e', padx=5
+        )
+        self.profile_combo = ttk.Combobox(top_frame, textvariable=self.profile_var,
+                                          values=sorted(self._load_profiles().keys()),
+                                          width=18, state='readonly')
+        self.profile_combo.grid(row=0, column=3, padx=5)
+        tb.Button(top_frame, text="Загрузить", command=self.load_profile,
+                  bootstyle="secondary-outline").grid(row=0, column=4, padx=2)
+        tb.Button(top_frame, text="Сохранить", command=self.save_profile,
+                  bootstyle="secondary-outline").grid(row=0, column=5, padx=2)
+        tb.Button(top_frame, text="✖", command=self.delete_profile,
+                  bootstyle="danger-outline", width=3).grid(row=0, column=6, padx=2)
 
         # IP
         tb.Label(top_frame, text="IP:", bootstyle="inverse-secondary").grid(
