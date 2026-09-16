@@ -162,3 +162,35 @@ class TestReplaceIp:
         c = FakeChecker()
         files_mod.replace_ipv6(c, 'a::a', 'b::b')
         assert c._find_cmd('tar czf') is not None
+
+
+# ==================== webcheck (SSL / WHOIS / порты / grep) ====================
+import webcheck as webcheck_mod
+
+
+class TestWebcheckEdgeCases:
+    def test_ssl_no_domain(self):
+        c = FakeChecker()
+        out = webcheck_mod.ssl_cert_report(c, '')
+        assert '❌' in out
+        # при пустом домене команда не выполняется
+        assert c.commands == []
+
+    def test_whois_no_domain(self):
+        c = FakeChecker()
+        out = webcheck_mod.whois_report(c, '')
+        assert '❌' in out
+        assert c.commands == []
+
+    def test_port_scan_uses_run_and_ss(self):
+        c = FakeChecker()
+        out = webcheck_mod.port_scan_report(c, host='127.0.0.1')
+        assert 'СКАНИРОВАНИЕ ПОРТОВ' in out
+        assert c._find_cmd('ss -tulpn') is not None
+        assert c._find_cmd('127.0.0.1') is not None
+
+    def test_grep_logs_no_files(self):
+        c = FakeChecker()
+        # find_logs вернёт пусто -> сообщение об отсутствии логов
+        out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', r'" 5\d\d ')
+        assert '❌' in out or 'не найдены' in out

@@ -9,6 +9,7 @@
   - files.py    — файлы, конфиги, замена IP, перезапуск служб
   - panels.py   — управление ISPmanager
   - reports.py  — сводный отчёт
+  - webcheck.py — SSL-сертификаты, WHOIS, порты, grep логов
 
 Этот модуль сохранён для обратной совместимости импортов (gui.py импортирует
 всё именно отсюда). Прямое использование модулей предпочтительнее в новом коде.
@@ -58,6 +59,12 @@ from panels import (  # noqa: F401
 # --- reports ---
 from reports import full_diagnostic_report  # noqa: F401
 
+# --- webcheck ---
+from webcheck import (  # noqa: F401
+    ssl_cert_report, whois_report, port_scan_report,
+    grep_logs_report, list_common_reports,
+)
+
 
 __all__ = [
     'BACKUP_DIR', 'BACKUP_SUBDIRS', 'LOG_PATHS', 'DOMAIN_PATHS',
@@ -78,4 +85,6 @@ __all__ = [
     'ispmanager_ssl_issue', 'ispmanager_disable', 'ispmanager_disable_geoip',
     'ispmanager_check_cron_path', 'ispmanager_fix_cron_path',
     'full_diagnostic_report',
+    'ssl_cert_report', 'whois_report', 'port_scan_report',
+    'grep_logs_report', 'list_common_reports',
 ]

@@ -42,6 +42,8 @@ DOMAIN_PATHS = {
         '/etc/nginx/sites-available/*'
     ],
     'ispmanager': [
+        '/etc/nginx/vhosts/*/*',
+        '/etc/nginx/vhosts/*',
         '/etc/nginx/vhosts/*/*.conf',
         '/etc/nginx/vhosts/*.conf',
         '/usr/local/mgr5/etc/nginx/vhosts/*.conf',

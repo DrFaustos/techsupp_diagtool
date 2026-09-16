@@ -35,6 +35,9 @@ from diagnostic import (
     ispmanager_fix_cron_path
 )
 from ssh_client import ServerChecker
+from webcheck import (
+    ssl_cert_report, whois_report, port_scan_report, grep_logs_report,
+)
 
 
 # ==================== НАСТРОЙКИ ТЕМ ====================
@@ -397,6 +400,22 @@ class DiagnosticApp:
             bootstyle="secondary"
         )
         self.oom_btn.pack(side=tk.LEFT, padx=5)
+
+        self.ssl_btn = tb.Button(btn_frame, text="SSL-сертификат",
+            command=self.run_ssl_check, state=tk.DISABLED, bootstyle="secondary")
+        self.ssl_btn.pack(side=tk.LEFT, padx=5)
+        self.whois_btn = tb.Button(btn_frame, text="WHOIS",
+            command=self.run_whois, state=tk.DISABLED, bootstyle="secondary")
+        self.whois_btn.pack(side=tk.LEFT, padx=5)
+        self.ports_btn = tb.Button(btn_frame, text="Порты",
+            command=self.run_port_scan, state=tk.DISABLED, bootstyle="secondary")
+        self.ports_btn.pack(side=tk.LEFT, padx=5)
+        self.grep_btn = tb.Button(btn_frame, text="Grep логов",
+            command=self.run_grep_logs, state=tk.DISABLED, bootstyle="secondary")
+        self.grep_btn.pack(side=tk.LEFT, padx=5)
+        self.cancel_btn = tb.Button(btn_frame, text="✖ Отменить",
+            command=self.cancel_task, state=tk.DISABLED, bootstyle="danger-outline")
+        self.cancel_btn.pack(side=tk.RIGHT, padx=5)
 
         self.cheat_btn = tb.Button(
             btn_frame,
@@ -817,6 +836,10 @@ class DiagnosticApp:
         self.logs_btn.config(state=tk.NORMAL)
         self.access_btn.config(state=tk.NORMAL)
         self.oom_btn.config(state=tk.NORMAL)
+        self.ssl_btn.config(state=tk.NORMAL)
+        self.whois_btn.config(state=tk.NORMAL)
+        self.ports_btn.config(state=tk.NORMAL)
+        self.grep_btn.config(state=tk.NORMAL)
         self.dns_btn.config(state=tk.NORMAL)
         self.resolv_btn.config(state=tk.NORMAL)
         self.edit_dns_btn.config(state=tk.NORMAL)
@@ -902,10 +925,12 @@ class DiagnosticApp:
                 self.root.after(0, self._stop_progress)
                 if btn:
                     self.root.after(0, lambda b=btn: b.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.cancel_btn.config(state=tk.DISABLED))
                 with self._busy_lock:
                     self._busy = False
                 del active_checker
 
+        self.cancel_btn.config(state=tk.NORMAL)
         thread = threading.Thread(target=wrapper)
         thread.daemon = True
         thread.start()
@@ -956,7 +981,13 @@ class DiagnosticApp:
 
     # ---------- ДИАГНОСТИКИ ----------
     def run_full(self):
-        self._run_in_thread(full_diagnostic_report, self.full_btn, self.checker, self.panel_type, cache_key='full')
+        def progress_cb(step, total, name):
+            self.root.after(0, self.log, f"➡ Этап {step}/{total}: {name}")
+        self._run_in_thread(
+            full_diagnostic_report, self.full_btn,
+            self.checker, self.panel_type,
+            progress_cb=progress_cb, cache_key='full'
+        )
 
     def run_disk_memory(self):
         self._run_in_thread(disk_memory_report, self.disk_btn, self.checker, cache_key='disk')
@@ -975,6 +1006,67 @@ class DiagnosticApp:
 
     def run_oom_search(self):
         self._run_in_thread(search_oom_logs, self.oom_btn, self.checker, cache_key='oom')
+
+    # ---------- ДОП. ПРОВЕРКИ (SSL / WHOIS / порты / grep) ----------
+    def _ask_domain(self, title):
+        domains = []
+        try:
+            domains = get_domains(self.checker, self.panel_type) or []
+        except Exception:
+            domains = []
+        initial = domains[0] if domains else ""
+        value = simpledialog.askstring(title, "Домен:", initialvalue=initial, parent=self.root)
+        return (value or "").strip()
+
+    def run_ssl_check(self):
+        if not self.checker:
+            return
+        domain = self._ask_domain("SSL-сертификат")
+        if not domain:
+            return
+        self._run_simple(ssl_cert_report, self.ssl_btn, None, self.checker, domain)
+
+    def run_whois(self):
+        if not self.checker:
+            return
+        domain = self._ask_domain("WHOIS")
+        if not domain:
+            return
+        self._run_simple(whois_report, self.whois_btn, None, self.checker, domain)
+
+    def run_port_scan(self):
+        if not self.checker:
+            return
+        host = self.ip_var.get().strip() or None
+        self._run_simple(port_scan_report, self.ports_btn, None, self.checker, host)
+
+    def run_grep_logs(self):
+        if not self.checker:
+            return
+        domain = self._ask_domain("Grep логов")
+        if not domain:
+            return
+        pattern = simpledialog.askstring(
+            "Grep логов", "Regex-шаблон (по умолчанию 5xx/404):",
+            initialvalue=r'" 5[0-9][0-9] ', parent=self.root
+        )
+        if pattern is None:
+            return
+        pattern = pattern.strip() or r'" 5[0-9][0-9] '
+        self._run_simple(
+            grep_logs_report, self.grep_btn, None,
+            self.checker, self.panel_type, domain, pattern
+        )
+
+    def cancel_task(self):
+        """Прерывает текущую долгую операцию."""
+        if self.checker is not None:
+            try:
+                self.checker.cancel()
+            except Exception:
+                pass
+        self.log("⏹ Запрошена отмена текущей операции...")
+
 
     # ---------- АНАЛИЗ ЛОГОВ ДОСТУПА ----------
     def run_access_analysis(self):
@@ -1669,6 +1761,11 @@ class DiagnosticApp:
         self.logs_btn.config(state=tk.DISABLED)
         self.access_btn.config(state=tk.DISABLED)
         self.oom_btn.config(state=tk.DISABLED)
+        self.ssl_btn.config(state=tk.DISABLED)
+        self.whois_btn.config(state=tk.DISABLED)
+        self.ports_btn.config(state=tk.DISABLED)
+        self.grep_btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.DISABLED)
         self.dns_btn.config(state=tk.DISABLED)
         self.resolv_btn.config(state=tk.DISABLED)
         self.edit_dns_btn.config(state=tk.DISABLED)

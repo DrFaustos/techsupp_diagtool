@@ -60,6 +60,7 @@ def get_config_files(checker, panel_type):
             '/etc/nginx/fastpanel2-available/',
         ],
         'ispmanager': [
+            '/etc/nginx/vhosts/',
             '/usr/local/mgr5/etc/nginx/',
             '/usr/local/mgr5/etc/apache2/',
             '/usr/local/mgr5/etc/php/',
@@ -79,7 +80,7 @@ def get_config_files(checker, panel_type):
         for path in panel_paths[panel_type]:
             out, _ = checker.exec_command(f'ls -d {q(path)} 2>/dev/null && echo "exists"')
             if out.strip() == 'exists':
-                out2, _ = checker.exec_command(f'find {q(path)} -type f -name "*.conf" 2>/dev/null | head -20')
+                out2, _ = checker.exec_command(f'find {q(path)} -type f 2>/dev/null | head -20')
                 if out2.strip():
                     for f in out2.splitlines():
                         if f.strip():
