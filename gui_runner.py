@@ -173,7 +173,10 @@ class RunnerMixin:
                 self.root.after(0, lambda: self.cancel_btn.config(state=tk.DISABLED))
                 with self._busy_lock:
                     self._busy = False
-                del active_checker
+                # active_checker здесь не удаляем: del имени из внешней области
+                # сделал бы его локальным в wrapper и бросил UnboundLocalError
+                # в самом конце finally (поток умирал с traceback после каждой
+                # задачи). Ячейка живёт в _run_in_thread и освобождается сама.
 
         self.cancel_btn.config(state=tk.NORMAL)
         thread = threading.Thread(target=wrapper)
