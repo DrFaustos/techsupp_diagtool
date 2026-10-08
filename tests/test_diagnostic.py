@@ -372,3 +372,91 @@ class TestFManager:
         assert fm.is_text_file('/etc/nginx/sites-enabled/example.com') is True
         assert fm.is_text_file('/usr/bin/bash') is False
         assert fm.is_text_file('backup.tar.gz') is False
+
+
+# ==================== metrics: статусы служб (без рассинхрона) ====================
+import metrics as metrics_mod
+
+
+class TestParseServiceStatuses:
+    def test_basic_pairs(self):
+        out = 'nginx=active\nmysql=inactive\nmariadb=unknown\n'
+        assert metrics_mod.parse_service_statuses(out) == {
+            'nginx': 'active', 'mysql': 'inactive', 'mariadb': 'unknown',
+        }
+
+    def test_empty_and_none(self):
+        # система без systemd / systemctl недоступен -> пусто, без исключения
+        assert metrics_mod.parse_service_statuses('') == {}
+        assert metrics_mod.parse_service_statuses(None) == {}
+
+    def test_garbage_lines_skipped(self):
+        assert metrics_mod.parse_service_statuses('no equals here\n\n') == {}
+
+    def test_blank_status_becomes_unknown(self):
+        assert metrics_mod.parse_service_statuses('nginx=') == {'nginx': 'unknown'}
+
+    def test_extra_lines_cannot_shift_statuses(self):
+        # Регрессия на старый баг: `|| echo "inactive"` добавлял лишнюю строку
+        # и статусы съезжали по списку. Теперь имя едет вместе со статусом,
+        # поэтому любая посторонняя строка просто игнорируется.
+        out = 'nginx=active\nsome junk line\napache2=inactive\nmore junk\nmysql=active'
+        st = metrics_mod.parse_service_statuses(out)
+        assert st == {'nginx': 'active', 'apache2': 'inactive', 'mysql': 'active'}
+
+    def test_status_with_spaces_and_equals_inside(self):
+        # split('=', 1): всё после первого '=' — статус, даже с пробелами
+        assert metrics_mod.parse_service_statuses('nginx=active (running)') == {
+            'nginx': 'active (running)'}
+
+
+class TestServicesStatusCmd:
+    def test_default_list_used(self):
+        cmd = metrics_mod.services_status_cmd()
+        for svc in metrics_mod.SERVICES_TO_CHECK:
+            assert svc in cmd
+
+    def test_output_format_is_name_equals_status(self):
+        cmd = metrics_mod.services_status_cmd(['nginx', 'php8.2-fpm'])
+        assert "printf '%s=%s\\n'" in cmd
+        assert 'nginx' in cmd and 'php8.2-fpm' in cmd
+
+    def test_service_names_are_shell_quoted(self):
+        # защита от инъекции через имя службы
+        cmd = metrics_mod.services_status_cmd(['evil;rm -rf /'])
+        assert "'evil;rm -rf /'" in cmd
+
+
+class _SvcChecker:
+    """Заглушка: отвечает реальным выводом только на команду статусов служб."""
+
+    def __init__(self, out):
+        self.out = out
+        self.commands = []
+
+    def exec_command(self, cmd):
+        self.commands.append(cmd)
+        if '__svc_status' in cmd:
+            return self.out, ''
+        return '', ''
+
+    def run(self, cmd):
+        out, err = self.exec_command(cmd)
+        return out, err, 0
+
+
+class TestGetMetricsServices:
+    def test_metrics_services_pairs_correctly(self):
+        c = _SvcChecker('nginx=active\nmysql=inactive\n')
+        m = metrics_mod.get_metrics(c)
+        assert m['services'] == {'nginx': 'active', 'mysql': 'inactive'}
+
+    def test_metrics_services_empty_without_systemd(self):
+        c = _SvcChecker('')
+        m = metrics_mod.get_metrics(c)
+        assert m['services'] == {}
+
+    def test_metrics_services_no_shift_with_junk(self):
+        c = _SvcChecker('nginx=active\nWarning: junk happened\nphp8.2-fpm=inactive\n')
+        m = metrics_mod.get_metrics(c)
+        assert m['services'].get('php8.2-fpm') == 'inactive'

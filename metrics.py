@@ -1,5 +1,5 @@
 """Определение панели, системные метрики и базовые отчёты."""
-from common import LOG_PATHS, DOMAIN_PATHS, get_domain_from_config
+from common import LOG_PATHS, DOMAIN_PATHS, get_domain_from_config, q
 
 
 # ==================== ОПРЕДЕЛЕНИЕ ПАНЕЛИ ====================
@@ -18,6 +18,53 @@ def detect_panel(checker):
     if 'mgr5' in out.lower():
         return 'ispmanager'
     return 'none'
+
+
+# ==================== СЛУЖБЫ: СТАТУСЫ ====================
+# Список проверяемых служб. php-fpm перечислен и как общий unit-шаблон,
+# и с версиями, которые ставят панели (FastPanel/ISPmanager).
+SERVICES_TO_CHECK = [
+    'nginx', 'apache2', 'httpd',
+    'php-fpm', 'php7.4-fpm', 'php8.0-fpm', 'php8.1-fpm', 'php8.2-fpm', 'php8.3-fpm',
+    'mysql', 'mariadb',
+]
+
+
+def services_status_cmd(services=None):
+    """Shell-команда, печатающая строку 'имя=статус' для каждой службы.
+
+    Почему так, а не `systemctl is-active NAME || echo "inactive"`:
+    `systemctl is-active` пишет статус в stdout даже когда служба не активна
+    (rc != 0), поэтому `|| echo "inactive"` добавлял ВТОРУЮ строку. Список
+    строк становился длиннее списка имён, и статусы съезжали: nginx мог
+    показать статус apache2 и т.д. Формат 'имя=статус' делает рассинхрон
+    невозможным — имя едет вместе со своим статусом.
+    """
+    services = services if services is not None else SERVICES_TO_CHECK
+    args = ' '.join(q(s) for s in services)
+    return (
+        '__svc_status() { st=$(systemctl is-active "$1" 2>/dev/null); '
+        '[ -n "$st" ] || st=unknown; '
+        "printf '%s=%s\\n' \"$1\" \"$st\"; }; "
+        f'for __s in {args}; do __svc_status "$__s"; done'
+    )
+
+
+def parse_service_statuses(out):
+    """Разбирает вывод 'имя=статус' в dict. Чистая функция (тесты без SSH).
+
+    Пустой вывод (система без systemd / systemctl недоступен) -> {}.
+    """
+    statuses = {}
+    for line in (out or '').splitlines():
+        line = line.strip()
+        if not line or '=' not in line:
+            continue
+        name, status = line.split('=', 1)
+        name = name.strip()
+        if name:
+            statuses[name] = status.strip() or 'unknown'
+    return statuses
 
 
 # ==================== СБОР МЕТРИК ====================
@@ -49,11 +96,8 @@ def get_metrics(checker):
     firewall['nftables'] = out
     metrics['firewall'] = firewall
 
-    services = ['nginx', 'apache2', 'httpd', 'php-fpm', 'mysql', 'mariadb', 'php7.4-fpm']
-    cmd = '; '.join([f'systemctl is-active {svc} 2>/dev/null || echo "inactive"' for svc in services])
-    out, _ = checker.exec_command(cmd)
-    statuses = out.strip().split('\n')
-    metrics['services'] = {svc: statuses[i] if i < len(statuses) else 'unknown' for i, svc in enumerate(services)}
+    out, _ = checker.exec_command(services_status_cmd())
+    metrics['services'] = parse_service_statuses(out)
 
     return metrics
 
