@@ -194,3 +194,181 @@ class TestWebcheckEdgeCases:
         # find_logs вернёт пусто -> сообщение об отсутствии логов
         out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', r'" 5\d\d ')
         assert '❌' in out or 'не найдены' in out
+
+
+# ==================== fmanager (SFTP-менеджер файлов) ====================
+import stat
+import types
+
+import fmanager as fm
+
+
+class _Attr:
+    def __init__(self, filename, st_mode, st_size=0, st_mtime=0):
+        self.filename = filename
+        self.st_mode = st_mode
+        self.st_size = st_size
+        self.st_mtime = st_mtime
+
+
+class _FakeFile:
+    def __init__(self, store, path):
+        self.store = store
+        self.path = path
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def write(self, data):
+        self.store[self.path] = self.store.get(self.path, '') + data
+
+
+class FakeSFTP:
+    """Мини-ФС: fmanager проверяется без реального SFTP-соединения."""
+
+    def __init__(self, files=(), dirs=('/',)):
+        self.files = set(files)
+        self.dirs = set(dirs)
+        self.written = {}
+        self.ops = []
+        self.closed = 0
+
+    @staticmethod
+    def _base(p):
+        return p.rstrip('/').rsplit('/', 1)[-1]
+
+    @staticmethod
+    def _parent(p):
+        p = p.rstrip('/')
+        return p.rsplit('/', 1)[0] or '/'
+
+    # --- интерфейс, который использует fmanager ---
+    def close(self):
+        self.closed += 1
+
+    def listdir_attr(self, path):
+        path = path.rstrip('/') or '/'
+        if path not in self.dirs:
+            raise IOError(f'no such directory: {path}')
+        out = []
+        for d in self.dirs:
+            if d != '/' and self._parent(d) == path:
+                out.append(_Attr(self._base(d), stat.S_IFDIR | 0o755))
+        for f in self.files:
+            if self._parent(f) == path:
+                out.append(_Attr(self._base(f), stat.S_IFREG | 0o644, 12))
+        return out
+
+    def mkdir(self, path):
+        self.ops.append(('mkdir', path))
+        if path in self.dirs:
+            raise IOError(f'exists: {path}')
+        self.dirs.add(path)
+
+    def open(self, path, mode='r'):
+        self.ops.append(('open', path, mode))
+        if 'w' in mode:
+            self.files.add(path)
+            return _FakeFile(self.written, path)
+        raise IOError('read is not supported in fake')
+
+    def remove(self, path):
+        self.ops.append(('remove', path))
+        if path not in self.files:
+            raise IOError(f'no such file: {path}')
+        self.files.discard(path)
+
+    def rmdir(self, path):
+        self.ops.append(('rmdir', path))
+        if path not in self.dirs:
+            raise IOError(f'no such dir: {path}')
+        self.dirs.discard(path)
+
+    def rename(self, old, new):
+        self.ops.append(('rename', old, new))
+        if old in self.files:
+            self.files.discard(old)
+            self.files.add(new)
+        elif old in self.dirs:
+            self.dirs.discard(old)
+            self.dirs.add(new)
+        else:
+            raise IOError(f'no such path: {old}')
+
+    def get(self, remote, local):
+        self.ops.append(('get', remote, local))
+
+    def put(self, local, remote):
+        self.ops.append(('put', local, remote))
+        self.files.add(remote)
+
+
+def _sftp_checker(sftp):
+    return types.SimpleNamespace(client=types.SimpleNamespace(open_sftp=lambda: sftp))
+
+
+class TestFManager:
+    def test_list_dir_dirs_first_then_alpha(self):
+        sftp = FakeSFTP(files=['/srv/a.log', '/srv/z.txt'],
+                        dirs=['/', '/srv', '/srv/Zet', '/srv/www'])
+        entries = fm.list_dir(_sftp_checker(sftp), '/srv')
+        assert [e['name'] for e in entries] == ['www', 'Zet', 'a.log', 'z.txt']
+        assert entries[0]['is_dir'] is True
+        assert entries[2]['is_dir'] is False
+        assert sftp.closed == 1  # sftp всегда закрывается
+
+    def test_list_dir_empty_path_lists_root(self):
+        sftp = FakeSFTP(files=['/root-only.txt'], dirs=['/'])
+        entries = fm.list_dir(_sftp_checker(sftp), '')
+        assert [e['name'] for e in entries] == ['root-only.txt']
+
+    def test_make_dir_creates(self):
+        sftp = FakeSFTP(dirs=['/'])
+        out = fm.make_dir(_sftp_checker(sftp), '/srv/new')
+        assert '/srv/new' in sftp.dirs and '✅' in out
+
+    def test_create_file_writes_empty(self):
+        sftp = FakeSFTP(dirs=['/'])
+        fm.create_file(_sftp_checker(sftp), '/etc/new.conf')
+        assert sftp.written['/etc/new.conf'] == ''
+        assert sftp.closed == 1
+
+    def test_delete_file(self):
+        sftp = FakeSFTP(files=['/etc/x.conf'])
+        fm.delete_path(_sftp_checker(sftp), '/etc/x.conf')
+        assert sftp.files == set()
+
+    def test_delete_dir_is_recursive(self):
+        sftp = FakeSFTP(files=['/srv/a/b.txt', '/srv/a/c.log'],
+                        dirs=['/', '/srv', '/srv/a'])
+        fm.delete_path(_sftp_checker(sftp), '/srv/a', is_dir=True)
+        assert '/srv/a' not in sftp.dirs
+        assert not any(f.startswith('/srv/a/') for f in sftp.files)
+
+    def test_rename(self):
+        sftp = FakeSFTP(files=['/etc/a.conf'])
+        fm.rename_path(_sftp_checker(sftp), '/etc/a.conf', '/etc/b.conf')
+        assert sftp.files == {'/etc/b.conf'}
+
+    def test_transfer_ops(self):
+        sftp = FakeSFTP(dirs=['/'])
+        c = _sftp_checker(sftp)
+        assert fm.download_file(c, '/etc/nginx/nginx.conf', '/tmp/n.conf') == '/tmp/n.conf'
+        assert fm.upload_file(c, '/tmp/up.conf', '/etc/up.conf') == '/etc/up.conf'
+        assert ('get', '/etc/nginx/nginx.conf', '/tmp/n.conf') in sftp.ops
+        assert '/etc/up.conf' in sftp.files
+
+    def test_sftp_closed_on_error(self):
+        sftp = FakeSFTP(dirs=['/'])
+        with pytest.raises(IOError):
+            fm.list_dir(_sftp_checker(sftp), '/nope')
+        assert sftp.closed == 1
+
+    def test_is_text_file(self):
+        assert fm.is_text_file('/etc/nginx/nginx.conf') is True
+        assert fm.is_text_file('/etc/nginx/sites-enabled/example.com') is True
+        assert fm.is_text_file('/usr/bin/bash') is False
+        assert fm.is_text_file('backup.tar.gz') is False

@@ -65,6 +65,12 @@ from webcheck import (  # noqa: F401
     grep_logs_report, list_common_reports,
 )
 
+# --- fmanager ---
+from fmanager import (  # noqa: F401
+    list_dir, make_dir, create_file, delete_path, rename_path,
+    download_file, upload_file, is_text_file,
+)
+
 
 __all__ = [
     'BACKUP_DIR', 'BACKUP_SUBDIRS', 'LOG_PATHS', 'DOMAIN_PATHS',
@@ -87,4 +93,6 @@ __all__ = [
     'full_diagnostic_report',
     'ssl_cert_report', 'whois_report', 'port_scan_report',
     'grep_logs_report', 'list_common_reports',
+    'list_dir', 'make_dir', 'create_file', 'delete_path', 'rename_path',
+    'download_file', 'upload_file', 'is_text_file',
 ]
