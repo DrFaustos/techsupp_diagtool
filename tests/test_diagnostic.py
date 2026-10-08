@@ -212,9 +212,10 @@ class _Attr:
 
 
 class _FakeFile:
-    def __init__(self, store, path):
+    def __init__(self, store, path, mode='r'):
         self.store = store
         self.path = path
+        self.mode = mode
 
     def __enter__(self):
         return self
@@ -224,6 +225,11 @@ class _FakeFile:
 
     def write(self, data):
         self.store[self.path] = self.store.get(self.path, '') + data
+
+    def read(self):
+        if self.path not in self.store:
+            raise IOError('no such file in fake store')
+        return self.store[self.path]
 
 
 class FakeSFTP:
@@ -272,8 +278,7 @@ class FakeSFTP:
         self.ops.append(('open', path, mode))
         if 'w' in mode:
             self.files.add(path)
-            return _FakeFile(self.written, path)
-        raise IOError('read is not supported in fake')
+        return _FakeFile(self.written, path, mode)
 
     def remove(self, path):
         self.ops.append(('remove', path))
