@@ -38,50 +38,10 @@ from ssh_client import ServerChecker
 from webcheck import (
     ssl_cert_report, whois_report, port_scan_report, grep_logs_report,
 )
+from gui_themes import ThemesMixin, get_theme_colors, detect_system_theme, DARK_THEMES, LIGHT_THEMES
 
 
-# ==================== НАСТРОЙКИ ТЕМ ====================
-DARK_THEMES = ['darkly', 'cyborg', 'superhero', 'vapor', 'solar']
-LIGHT_THEMES = ['flatly', 'litera', 'minty', 'pulse', 'cosmo', 'sandstone']
-
-def get_theme_colors(theme_name):
-    """Возвращает цвета для поля вывода в зависимости от темы"""
-    if theme_name in DARK_THEMES:
-        return {
-            'bg': '#1a1a1a',
-            'fg': '#d3d7cf',
-            'insertbackground': 'white',
-            'selectbackground': '#3465a4'
-        }
-    else:
-        return {
-            'bg': '#ffffff',
-            'fg': '#000000',
-            'insertbackground': 'black',
-            'selectbackground': '#3465a4'
-        }
-
-def detect_system_theme():
-    """
-    Определяет тему ОС (Linux/GNOME) и возвращает имя темы для ttkbootstrap.
-    """
-    try:
-        result = subprocess.run(
-            ['gsettings', 'get', 'org.gnome.desktop.interface', 'gtk-theme'],
-            capture_output=True, text=True, timeout=2
-        )
-        if result.returncode == 0:
-            theme = result.stdout.strip().strip("'")
-            if 'dark' in theme.lower() or 'black' in theme.lower():
-                return 'darkly'
-            else:
-                return 'flatly'
-    except (subprocess.SubprocessError, OSError):
-        pass
-    return 'darkly'
-
-
-class DiagnosticApp:
+class DiagnosticApp(ThemesMixin):
     def __init__(self):
         self.initial_theme = detect_system_theme()
         self.root = tb.Window(themename=self.initial_theme)
@@ -135,39 +95,6 @@ class DiagnosticApp:
         self.output.bind("<Control-s>", lambda e: self.save_report())
         self.output.bind("<Control-f>", lambda e: self.find_in_output())
 
-    def update_output_colors(self, theme_name=None):
-        if theme_name is None:
-            theme_name = self.root.style.theme.name
-        colors = get_theme_colors(theme_name)
-        self.output.config(
-            bg=colors['bg'],
-            fg=colors['fg'],
-            insertbackground=colors['insertbackground'],
-            selectbackground=colors['selectbackground']
-        )
-
-    def apply_scrollbar_style(self, theme_name=None):
-        """Настраивает ширину и цвет вертикальной полосы прокрутки (для tk.Scrollbar)"""
-        if theme_name is None:
-            theme_name = self.root.style.theme.name
-
-        # Настраиваем скроллбар напрямую (это tk.Scrollbar, не ttk)
-        if hasattr(self, 'output') and hasattr(self.output, 'vbar'):
-            self.output.vbar.config(
-                width=20,
-                bg='#0078d4',
-                activebackground='#1084d4',
-                troughcolor='#2a2a2a' if theme_name in DARK_THEMES else '#e0e0e0'
-            )
-            
-    def switch_theme(self, theme_name):
-        try:
-            self.root.style.theme_use(theme_name)
-            self.update_output_colors(theme_name)
-            self.apply_scrollbar_style(theme_name)
-            self.current_theme = theme_name
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось переключить тему: {e}")
 
     # ---------- ПРОФИЛИ СЕРВЕРОВ ----------
     def _profiles_file(self):
@@ -829,14 +756,6 @@ class DiagnosticApp:
             self.cmd_entry.insert(0, matches[0])
         return "break"
 
-    def toggle_theme(self):
-        current_theme = self.root.style.theme.name
-        if current_theme in DARK_THEMES:
-            new_theme = 'flatly'
-        else:
-            new_theme = 'darkly'
-        self.switch_theme(new_theme)
-        self.theme_var.set(new_theme)
 
     def browse_key(self):
         filename = filedialog.askopenfilename()
