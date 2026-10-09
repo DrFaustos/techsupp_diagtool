@@ -14,6 +14,8 @@ htmlcov/
 dist/
 build/
 *.spec
+# спеку держим в репозитории: без неё команда сборки из README не воспроизводится
+!ServerDiagnostic.spec
 
 # Локальная база знаний Hermes — не часть продукта
 .ai-free/
