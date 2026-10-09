@@ -18,13 +18,14 @@ from gui_dns import DnsMixin
 from gui_admin import AdminMixin
 from gui_isp import IspmanagerMixin
 from gui_files import FilesMixin
+from common import __version__
 
 
 class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin, FilesMixin):
     def __init__(self):
         self.initial_theme = detect_system_theme()
         self.root = tb.Window(themename=self.initial_theme)
-        self.root.title("SSH Диагностика сервера")
+        self.root.title(f"SSH Диагностика сервера v{__version__}")
         self.root.geometry("1100x720")
         self.root.minsize(1000, 650)
 
