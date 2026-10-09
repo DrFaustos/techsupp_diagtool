@@ -40,6 +40,7 @@
 
 ### 🔧 Администрирование
 - **Редактор конфигов** – просмотр и редактирование конфигурационных файлов (nginx, apache, php, mysql) с созданием резервных копий
+- **Файловый менеджер** – навигация по каталогам по SFTP, правка текстовых файлов, скачать/загрузить
 - **Замена IPv4** – замена IP-адреса во всех .conf-файлах в /etc
 - **Замена IPv6** – замена IPv6-адреса во всех файлах в /etc (⚠️ включая бинарные; перед заменой создаётся бэкап /etc)
 - **Перезапуск служб** – перезапуск nginx, mysql, apache
@@ -76,25 +77,67 @@
 ### Шаги установки
 
 Клонируйте репозиторий:
- 
+```
+git clone https://github.com/ваш-username/server-diagnostic-tool.git
+cd server-diagnostic-tool
+```
 
 Создайте виртуальное окружение:
- 
+```
+python3 -m venv venv
+source venv/bin/activate       # Linux/Mac
+venv\Scripts\activate          # Windows
+```
 
 Установите зависимости:
- 
+```
+pip install -r requirements.txt
+```
 
 Запустите программу:
- 
+```
+python3 main.py
+```
 
 ### Запуск тестов
 
- 
+```
+venv/bin/python -m pytest tests/ -q                # все тесты
+xvfb-run -a venv/bin/python -m pytest tests/ -q     # со смоуком GUI под X11
+```
 
 ---
 
 ## 📁 Структура проекта
- 
+```
+Diagn/
+├── main.py             # Точка входа
+├── gui.py              # Окно: __init__ и разметка; DiagnosticApp собран из mixin-модулей
+├── gui_themes.py       # Темы и палитра
+├── gui_profiles.py     # Профили серверов и история подключений
+├── gui_output.py       # Лог, поиск Ctrl+F, история команд
+├── gui_runner.py       # Подключение и фоновые задачи с отменой
+├── gui_checks.py       # Кнопки диагностики
+├── gui_swap.py         # Swap и fstab
+├── gui_dns.py          # DNS-проверки и резолверы
+├── gui_admin.py        # Замена IP, перезапуск служб, редактор конфигов
+├── gui_isp.py          # Кнопки ISPmanager
+├── gui_files.py        # Файловый менеджер (окно, операции)
+├── fmanager.py         # Файловые операции SFTP + строки таблицы
+├── diagnostic.py       # Фасад диагностики (реэкспорт, обратная совместимость)
+├── common.py           # Конфигурации и вспомогательные функции
+├── metrics.py          # Определение панели, метрики, отчёты, веб-конфиг
+├── logs.py             # Поиск/анализ логов, домены, поиск OOM
+├── dns.py              # DNS-проверки и работа с резолверами
+├── files.py            # Файлы, конфиги, замена IP, перезапуск служб
+├── panels.py           # Управление панелью ISPmanager
+├── reports.py          # Сводный отчёт по диагностике
+├── webcheck.py         # SSL-сертификаты, WHOIS, порты, grep логов
+├── ssh_client.py       # SSH-подключение (Paramiko)
+├── tests/              # Юнит-тесты (pytest)
+├── requirements.txt    # Зависимости
+└── README.md           # Документация
+```
 
 ### Описание файлов
 
@@ -111,6 +154,8 @@
 | gui_dns.py | DNS: проверка доменов, резолверы сервера, диалог их замены |
 | gui_admin.py | Администрирование: замена IPv4/IPv6, перезапуск служб, bash-история, редактор конфигов |
 | gui_isp.py | Панель ISPmanager: перезапуск, kill core, обновление, SSL, отключение, GeoIP, cron |
+| gui_files.py | Файловый менеджер сервера по SFTP: навигация, правка текстовых файлов, скачать/загрузить |
+| fmanager.py | Файловые операции SFTP (list/mkdir/create/delete/rename/get/put) и подготовка строк таблицы |
 | diagnostic.py | Фасад: реэкспортирует функции из модулей ниже (сохранён для совместимости) |
 | common.py | Конфигурации (BACKUP_DIR, LOG_PATHS, DOMAIN_PATHS), q(), бэкапы, SFTP-запись |
 | metrics.py | detect_panel, get_metrics, disk_memory_report, network_report, web_config_report |
@@ -142,7 +187,7 @@
 | Подключение | Подключиться / Отключиться |
 | Диагностика | Полная диагностика, Диски и память, Сеть, Фаервол, Конфиги веб, Логи сайтов, Анализ логов доступа, Поиск OOM |
 | DNS | DNS-проверка, DNS-резолверы, Изменить DNS |
-| Администрирование | Заменить IPv4, Заменить IPv6, Перезапустить службы, Редактор конфигов |
+| Администрирование | Заменить IPv4, Заменить IPv6, Перезапустить службы, Редактор конфигов, Файлы |
 | ISPmanager | Перезапустить панель, Kill core, Обновить панель, Выпуск SSL, Отключить панель, Отключить GeoIP, Проверить CRON, Исправить CRON |
 | Swap | Создать swap файл, Прописать swap в fstab |
 | Доп. проверки | SSL-сертификат, WHOIS, Порты, Grep логов |
@@ -237,7 +282,10 @@
 ### Ошибка `No module named 'tkinter'`
 
 Установите Tkinter:
- 
+```
+sudo apt install python3-tk        # Ubuntu/Debian
+sudo yum install python3-tkinter   # CentOS/RHEL
+```
 
 ### Ошибка подключения
 
@@ -290,7 +338,10 @@ DeepSeek – искусственный интеллект, который по�
 ## 📦 Сборка исполняемого файла (опционально)
 
 Для создания standalone-версии:
- 
+```
+pip install pyinstaller
+pyinstaller --onefile --windowed --name=ServerDiagnostic main.py
+```
 Исполняемый файл появится в папке `dist/`.
 
 ---

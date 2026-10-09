@@ -17,9 +17,10 @@ from gui_swap import SwapMixin
 from gui_dns import DnsMixin
 from gui_admin import AdminMixin
 from gui_isp import IspmanagerMixin
+from gui_files import FilesMixin
 
 
-class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin):
+class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin, FilesMixin):
     def __init__(self):
         self.initial_theme = detect_system_theme()
         self.root = tb.Window(themename=self.initial_theme)
@@ -353,6 +354,15 @@ class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, Checks
             bootstyle="secondary"
         )
         self.config_editor_btn.pack(side=tk.LEFT, padx=5)
+
+        self.file_btn = tb.Button(
+            btn_frame,
+            text="📁 Файлы",
+            command=self.open_file_manager,
+            state=tk.DISABLED,
+            bootstyle="secondary"
+        )
+        self.file_btn.pack(side=tk.LEFT, padx=5)
 
         # ---------- ПЕРЕКЛЮЧАТЕЛЬ ТЕМ ----------
         theme_frame = tb.Frame(btn_frame, bootstyle="secondary")

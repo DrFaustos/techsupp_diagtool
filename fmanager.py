@@ -6,6 +6,7 @@
 import os
 import stat
 import posixpath
+from datetime import datetime
 
 
 def _filemode(mode):
@@ -146,3 +147,52 @@ def is_text_file(name):
         return True
     # Остаток — похожие на домен имена: example.com, site.ru.net
     return 2 <= len(ext) - 1 <= 8 and ext[1:].isalpha()
+
+
+# ==================== ПОДГОТОВКА ЗАПИСЕЙ ДЛЯ ТАБЛИЦЫ ====================
+_SIZE_UNITS = ('B', 'KB', 'MB', 'GB', 'TB')
+
+
+def human_size(num):
+    """Размер в человекочитаемом виде. Мусор на входе -> '?' (таблица не падает)."""
+    try:
+        n = float(num)
+    except (TypeError, ValueError):
+        return '?'
+    if n < 0:
+        return '?'
+    for unit in _SIZE_UNITS:
+        if n < 1024 or unit == _SIZE_UNITS[-1]:
+            return f'{int(n)} {unit}' if unit == 'B' else f'{n:.1f} {unit}'
+        n /= 1024
+
+
+def format_time(ts):
+    """Unix-время -> 'ГГГГ-ММ-ДД ЧЧ:ММ'. 0/None/битое значение -> пустая строка."""
+    if not ts:
+        return ''
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M')
+    except (OverflowError, OSError, ValueError, TypeError):
+        return ''
+
+
+def format_entries(entries):
+    """Записи list_dir -> строки для ttk.Treeview.
+
+    Порядок колонок: (имя, тип, размер, права, изменён). Каталоги помечаются
+    «/», symlink'и — «@»: оператор не спутает их с обычным файлом перед
+    удалением (rm каталога рекурсивен).
+    """
+    rows = []
+    for e in entries:
+        name = e.get('name', '')
+        if e.get('is_dir'):
+            kind, label = 'папка', name + '/'
+        elif e.get('is_link'):
+            kind, label = 'ссылка', name + '@'
+        else:
+            kind, label = 'файл', name
+        rows.append((label, kind, human_size(e.get('size', 0)),
+                     e.get('mode', '?'), format_time(e.get('mtime'))))
+    return rows

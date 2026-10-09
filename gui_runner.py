@@ -86,6 +86,7 @@ class RunnerMixin:
         self.ipv6_btn.config(state=tk.NORMAL)
         self.restart_btn.config(state=tk.NORMAL)
         self.config_editor_btn.config(state=tk.NORMAL)
+        self.file_btn.config(state=tk.NORMAL)
         self.swap_btn.config(state=tk.NORMAL)
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
@@ -163,20 +164,24 @@ class RunnerMixin:
                 result = target_func(*args, **kwargs)
                 if cache_key:
                     self._diag_cache[cache_key] = (time.time(), result)
-                self.root.after(0, self._display_result, result)
             except Exception as e:
-                self.root.after(0, self._display_result, f"❌ Ошибка: {str(e)}")
+                result = f"❌ Ошибка: {str(e)}"
             finally:
-                self.root.after(0, self._stop_progress)
-                if btn:
-                    self.root.after(0, lambda b=btn: b.config(state=tk.NORMAL))
-                self.root.after(0, lambda: self.cancel_btn.config(state=tk.DISABLED))
+                # Флаг занятости освобождаем ПЕРВЫМ: если окно уже закрыто,
+                # root.after бросает RuntimeError, и при прежнем порядке
+                # (сброс в последней строке finally) исключение съедало его —
+                # приложение навсегда считало себя занятым.
                 with self._busy_lock:
                     self._busy = False
-                # active_checker здесь не удаляем: del имени из внешней области
-                # сделал бы его локальным в wrapper и бросил UnboundLocalError
-                # в самом конце finally (поток умирал с traceback после каждой
-                # задачи). Ячейка живёт в _run_in_thread и освобождается сама.
+                self._post_ui(self._stop_progress)
+                if btn:
+                    self._post_ui(lambda b=btn: b.config(state=tk.NORMAL))
+                self._post_ui(lambda: self.cancel_btn.config(state=tk.DISABLED))
+            # active_checker здесь не удаляем: del имени из внешней области
+            # сделал бы его локальным в wrapper и бросил UnboundLocalError
+            # в конце finally (поток умирал с traceback после каждой
+            # задачи). Ячейка живёт в _run_in_thread и освобождается сама.
+            self._post_ui(self._display_result, result)
 
         self.cancel_btn.config(state=tk.NORMAL)
         thread = threading.Thread(target=wrapper)
@@ -214,18 +219,32 @@ class RunnerMixin:
             except Exception as e:
                 result = f"❌ Ошибка: {str(e)}"
             finally:
-                self.root.after(0, self._stop_progress)
-                if btn:
-                    self.root.after(0, lambda b=btn: b.config(state=tk.NORMAL))
-                self.root.after(0, lambda: self.cancel_btn.config(state=tk.DISABLED))
+                # См. комментарий в _run_in_thread: сброс флага до after-вызовов.
                 with self._busy_lock:
                     self._busy = False
+                self._post_ui(self._stop_progress)
+                if btn:
+                    self._post_ui(lambda b=btn: b.config(state=tk.NORMAL))
+                self._post_ui(lambda: self.cancel_btn.config(state=tk.DISABLED))
             if on_done:
-                self.root.after(0, on_done, result)
+                self._post_ui(on_done, result)
             else:
-                self.root.after(0, self._display_result, result)
+                self._post_ui(self._display_result, result)
 
         threading.Thread(target=wrapper, daemon=True).start()
+
+    def _post_ui(self, fn, *args):
+        """Ставит вызов в mainloop и гасит ошибку закрытого окна.
+
+        Фоновый поток может вернуться уже после закрытия приложения:
+        root.after() в этот момент бросает RuntimeError/TclError. Раньше это
+        исключение улетало прямо из finally, и строки после него не
+        выполнялись — приложение навсегда оставалось «занято».
+        """
+        try:
+            self.root.after(0, fn, *args)
+        except Exception:
+            pass
 
     def _stop_progress(self):
         self.progress.stop()
@@ -308,6 +327,7 @@ class RunnerMixin:
         self.ipv6_btn.config(state=tk.DISABLED)
         self.restart_btn.config(state=tk.DISABLED)
         self.config_editor_btn.config(state=tk.DISABLED)
+        self.file_btn.config(state=tk.DISABLED)
         self.swap_btn.config(state=tk.DISABLED)
         self.fstab_btn.config(state=tk.DISABLED)
         self.send_btn.config(state=tk.DISABLED)
