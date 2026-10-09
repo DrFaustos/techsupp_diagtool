@@ -13,6 +13,8 @@ htmlcov/
 # PyInstaller / build artifacts
 dist/
 build/
+dist_onedir/
+build_onedir/
 *.spec
 # спеку держим в репозитории: без неё команда сборки из README не воспроизводится
 !ServerDiagnostic.spec
