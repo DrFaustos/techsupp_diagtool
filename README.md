@@ -70,6 +70,8 @@
 
 ## 🚀 Установка
 
+Самый быстрый способ — скачать готовый бинарник для Linux из [Releases](https://github.com/DrFaustos/techsupp_diagtool/releases). Ниже — установка из исходников.
+
 ### Требования
 - Python 3.7+
 - pip
@@ -80,8 +82,8 @@
 
 Клонируйте репозиторий:
 ```
-git clone https://github.com/ваш-username/server-diagnostic-tool.git
-cd server-diagnostic-tool
+git clone https://github.com/DrFaustos/techsupp_diagtool.git
+cd techsupp_diagtool
 ```
 
 Создайте виртуальное окружение:
@@ -343,12 +345,30 @@ DeepSeek – искусственный интеллект, который по�
 
 ## 📦 Сборка исполняемого файла (опционально)
 
-Для создания standalone-версии:
+Готовый standalone-бинарник для Linux (x86_64) лежит в
+[Releases](https://github.com/DrFaustos/techsupp_diagtool/releases): скачать, сделать исполняемым и запустить.
+
 ```
-pip install pyinstaller
-pyinstaller --onefile --windowed --name=ServerDiagnostic main.py
+chmod +x ServerDiagnostic
+./ServerDiagnostic
 ```
-Исполняемый файл появится в папке `dist/`.
+
+Зависимости не нужны: Python, Tkinter и библиотеки уже внутри.
+Бинарник собран на Ubuntu 24.04 (glibc ≥ 2.14), под другие ОС соберите сами.
+
+Пересобрать под свою систему:
+
+```
+pip install -r requirements.txt pyinstaller
+pyinstaller --onefile --windowed --name=ServerDiagnostic \\
+  --collect-all ttkbootstrap --collect-all paramiko \\
+  --hidden-import PIL --hidden-import PIL.Image \\
+  --hidden-import PIL.ImageTk --hidden-import PIL._tkinter_finder main.py
+```
+
+Флаги не лишние: `ttkbootstrap` грузит темы из каталога пакета, а без
+`PIL._tkinter_finder` окно падает на старте с ошибкой
+`invalid command name "PyImagingPhoto"`.
 
 ---
 
