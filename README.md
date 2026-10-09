@@ -360,15 +360,16 @@ chmod +x ServerDiagnostic
 
 ```
 pip install -r requirements.txt pyinstaller
-pyinstaller --onefile --windowed --name=ServerDiagnostic \\
-  --collect-all ttkbootstrap --collect-all paramiko \\
-  --hidden-import PIL --hidden-import PIL.Image \\
-  --hidden-import PIL.ImageTk --hidden-import PIL._tkinter_finder main.py
+pyinstaller ServerDiagnostic.spec
 ```
 
-Флаги не лишние: `ttkbootstrap` грузит темы из каталога пакета, а без
-`PIL._tkinter_finder` окно падает на старте с ошибкой
-`invalid command name "PyImagingPhoto"`.
+Собирать нужно именно по спеке — руками через `--collect-all` проще потерять
+раскладку Tcl-модулей. В `ServerDiagnostic.spec` разложены: темы `ttkbootstrap`
+(пакет грузит их из своего каталога), `PIL._tkinter_finder` (без него окно падает
+на старте с `invalid command name "PyImagingPhoto"`) и Tcl-модули `.tm` в
+`_internal/tcl8/<версия>/` (иначе на машине без системного Tcl старт гибнет с
+`::msgcat::mcmset: invalid command name`). Раскладка `.tm` закрыта тестом
+`tests/test_spec_tcl.py`.
 
 ---
 
