@@ -16,7 +16,7 @@ from gui_checks import ChecksMixin
 from gui_swap import SwapMixin
 from gui_dns import DnsMixin
 from gui_admin import AdminMixin
-from gui_isp import IspmanagerMixin
+from gui_isp import IspmanagerMixin, ISPMANAGER_MENU
 from gui_files import FilesMixin
 from common import __version__
 
@@ -397,87 +397,29 @@ class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, Checks
         btn_frame = tb.Frame(self.root, bootstyle="secondary")
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
 
-        # ---------- КНОПКИ ISPmanager ----------
+        # ---------- МЕНЮ ISPmanager ----------
+        # Восемь действий раньше занимали два ряда кнопок; выпадающее меню
+        # группирует их в один элемент, содержимое (методы run_isp_*) то же.
         self.ispmanager_frame = tb.Frame(btn_frame, bootstyle="secondary")
         self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
         self.ispmanager_frame.pack_forget()
 
-        self.isp_restart_btn = tb.Button(
+        self.isp_menu_btn = tb.Menubutton(
             self.ispmanager_frame,
-            text="Перезапустить панель",
-            command=self.run_isp_restart,
+            text="🛠 ISPmanager ▾",
             state=tk.DISABLED,
-            bootstyle="warning"
+            bootstyle="warning",
+            direction="below",
         )
-        self.isp_restart_btn.pack(side=tk.LEFT, padx=2)
-
-        self.isp_kill_btn = tb.Button(
-            self.ispmanager_frame,
-            text="Kill core",
-            command=self.run_isp_kill,
-            state=tk.DISABLED,
-            bootstyle="danger"
-        )
-        self.isp_kill_btn.pack(side=tk.LEFT, padx=2)
-
-        self.isp_update_btn = tb.Button(
-            self.ispmanager_frame,
-            text="Обновить панель",
-            command=self.run_isp_update,
-            state=tk.DISABLED,
-            bootstyle="info"
-        )
-        self.isp_update_btn.pack(side=tk.LEFT, padx=2)
-
-        self.isp_ssl_btn = tb.Button(
-            self.ispmanager_frame,
-            text="Выпуск SSL",
-            command=self.run_isp_ssl,
-            state=tk.DISABLED,
-            bootstyle="primary"
-        )
-        self.isp_ssl_btn.pack(side=tk.LEFT, padx=2)
-
-        # Второй ряд ISP-кнопок (чтобы не переполнять строку)
-        self.ispmanager_frame2 = tb.Frame(btn_frame, bootstyle="secondary")
-        self.ispmanager_frame2.pack(side=tk.LEFT, padx=5)
-        self.ispmanager_frame2.pack_forget()
-
-        self.isp_disable_btn = tb.Button(
-            self.ispmanager_frame2,
-            text="Отключить панель",
-            command=self.run_isp_disable,
-            state=tk.DISABLED,
-            bootstyle="danger"
-        )
-        self.isp_disable_btn.pack(side=tk.LEFT, padx=2)
-
-        self.isp_geoip_btn = tb.Button(
-            self.ispmanager_frame2,
-            text="Отключить GeoIP",
-            command=self.run_isp_geoip,
-            state=tk.DISABLED,
-            bootstyle="secondary"
-        )
-        self.isp_geoip_btn.pack(side=tk.LEFT, padx=2)
-
-        self.isp_cron_btn = tb.Button(
-            self.ispmanager_frame2,
-            text="Проверить CRON",
-            command=self.run_isp_cron,
-            state=tk.DISABLED,
-            bootstyle="secondary"
-        )
-        self.isp_cron_btn.pack(side=tk.LEFT, padx=2)
-
-        self.isp_fix_cron_btn = tb.Button(
-            self.ispmanager_frame2,
-            text="Исправить CRON",
-            command=self.run_isp_fix_cron,
-            state=tk.DISABLED,
-            bootstyle="warning"
-        )
-        self.isp_fix_cron_btn.pack(side=tk.LEFT, padx=2)
+        self.isp_menu_btn.pack(side=tk.LEFT)
+        self.isp_menu = tk.Menu(self.isp_menu_btn, tearoff=0)
+        for _item in ISPMANAGER_MENU:
+            if _item is None:
+                self.isp_menu.add_separator()
+            else:
+                _label, _method = _item
+                self.isp_menu.add_command(label=_label, command=getattr(self, _method))
+        self.isp_menu_btn['menu'] = self.isp_menu
 
         # ---------- КНОПКИ SWAP ----------
         swap_frame = tb.Frame(self.root, bootstyle="secondary")

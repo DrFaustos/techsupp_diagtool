@@ -91,25 +91,13 @@ class RunnerMixin:
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
 
-        # ISPmanager кнопки
+        # Меню ISPmanager: показываем только для этой панели
         if self.panel_type == 'ispmanager':
             self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
-            self.ispmanager_frame2.pack(side=tk.LEFT, padx=5)
-            for btn in [
-                self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
-                self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
-                self.isp_cron_btn, self.isp_fix_cron_btn
-            ]:
-                btn.config(state=tk.NORMAL)
+            self._set_isp_menu_state(tk.NORMAL)
         else:
             self.ispmanager_frame.pack_forget()
-            self.ispmanager_frame2.pack_forget()
-            for btn in [
-                self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
-                self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
-                self.isp_cron_btn, self.isp_fix_cron_btn
-            ]:
-                btn.config(state=tk.DISABLED)
+            self._set_isp_menu_state(tk.DISABLED)
 
         self.connect_btn.config(text="Отключиться", bootstyle="danger", command=self.disconnect)
         self.connect_btn.config(state=tk.NORMAL)
@@ -332,14 +320,8 @@ class RunnerMixin:
         self.fstab_btn.config(state=tk.DISABLED)
         self.send_btn.config(state=tk.DISABLED)
 
-        for btn in [
-            self.isp_restart_btn, self.isp_kill_btn, self.isp_update_btn,
-            self.isp_ssl_btn, self.isp_disable_btn, self.isp_geoip_btn,
-            self.isp_cron_btn, self.isp_fix_cron_btn
-        ]:
-            btn.config(state=tk.DISABLED)
+        self._set_isp_menu_state(tk.DISABLED)
         self.ispmanager_frame.pack_forget()
-        self.ispmanager_frame2.pack_forget()
 
         self.connect_btn.config(text="Подключиться", bootstyle="success", command=self.connect)
         self.log("Соединение закрыто.")

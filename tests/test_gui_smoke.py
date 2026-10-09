@@ -107,6 +107,18 @@ class TestNoLostSelfAttributes:
                       if not hasattr(gui_mod.DiagnosticApp, n))
         assert not lost, f'кнопки ссылаются на несуществующие методы: {lost}'
 
+    def test_isp_menu_entries_bound(self):
+        """Каждый пункт ISPMANAGER_MENU обязан вести на реальный метод класса.
+
+        Меню собирается через getattr, поэтому `command=self.*`-скан его не
+        видит; проверяем состав списка напрямую.
+        """
+        from gui_isp import ISPMANAGER_MENU
+        methods = [m for item in ISPMANAGER_MENU if item is not None for m in (item[1],)]
+        assert methods, 'ISPMANAGER_MENU пуст'
+        lost = sorted(m for m in methods if not hasattr(gui_mod.DiagnosticApp, m))
+        assert not lost, f'пункты меню ссылаются на несуществующие методы: {lost}'
+
 
 class TestMaskSecrets:
     """Лог пишется в файл — пароли/токены в нём быть не должно."""
@@ -150,6 +162,7 @@ class TestWindowBuilds:
     def test_key_widgets_exist(self, app):
         for attr in ('root', 'output', 'cmd_entry', 'connect_btn', 'full_btn',
                      'disk_btn', 'send_btn', 'cancel_btn', 'ispmanager_frame',
+                     'isp_menu_btn', 'isp_menu',
                      'ip_var', 'port_var', 'user_var', 'password_var', 'key_var'):
             assert hasattr(app, attr), f'нет виджета/поля {attr}'
 
@@ -157,7 +170,7 @@ class TestWindowBuilds:
         import tkinter as tk
         assert app.checker is None
         for attr in ('full_btn', 'disk_btn', 'network_btn', 'firewall_btn',
-                     'logs_btn', 'send_btn', 'cancel_btn'):
+                     'logs_btn', 'send_btn', 'cancel_btn', 'isp_menu_btn'):
             # cget отдаёт Tcl-объект, а не str — сравниваем приведённое значение
             state = str(getattr(app, attr).cget('state'))
             assert state == tk.DISABLED, f'{attr} активен до подключения ({state})'
