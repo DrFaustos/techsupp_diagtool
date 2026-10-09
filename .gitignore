@@ -1,6 +1,9 @@
 venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+htmlcov/
 *.log
 *.txt~
 .DS_Store
