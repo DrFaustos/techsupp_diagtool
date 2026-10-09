@@ -1,5 +1,7 @@
 # SSH Диагностика сервера
 
+[![тесты](https://img.shields.io/github/actions/workflow/status/DrFaustos/techsupp_diagtool/tests.yml?branch=main&label=tests)](https://github.com/DrFaustos/techsupp_diagtool/actions/workflows/tests.yml) [![Лицензия: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python 3.7+](https://img.shields.io/badge/python-3.7%2B-blue)](https://www.python.org/downloads/)
+
 Многофункциональный инструмент для диагностики и администрирования удалённых серверов через SSH с поддержкой панелей управления **FastPanel** и **ISPmanager**.
 
 ---
