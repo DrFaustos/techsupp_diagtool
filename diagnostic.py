@@ -54,6 +54,8 @@ from panels import (  # noqa: F401
     ispmanager_restart, ispmanager_kill_core, ispmanager_update,
     ispmanager_ssl_issue, ispmanager_disable, ispmanager_disable_geoip,
     ispmanager_check_cron_path, ispmanager_fix_cron_path,
+    fastpanel_unit, find_fastpanel_logs, fastpanel_restart, fastpanel_logs,
+    fastpanel_status, fastpanel_restart_web,
 )
 
 # --- reports ---
@@ -90,6 +92,8 @@ __all__ = [
     'ispmanager_restart', 'ispmanager_kill_core', 'ispmanager_update',
     'ispmanager_ssl_issue', 'ispmanager_disable', 'ispmanager_disable_geoip',
     'ispmanager_check_cron_path', 'ispmanager_fix_cron_path',
+    'fastpanel_unit', 'find_fastpanel_logs', 'fastpanel_restart',
+    'fastpanel_logs', 'fastpanel_status', 'fastpanel_restart_web',
     'full_diagnostic_report',
     'ssl_cert_report', 'whois_report', 'port_scan_report',
     'grep_logs_report', 'list_common_reports',

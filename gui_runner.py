@@ -91,13 +91,8 @@ class RunnerMixin:
         self.fstab_btn.config(state=tk.NORMAL)
         self.send_btn.config(state=tk.NORMAL)
 
-        # Меню ISPmanager: показываем только для этой панели
-        if self.panel_type == 'ispmanager':
-            self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
-            self._set_isp_menu_state(tk.NORMAL)
-        else:
-            self.ispmanager_frame.pack_forget()
-            self._set_isp_menu_state(tk.DISABLED)
+        # Меню действий панели: видно только меню определённой панели
+        self._set_panel_menus_visible(self.panel_type)
 
         self.connect_btn.config(text="Отключиться", bootstyle="danger", command=self.disconnect)
         self.connect_btn.config(state=tk.NORMAL)
@@ -320,8 +315,7 @@ class RunnerMixin:
         self.fstab_btn.config(state=tk.DISABLED)
         self.send_btn.config(state=tk.DISABLED)
 
-        self._set_isp_menu_state(tk.DISABLED)
-        self.ispmanager_frame.pack_forget()
+        self._set_panel_menus_visible(None)
 
         self.connect_btn.config(text="Подключиться", bootstyle="success", command=self.connect)
         self.log("Соединение закрыто.")

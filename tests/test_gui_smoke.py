@@ -30,6 +30,25 @@ def gui_sources():
     return out
 
 
+def add_self_targets(target, defined):
+    """Заносит self.<attr> из ЛЮБОЙ цели присваивания.
+
+    Разбирает не только `self.x = ...`, но и распаковку `self.a, self.b = ...`
+    (её дают виджеты меню), списки и `*`-элементы. Без этого объявленный таким
+    образом атрибут считался бы «потерянным», и тест врал бы.
+    """
+    if target is None:
+        return
+    if isinstance(target, ast.Attribute) and \
+            isinstance(target.value, ast.Name) and target.value.id == 'self':
+        defined.add(target.attr)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            add_self_targets(elt, defined)
+    elif isinstance(target, ast.Starred):
+        add_self_targets(target.value, defined)
+
+
 def collect_defs_and_uses(paths):
     """Возвращает (определено, используется) имён self-атрибутов по AST."""
     defined = set()
@@ -43,19 +62,14 @@ def collect_defs_and_uses(paths):
             # self.<name> = ... / self.<name>: тип = ...
             elif isinstance(node, ast.Assign):
                 for tgt in node.targets:
-                    if isinstance(tgt, ast.Attribute) and \
-                            isinstance(tgt.value, ast.Name) and tgt.value.id == 'self':
-                        defined.add(tgt.attr)
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Attribute) \
-                    and isinstance(node.target.value, ast.Name) and node.target.value.id == 'self':
-                defined.add(node.target.attr)
+                    add_self_targets(tgt, defined)
+            elif isinstance(node, ast.AnnAssign):
+                add_self_targets(node.target, defined)
             # for self.x in ... / with ... as self.x — тоже объявляют атрибут
             elif isinstance(node, (ast.For, ast.AsyncFor, ast.withitem)) or \
                     isinstance(node, ast.comprehension):
                 tgt = node.target if not isinstance(node, ast.withitem) else node.optional_vars
-                if isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name) \
-                        and tgt.value.id == 'self':
-                    defined.add(tgt.attr)
+                add_self_targets(tgt, defined)
             # self.<name> где угодно (в т.ч. self.x += ..., del self.x)
             if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
                     and node.value.id == 'self':
@@ -107,17 +121,20 @@ class TestNoLostSelfAttributes:
                       if not hasattr(gui_mod.DiagnosticApp, n))
         assert not lost, f'кнопки ссылаются на несуществующие методы: {lost}'
 
-    def test_isp_menu_entries_bound(self):
-        """Каждый пункт ISPMANAGER_MENU обязан вести на реальный метод класса.
+    def test_panel_menu_entries_bound(self):
+        """Каждый пункт меню панели обязан вести на реальный метод класса.
 
         Меню собирается через getattr, поэтому `command=self.*`-скан его не
-        видит; проверяем состав списка напрямую.
+        видит; проверяем состав списков напрямую.
         """
         from gui_isp import ISPMANAGER_MENU
-        methods = [m for item in ISPMANAGER_MENU if item is not None for m in (item[1],)]
-        assert methods, 'ISPMANAGER_MENU пуст'
-        lost = sorted(m for m in methods if not hasattr(gui_mod.DiagnosticApp, m))
-        assert not lost, f'пункты меню ссылаются на несуществующие методы: {lost}'
+        from gui_fastpanel import FASTPANEL_MENU
+        for name, items in (('ISPMANAGER_MENU', ISPMANAGER_MENU),
+                            ('FASTPANEL_MENU', FASTPANEL_MENU)):
+            methods = [m for item in items if item is not None for m in (item[1],)]
+            assert methods, f'{name} пуст'
+            lost = sorted(m for m in methods if not hasattr(gui_mod.DiagnosticApp, m))
+            assert not lost, f'{name} ссылается на несуществующие методы: {lost}'
 
 
 class TestMaskSecrets:
@@ -163,6 +180,7 @@ class TestWindowBuilds:
         for attr in ('root', 'output', 'cmd_entry', 'connect_btn', 'full_btn',
                      'disk_btn', 'send_btn', 'cancel_btn', 'ispmanager_frame',
                      'isp_menu_btn', 'isp_menu',
+                     'fastpanel_frame', 'fp_menu_btn', 'fp_menu',
                      'ip_var', 'port_var', 'user_var', 'password_var', 'key_var'):
             assert hasattr(app, attr), f'нет виджета/поля {attr}'
 
@@ -170,7 +188,8 @@ class TestWindowBuilds:
         import tkinter as tk
         assert app.checker is None
         for attr in ('full_btn', 'disk_btn', 'network_btn', 'firewall_btn',
-                     'logs_btn', 'send_btn', 'cancel_btn', 'isp_menu_btn'):
+                     'logs_btn', 'send_btn', 'cancel_btn',
+                     'isp_menu_btn', 'fp_menu_btn'):
             # cget отдаёт Tcl-объект, а не str — сравниваем приведённое значение
             state = str(getattr(app, attr).cget('state'))
             assert state == tk.DISABLED, f'{attr} активен до подключения ({state})'

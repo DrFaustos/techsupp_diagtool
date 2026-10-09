@@ -28,11 +28,8 @@ ISPMANAGER_MENU = [
 
 
 class IspmanagerMixin:
-    def _set_isp_menu_state(self, state):
-        """Включает/выключает меню панели целиком (один элемент вместо 8 кнопок)."""
-        self.isp_menu_btn.config(state=state)
-
     # ---------- МЕНЮ ISPmanager ----------
+    # Показ/скрытие и состояние — в gui.py:_set_panel_menus_visible.
     def run_isp_restart(self):
         if not self.checker:
             return

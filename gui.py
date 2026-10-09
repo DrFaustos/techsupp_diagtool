@@ -17,11 +17,12 @@ from gui_swap import SwapMixin
 from gui_dns import DnsMixin
 from gui_admin import AdminMixin
 from gui_isp import IspmanagerMixin, ISPMANAGER_MENU
+from gui_fastpanel import FastpanelMixin, FASTPANEL_MENU
 from gui_files import FilesMixin
 from common import __version__
 
 
-class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin, FilesMixin):
+class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin, FastpanelMixin, FilesMixin):
     def __init__(self):
         self.initial_theme = detect_system_theme()
         self.root = tb.Window(themename=self.initial_theme)
@@ -75,6 +76,45 @@ class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, Checks
         self.output.bind("<Control-s>", lambda e: self.save_report())
         self.output.bind("<Control-f>", lambda e: self.find_in_output())
 
+
+    # ---------- МЕНЮ ПАНЕЛЕЙ УПРАВЛЕНИЯ ----------
+    def _build_panel_menu(self, parent, text, bootstyle, items):
+        """Меню действий панели: Menubutton + tk.Menu из списка пунктов.
+
+        items — [(подпись, имя метода)] либо None (разделитель). Методы берутся
+        с класса через getattr, поэтому состав списков проверяет
+        tests/test_gui_smoke.py, а не скан command=self.*.
+        Возвращает (menubutton, menu) — состоянием рулит _set_panel_menus_visible.
+        """
+        btn = tb.Menubutton(parent, text=text, state=tk.DISABLED,
+                            bootstyle=bootstyle, direction="below")
+        btn.pack(side=tk.LEFT)
+        menu = tk.Menu(btn, tearoff=0)
+        for item in items:
+            if item is None:
+                menu.add_separator()
+            else:
+                label, method = item
+                menu.add_command(label=label, command=getattr(self, method))
+        btn['menu'] = menu
+        return btn, menu
+
+    def _set_panel_menus_visible(self, panel_type):
+        """Показывает меню только той панели, которая определена.
+
+        panel_type=None (соединение закрыто) — выключены и скрыты все.
+        """
+        menus = {
+            'ispmanager': (self.ispmanager_frame, self.isp_menu_btn),
+            'fastpanel': (self.fastpanel_frame, self.fp_menu_btn),
+        }
+        for panel, (frame, btn) in menus.items():
+            if panel_type == panel:
+                frame.pack(side=tk.LEFT, padx=5)
+                btn.config(state=tk.NORMAL)
+            else:
+                frame.pack_forget()
+                btn.config(state=tk.DISABLED)
 
     def create_widgets(self):
         top_frame = tb.Frame(self.root, bootstyle="secondary")
@@ -397,29 +437,20 @@ class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, Checks
         btn_frame = tb.Frame(self.root, bootstyle="secondary")
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
 
-        # ---------- МЕНЮ ISPmanager ----------
-        # Восемь действий раньше занимали два ряда кнопок; выпадающее меню
-        # группирует их в один элемент, содержимое (методы run_isp_*) то же.
+        # ---------- МЕНЮ ПАНЕЛЕЙ ----------
+        # Раньше ISPmanager занимал восемь кнопок в двух рядах; теперь каждое
+        # действие панели — один выпадающий пункт, рядом с остальными.
         self.ispmanager_frame = tb.Frame(btn_frame, bootstyle="secondary")
         self.ispmanager_frame.pack(side=tk.LEFT, padx=5)
         self.ispmanager_frame.pack_forget()
+        self.isp_menu_btn, self.isp_menu = self._build_panel_menu(
+            self.ispmanager_frame, "🛠 ISPmanager ▾", "warning", ISPMANAGER_MENU)
 
-        self.isp_menu_btn = tb.Menubutton(
-            self.ispmanager_frame,
-            text="🛠 ISPmanager ▾",
-            state=tk.DISABLED,
-            bootstyle="warning",
-            direction="below",
-        )
-        self.isp_menu_btn.pack(side=tk.LEFT)
-        self.isp_menu = tk.Menu(self.isp_menu_btn, tearoff=0)
-        for _item in ISPMANAGER_MENU:
-            if _item is None:
-                self.isp_menu.add_separator()
-            else:
-                _label, _method = _item
-                self.isp_menu.add_command(label=_label, command=getattr(self, _method))
-        self.isp_menu_btn['menu'] = self.isp_menu
+        self.fastpanel_frame = tb.Frame(btn_frame, bootstyle="secondary")
+        self.fastpanel_frame.pack(side=tk.LEFT, padx=5)
+        self.fastpanel_frame.pack_forget()
+        self.fp_menu_btn, self.fp_menu = self._build_panel_menu(
+            self.fastpanel_frame, "🛠 FastPanel ▾", "info", FASTPANEL_MENU)
 
         # ---------- КНОПКИ SWAP ----------
         swap_frame = tb.Frame(self.root, bootstyle="secondary")
