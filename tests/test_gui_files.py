@@ -170,6 +170,28 @@ def _find_treeview(widget):
     return None
 
 
+def _press_enter(tree, dialog, want, timeout=3.0):
+    """Нажимает Enter в таблице и ждёт результата навигации.
+
+    when='tail' + ожидание по дедлайну, а не один update(), — не придирка, а
+    следствие замера: event_generate('<Return>') по умолчанию ставит событие в
+    НАЧАЛО очереди, и под реальным оконным менеджером (машина разработчика),
+    когда X-фокус новому Toplevel ещё не передан (root.focus_get() is None),
+    событие до on_open не доходило вообще — на 6 прогонах из 40 таблица
+    оставалась ['etc']. В CI Xvfb крутится без WM, поэтому там тест проходил и
+    так, и дефект был не виден.
+    """
+    tree.focus_force()
+    dialog.update()
+    tree.event_generate('<Return>', when='tail')
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        dialog.update()
+        if [str(i) for i in tree.get_children()] == want:
+            return
+        time.sleep(0.002)
+
+
 class TestManagerOpens:
     def test_window_lists_and_navigates(self):
         app = _make_app()
@@ -194,15 +216,12 @@ class TestManagerOpens:
             # обработчик; сам Double-1 Tk синтезировать не позволяет)
             dialog.update()
             tree.selection_set('etc')
-            tree.focus_set()
-            tree.event_generate('<Return>')
-            dialog.update()
+            _press_enter(tree, dialog, ['nginx'])
             assert [str(i) for i in tree.get_children()] == ['nginx']
 
             # и ещё один уровень вниз: /etc/nginx -> nginx.conf
             tree.selection_set('nginx')
-            tree.event_generate('<Return>')
-            dialog.update()
+            _press_enter(tree, dialog, ['nginx.conf'])
             assert [str(i) for i in tree.get_children()] == ['nginx.conf']
             conf_row = tree.item('nginx.conf', 'values')
             assert str(conf_row[1]) == 'файл'
