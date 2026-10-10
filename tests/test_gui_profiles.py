@@ -295,3 +295,64 @@ class TestHistorySelect:
         h.history_combo._v = 'неизвестная запись'
         h._on_history_select(None)
         assert h.ip_var.get() == 'keep-me'
+
+
+# ==================== отказоустойчивость: ветки, что были непокрыты =========
+#
+# Три оставшиеся ветки — это не «счастье», а поломка на живом сервере: пустое
+# имя профиля при удалении, битый JSON истории, сбой записи истории (диск/право).
+# Каждая обязана отработать молча, а не уронить приложение: история подключений
+# не критична, в отличие от профилей (там _save_profiles показывает messagebox —
+# см. TestSaveProfiles), поэтому здесь обработчик просто глотает исключение.
+
+
+class TestDeleteProfileGuard:
+    def test_empty_name_is_noop(self, tmp_path, monkeypatch):
+        # profile_var пуст — подтверждение не открывается, файл не трогается
+        dlg = _Dialogs()
+        monkeypatch.setattr(gp, 'messagebox', dlg)
+        p = tmp_path / 'p.json'
+        p.write_text(json.dumps({'prod': {'ip': '1.1.1.1'}}), encoding='utf-8')
+        h = _Host(p, tmp_path / 'h.json')
+        h.delete_profile()                    # profile_var == ''
+        assert dlg.askyesno_ret is True       # но спросить не должны были
+        assert 'prod' in h._load_profiles()   # файл не изменён
+
+
+class TestConnHistoryResilience:
+    def test_corrupt_history_file_degrades_to_empty(self, tmp_path):
+        # битый JSON на диске не должен ронять загрузку — пустой список
+        hp = tmp_path / 'h.json'
+        hp.write_text('[ { это не json', encoding='utf-8')
+        h = _Host(tmp_path / 'p.json', hp)
+        assert h._load_conn_history() == []
+
+    def test_truncated_history_file_degrades_to_empty(self, tmp_path):
+        # оборванная запись (например, упала на середине json.dump) — то же
+        hp = tmp_path / 'h.json'
+        hp.write_text('[{"ip": "1.1.1.1"', encoding='utf-8')
+        h = _Host(tmp_path / 'p.json', hp)
+        assert h._load_conn_history() == []
+
+    def test_write_failure_is_swallowed_but_memory_updated(self, tmp_path):
+        # conn_history_file указывает на каталог -> open('w') бросит;
+        # наружу бросок идти не должен, но in-memory история уже обновлена —
+        # так прод ведёт себя сейчас, и тест это закрепляет
+        h = _Host(tmp_path / 'p.json', tmp_path)   # путь = каталог
+        h._save_conn_history('1.1.1.1', '22', 'root')   # не должно бросить
+        assert h.conn_history == [{'ip': '1.1.1.1', 'port': '22', 'user': 'root'}]
+
+    def test_chmod_failure_is_swallowed(self, tmp_path, monkeypatch):
+        # запись прошла, но os.chmod упал (файл на read-only-фс) — не роняем;
+        # данные на диске при этом корректны
+        hp = tmp_path / 'h.json'
+        h = _Host(tmp_path / 'p.json', hp)
+
+        def boom(path, mode):
+            raise OSError('read-only file system')
+
+        monkeypatch.setattr(gp.os, 'chmod', boom)
+        h._save_conn_history('1.1.1.1', '22', 'root')
+        # json уже легло до chmod — файл читается
+        assert json.loads(hp.read_text(encoding='utf-8')) == \
+            [{'ip': '1.1.1.1', 'port': '22', 'user': 'root'}]
