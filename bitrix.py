@@ -348,18 +348,51 @@ def bitrix_mysql_tune(checker):
 
 
 # ==================== ДОСТУП К БАЗЕ ====================
-def bitrix_db_check(checker):
-    lines = ['=== ПРОВЕРКА ДОСТУПА К БАЗЕ (dbconn.php) ===']
+def _db_credentials(checker):
+    """(vals, None) либо (None, [строки-ошибки]) — реквизиты из dbconn.php.
+
+    Пароль здесь не печатается: строки ошибок идут прямо в отчёт оператору.
+    """
     out, _, rc = checker.run(f'cat {q(DBCONN_PATH)} 2>/dev/null')
     if rc != 0 or not out.strip():
-        lines.append(f'❌ {DBCONN_PATH} не читается — проверьте, что сайт в '
-                     f'{BITRIX_DOCROOT}')
-        return '\n'.join(lines)
-
+        return None, [f'❌ {DBCONN_PATH} не читается — проверьте, что сайт в '
+                      f'{BITRIX_DOCROOT}']
     vals = parse_dbconn(out)
     missing = [k for k in ('DBHost', 'DBLogin', 'DBName') if not vals.get(k)]
     if missing:
-        lines.append('❌ В dbconn.php не найдено: ' + ', '.join(missing))
+        return None, ['❌ В dbconn.php не найдено: ' + ', '.join(missing)]
+    return vals, None
+
+
+def _db_query(checker, sql):
+    """Запрос от имени Битрикс-пользователя: (True, stdout) либо (False, вывод).
+
+    Пароль не уходит в аргументы mysql (его видно в ps): он во временном
+    файле 0600, который удаляется в finally — даже если mysql упал.
+    """
+    vals, errors = _db_credentials(checker)
+    if vals is None:
+        return False, '\n'.join(errors or [])
+    content = ('[client]\n'
+               f"host={vals['DBHost']}\nuser={vals['DBLogin']}\n"
+               f"password={vals.get('DBPassword', '')}\ndatabase={vals['DBName']}\n")
+    ok, err = write_remote_file(checker, DBCHECK_CNF, content)
+    if not ok:
+        return False, f'❌ Не удалось подготовить файл проверки: {err}'
+    checker.run(f'chmod 600 {q(DBCHECK_CNF)} 2>/dev/null')
+    try:
+        out, _, rc = checker.run(
+            f'mysql --defaults-extra-file={q(DBCHECK_CNF)} -N -e {q(sql)} 2>&1')
+        return rc == 0, out.strip()
+    finally:
+        checker.run(f'rm -f {q(DBCHECK_CNF)}')
+
+
+def bitrix_db_check(checker):
+    lines = ['=== ПРОВЕРКА ДОСТУПА К БАЗЕ (dbconn.php) ===']
+    vals, errors = _db_credentials(checker)
+    if vals is None:
+        lines.extend(errors or [])
         return '\n'.join(lines)
 
     # Пароль наружу не печатаем: в отчёте только факт, задан он или нет.
@@ -367,25 +400,12 @@ def bitrix_db_check(checker):
                  f"DBName={vals['DBName']} "
                  f"DBPassword={'задан' if vals.get('DBPassword') else 'ПУСТОЙ'}")
 
-    # Пароль в аргументах mysql видно в ps — передаём через defaults-файл 0600.
-    content = ('[client]\n'
-               f"host={vals['DBHost']}\nuser={vals['DBLogin']}\n"
-               f"password={vals.get('DBPassword', '')}\ndatabase={vals['DBName']}\n")
-    ok, err = write_remote_file(checker, DBCHECK_CNF, content)
-    if not ok:
-        lines.append(f'❌ Не удалось подготовить файл проверки: {err}')
-        return '\n'.join(lines)
-    checker.run(f'chmod 600 {q(DBCHECK_CNF)} 2>/dev/null')
-
-    out, _, rc = checker.run(
-        f'mysql --defaults-extra-file={q(DBCHECK_CNF)} -e "SELECT 1" 2>&1')
-    checker.run(f'rm -f {q(DBCHECK_CNF)}')
-
-    if rc == 0:
+    ok, out = _db_query(checker, 'SELECT 1')
+    if ok:
         lines.append('✅ Битрикс-пользователь подключается к базе (SELECT 1 прошёл)')
         return '\n'.join(lines)
 
-    detail = out.strip() or 'mysql: нет вывода'
+    detail = out or 'mysql: нет вывода'
     lines.append(f'❌ Подключение не прошло: {detail}')
     low = detail.lower()
     if 'access denied' in low:
@@ -398,6 +418,95 @@ def bitrix_db_check(checker):
     elif "can't connect" in low or 'connection refused' in low:
         lines.append('💡 MySQL не слушает адрес из DBHost: проверьте службу '
                      'mysqld и DBHost (localhost vs 127.0.0.1 vs контейнер).')
+    return '\n'.join(lines)
+
+
+# ==================== РАЗМЕР ТАБЛИЦ ====================
+# Запрос к information_schema: база берётся из defaults-файла (database=...),
+# одинарных кавычек в SQL нет — q() в _db_query их не ломает.
+TOP_TABLES_SQL = (
+    'SELECT TABLE_NAME, ROUND((DATA_LENGTH+INDEX_LENGTH)/1024/1024,1), TABLE_ROWS '
+    'FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() '
+    'ORDER BY (DATA_LENGTH+INDEX_LENGTH) DESC LIMIT 20'
+)
+
+# Порог, с которого таблица-«мусорщик» попадает в рекомендации.
+GARBAGE_WARN_MB = 100
+
+# Подсказки по таблицам, которые в Битриксе разрастаются именно мусором.
+# b_cache_tag вручную не чистят: удаление тегов ломает инкрементальный кеш,
+# поэтому подсказка — про штатные механизмы, не про DELETE.
+GARBAGE_HINTS = {
+    'b_user_session': 'сессии: штатная задача «Очистка неактивных сессий» '
+                      'или DELETE по DATE_LAST (сначала SELECT COUNT)',
+    'b_cache_tag': 'теги кеша: НЕ удалять вручную — чистить штатной «Очисткой '
+                   'кеша» в админке, ручное DELETE ломает инкрементальный кеш',
+    'b_cache_filter_tag': 'теги фильтра: как и b_cache_tag — только штатная '
+                          'очистка кеша',
+    'b_stat_hit': 'статистика визитов: отключите модуль статистики или '
+                  'архивируйте старые записи',
+    'b_stat_session': 'статистика сессий: чистить вместе с b_stat_hit',
+    'b_log': 'журнал событий: уменьшите срок хранения в настройках продукта',
+    'b_sale_basket': 'брошенные корзины: удаляйте позиции старше N дней '
+                     '(сначала SELECT COUNT по DATE_INSERT)',
+}
+
+
+def parse_top_tables(text):
+    """Вывод `mysql -N` (TAB-разделённые колонки) -> список строк отчёта.
+
+    Колонки: имя, размер МБ, примерное число строк. Посторонние строки
+    (например 'ERROR 1142 ...' от нехватки прав на information_schema)
+    пропускаются: на них отчёт отвечает отдельным предупреждением.
+    """
+    rows = []
+    for line in (text or '').splitlines():
+        parts = line.split('\t')
+        if len(parts) < 3:
+            continue
+        try:
+            size_mb = float(parts[1])
+        except ValueError:
+            continue
+        rows.append({'table': parts[0], 'size_mb': size_mb, 'rows': parts[2]})
+    return rows
+
+
+def garbage_hints(rows, warn_mb=GARBAGE_WARN_MB):
+    """Строки-рекомендации по таблицам-мусорщикам тяжелее warn_mb."""
+    sizes = {r['table']: r['size_mb'] for r in rows}
+    return [f'💡 {table} ({sizes[table]:.0f} МБ) — {hint}'
+            for table, hint in GARBAGE_HINTS.items()
+            if sizes.get(table, 0) >= warn_mb]
+
+
+def bitrix_db_tables_report(checker):
+    lines = ['=== ТОП-20 ТАБЛИЦ БАЗЫ БИТРИКС ===']
+    ok, out = _db_query(checker, TOP_TABLES_SQL)
+    if not ok:
+        lines.append('❌ Запрос к information_schema не прошёл:')
+        lines.extend((out or 'mysql: нет вывода').splitlines())
+        return '\n'.join(lines)
+
+    rows = parse_top_tables(out)
+    if not rows:
+        lines.append('⚠️ Таблицы не перечислены: нет прав на information_schema '
+                     'или база пуста')
+        return '\n'.join(lines)
+
+    total = sum(r['size_mb'] for r in rows)
+    lines.append(f'Топ-{len(rows)}, сумма показанных: {total:.0f} МБ')
+    for row in rows:
+        mark = '  ⚠️' if row['table'] in GARBAGE_HINTS else ''
+        lines.append(f"{row['size_mb']:9.1f} МБ  {row['table']:<40} "
+                     f"строк: {row['rows']}{mark}")
+
+    hints = garbage_hints(rows)
+    if hints:
+        lines.append('')
+        lines.extend(hints)
+        lines.append('⚠️ Перед любой чисткой — бэкап дампом mysqldump; таблицы '
+                     'с префиксом b_ кроме перечисленных мусором не являются.')
     return '\n'.join(lines)
 
 

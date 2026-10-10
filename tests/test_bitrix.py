@@ -220,6 +220,62 @@ class TestDbCheck:
         assert '❌' in out and 'dbconn.php' in out
 
 
+# ==================== топ-таблицы БД ====================
+TOP_TABLES_OUT = (
+    'b_cache_tag\t1843.2\t12000000\n'
+    'b_user_session\t512.7\t340000\n'
+    'b_iblock_element\t210.5\t48000\n'
+    'b_sale_basket\t4.1\t900\n'
+)
+
+
+class TestTopTables:
+    def test_parse_top_tables(self):
+        rows = bx.parse_top_tables(TOP_TABLES_OUT)
+        assert len(rows) == 4
+        assert rows[0] == {'table': 'b_cache_tag', 'size_mb': 1843.2,
+                           'rows': '12000000'}
+
+    def test_parse_skips_foreign_lines(self):
+        assert bx.parse_top_tables('ERROR 1142 (42000): SELECT command denied') == []
+        assert bx.parse_top_tables('x\tabc\t1\n') == []
+        assert bx.parse_top_tables('') == []
+        assert bx.parse_top_tables(None) == []
+
+    def test_garbage_hints_threshold(self):
+        hints = '\n'.join(bx.garbage_hints(bx.parse_top_tables(TOP_TABLES_OUT)))
+        assert 'b_cache_tag' in hints and 'b_user_session' in hints
+        assert 'b_sale_basket' not in hints          # 4 МБ — ниже порога
+        assert 'НЕ удалять вручную' in hints         # теги кеша руками не чистят
+
+    def test_report_total_and_hints(self):
+        c = FakeSSH(routes=[
+            ('cat', DBCONN_TEXT),
+            ('SELECT TABLE_NAME', TOP_TABLES_OUT),
+        ], client=FakeSftpClient())
+        out = bx.bitrix_db_tables_report(c)
+        assert '=== ТОП-20 ТАБЛИЦ БАЗЫ БИТРИКС ===' in out and 'Топ-4' in out
+        assert '💡 b_cache_tag' in out
+        # пароль ушёл только в defaults-файл, но не в командную строку
+        assert 'sup3r-secret' not in ' '.join(c.commands)
+        assert c.find('rm -f') is not None
+
+    def test_report_query_failure(self):
+        c = FakeSSH(routes=[
+            ('cat', DBCONN_TEXT),
+            ('SELECT TABLE_NAME',
+             ('ERROR 1142 (42000): SELECT command denied to user', '', 1)),
+        ], client=FakeSftpClient())
+        out = bx.bitrix_db_tables_report(c)
+        assert '❌' in out and '1142' in out
+
+    def test_report_no_rows(self):
+        c = FakeSSH(routes=[('cat', DBCONN_TEXT), ('SELECT TABLE_NAME', '')],
+                    client=FakeSftpClient())
+        out = bx.bitrix_db_tables_report(c)
+        assert '⚠️' in out and 'information_schema' in out
+
+
 # ==================== PHP / cron / почта ====================
 class TestPhp:
     def test_report_flags_missing_module(self):

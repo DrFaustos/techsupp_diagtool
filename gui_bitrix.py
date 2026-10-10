@@ -13,6 +13,7 @@ from diagnostic import (
     detect_bitrix_env, bitrix_sites_report,
     bitrix_ssl_report, bitrix_ssl_renew,
     bitrix_mysql_report, bitrix_mysql_tune, bitrix_db_check,
+    bitrix_db_tables_report,
     bitrix_php_report, bitrix_cron_report, bitrix_mail_report,
 )
 
@@ -23,6 +24,7 @@ BITRIX_MENU = [
     ("SSL Let's Encrypt: состояние", "run_bx_ssl"),
     ("MySQL: состояние и рекомендация", "run_bx_mysql"),
     ("Доступ к базе (dbconn.php)", "run_bx_db"),
+    ("Топ-таблицы базы (размер)", "run_bx_db_tables"),
     ("PHP: параметры и модули", "run_bx_php"),
     ("Cron-агенты Битрикс", "run_bx_cron"),
     ("Почта: postfix и mailq", "run_bx_mail"),
@@ -86,6 +88,12 @@ class BitrixMixin:
         if not self.checker:
             return
         self._run_in_thread(bitrix_db_check, self.bx_menu_btn, self.checker)
+
+    def run_bx_db_tables(self):
+        if not self.checker:
+            return
+        self._run_in_thread(bitrix_db_tables_report, self.bx_menu_btn,
+                            self.checker, cache_key='bx_db_tables')
 
     def run_bx_php(self):
         if not self.checker:
