@@ -214,6 +214,20 @@ class TestScrollbarStyle:
         host = _Host(vbar=False)
         host.apply_scrollbar_style('darkly')
 
+    def test_no_theme_argument_reads_current_style(self):
+        # theme_name=None: имя берётся из root.style.theme.name. Без этой ветки
+        # вызов из switch_theme/старта дал бы скроллбару None и светлая тема
+        # осталась бы с тёмным жолобом
+        host = _Host(theme='flatly')
+        host.apply_scrollbar_style()
+        assert _vbar_cfg(host)['troughcolor'] == '#e0e0e0'
+
+    def test_no_theme_argument_follows_style_after_switch(self):
+        host = _Host(theme='darkly')
+        host.root.style.theme.name = 'darkly'
+        host.apply_scrollbar_style()
+        assert _vbar_cfg(host)['troughcolor'] == '#2a2a2a'
+
 
 class TestSwitchAndToggle:
     def test_switch_updates_style_output_and_current(self):

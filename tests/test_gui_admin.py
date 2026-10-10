@@ -599,3 +599,15 @@ class TestConfigEditor:
         ed.msg.askyesno_ret = False
         ed.bundle.command('Закрыть')()
         assert ed.bundle.dialog().destroyed == 0
+
+    def test_close_without_changes_destroys_quietly(self, ed):
+        # «Закрыть» при НЕизменённом тексте обязан закрыть окно МОЛЧА. Здесь
+        # get() возвращает ровно прочитанное содержимое — так ведёт себя виджет,
+        # если текст не трогали; без этой ветки оператор получил бы лишний
+        # вопрос при каждом закрытии редактора
+        text = ed.bundle.by_kind('ScrolledText')[0]
+        text.get = lambda *a: CONTENT
+        ed.msg.askyesno_ret = True          # спросить НЕ должны, несмотря на True
+        ed.bundle.command('Закрыть')()
+        assert ed.msg.asks == []
+        assert ed.bundle.dialog().destroyed == 1

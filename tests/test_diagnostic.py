@@ -378,6 +378,35 @@ class TestFManager:
         assert fm.is_text_file('/usr/bin/bash') is False
         assert fm.is_text_file('backup.tar.gz') is False
 
+    def test_is_text_file_edge_names(self):
+        # пустое имя (пустая строка из таблицы) и дотфайлы — пограничные
+        # ответы эвристики: .htaccess править можно, '' открывать нечего
+        assert fm.is_text_file('') is False
+        assert fm.is_text_file(None) is False
+        assert fm.is_text_file('/etc/apache2/.htaccess') is True
+        assert fm.is_text_file('/root/.bashrc') is True
+
+    def test_delete_dir_recurses_into_subdirectories(self):
+        # вложенный каталог: _rmtree обязан уйти в рекурсию, иначе rmdir
+        # непустого каталога упал бы на живом сервере посреди удаления
+        sftp = FakeSFTP(files=['/srv/a/b.txt'],
+                        dirs=['/', '/srv', '/srv/a', '/srv/a/inner'])
+        out = fm.delete_path(_sftp_checker(sftp), '/srv', is_dir=True)
+        assert '✅ Удалено: /srv' in out
+        assert not [d for d in sftp.dirs if d.startswith('/srv')]
+        # порядок: сначала содержимое, потом сам каталог
+        assert ('rmdir', '/srv/a/inner') in sftp.ops
+        assert ('remove', '/srv/a/b.txt') in sftp.ops
+        assert sftp.ops[-1] == ('rmdir', '/srv')
+        assert sftp.closed == 1
+
+    def test_filemode_garbage_is_safe(self):
+        # st_mode у части записей приходит None/мусором: stat.filemode бросает
+        # TypeError, а таблицаlist_dir не имеет права падать на одной записи
+        assert fm._filemode(None) == '?'
+        assert fm._filemode('abc') == '?'
+        assert fm._filemode(0o100644) == '-rw-r--r--'
+
 
 # ==================== metrics: статусы служб (без рассинхрона) ====================
 import metrics as metrics_mod

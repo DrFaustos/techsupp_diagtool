@@ -134,3 +134,16 @@ class TestWebConfig:
     def test_nothing_detected_gives_hint(self):
         out = metrics_mod.web_config_report(FakeSSH())
         assert 'не обнаружен' in out
+
+    def test_report_lists_every_detected_service(self):
+        # раньше проверялся только check_web_config (словарь), а сам отчёт —
+        # только пустая ветка; цикл по найденным сервисам не был закрыт вовсе
+        c = FakeSSH(routes=[
+            ('nginx -t', 'nginx: configuration file /etc/nginx/nginx.conf '
+                         'test is successful'),
+            ('apache2ctl', 'Syntax OK'),
+        ])
+        out = metrics_mod.web_config_report(c)
+        assert 'nginx: nginx: configuration file' in out
+        assert 'apache: Syntax OK' in out
+        assert 'не обнаружен' not in out
