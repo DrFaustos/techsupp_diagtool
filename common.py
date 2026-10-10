@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"

@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-10-10
+
 ### Добавлено
 
 - **Тесты backend-модулей** (`tests/test_metrics.py`, `tests/test_files.py`,
