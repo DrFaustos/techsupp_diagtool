@@ -321,6 +321,30 @@ def bitrix_sites_report(checker):
 
 
 # ==================== SSL (dehydrated) ====================
+# Штатный перевыпуск dehydrated в BitrixVM живёт НЕ только в root crontab:
+# webdir чаще пишет задание в /etc/cron.d/ либо в периодические каталоги.
+# Отчёт обязан искать во всех местах, иначе на исправной сервере врёт
+# «перевыпускать придётся вручную».
+DEHYDRATED_CRON_DIRS = ('/etc/cron.d', '/etc/cron.hourly', '/etc/cron.daily',
+                        '/etc/cron.weekly', '/etc/cron.monthly')
+
+
+def find_dehydrated_cron(checker):
+    """Где прописан перевыпуск dehydrated: (строки_root_cron, [файлы_cron.d]).
+
+    root crontab читаем отдельно (spool), остальные места — одним grep -rlF по
+    каталогам: ищет по СОДЕРЖИМОМУ, поэтому находит и файл cron.d/dehydrated,
+    и скрипт в cron.hourly, который дергает dehydrated.
+    """
+    out, _, _ = checker.run('crontab -l 2>/dev/null | grep -F dehydrated')
+    root = out.strip()
+    targets = ' '.join(q(p) for p in DEHYDRATED_CRON_DIRS)
+    out, _, _ = checker.run(
+        f'grep -rlF {q("dehydrated")} {targets} 2>/dev/null')
+    files = sorted({ln.strip() for ln in out.splitlines() if ln.strip()})
+    return root, files
+
+
 def bitrix_ssl_report(checker):
     lines = ["=== SSL LET'S ENCRYPT (dehydrated) ==="]
     certs_dir = f'{DEHYDRATED}/certs'
@@ -344,9 +368,19 @@ def bitrix_ssl_report(checker):
         tail = f', осталось {days} дн.' if days is not None else ''
         lines.append(f'{mark} {dom}: {raw}{tail}')
 
-    out, _, _ = checker.run('crontab -l 2>/dev/null | grep -F dehydrated')
-    lines.append('✅ Перевыпуск настроен в cron' if out.strip()
-                 else '⚠️ В crontab задания dehydrated нет — перевыпускать придётся вручную')
+    root_cron, cron_files = find_dehydrated_cron(checker)
+    if root_cron:
+        lines.append('✅ Перевыпуск настроен в crontab root:')
+        lines.extend('   ' + ln for ln in root_cron.splitlines())
+    elif cron_files:
+        # Штатная раскладка BitrixVM: задание лежит в cron.d / cron.* — это
+        # НЕ ошибка, ругаться «придётся вручную» на исправном сервере нельзя.
+        lines.append('✅ Перевыпуск настроен вне root crontab: '
+                     + ', '.join(cron_files))
+    else:
+        lines.append('⚠️ Задания dehydrated нет ни в crontab root, ни в '
+                     + ', '.join(DEHYDRATED_CRON_DIRS)
+                     + ' — перевыпускать придётся вручную')
 
     out, _, _ = checker.run(f'tail -n 15 {q(DEHYDRATED_LOG)} 2>/dev/null')
     if out.strip():

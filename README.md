@@ -60,7 +60,9 @@
 Меню «🧩 Битрикс ▾» появляется автоматически, если на сервере найдены
 `/opt/webdir` и `/home/bitrix`:
 - **SSL Let's Encrypt** — срок остатка сертификатов dehydrated, хвост
-  `dehydrated_update.log`, задание cron, перевыпуск `dehydrated -c`
+  `dehydrated_update.log`, задание перевыуска ищется во всех штатных местах
+  (root crontab, `/etc/cron.d`, `cron.hourly/daily/weekly/monthly`), перевыпуск
+  `dehydrated -c`
 - **MySQL** — `innodb_buffer_pool_size` и hit ratio InnoDB, рекомендация от объёма
   RAM (40%, округление до chunk 128M); «применить тюнинг» пишет
   `/etc/my.cnf.d/bitrix-tuning.cnf`, не трогая текущий `my.cnf`

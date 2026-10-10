@@ -127,11 +127,60 @@ class TestSSL:
         ])
         out = bx.bitrix_ssl_report(c)
         assert '✅ site.ru' in out and 'осталось' in out
-        assert '⚠️ В crontab задания dehydrated нет' in out
+        assert '⚠️ Задания dehydrated нет ни в crontab root' in out
 
     def test_report_no_certs(self):
         out = bx.bitrix_ssl_report(FakeSSH())
         assert 'пусто' in out
+
+    def test_find_dehydrated_cron_root_wins(self):
+        # игла 'grep -rlF' отличается от команды root crontab — маршруты не спорят
+        c = FakeSSH(routes=[
+            ('crontab -l 2>/dev/null | grep -F dehydrated',
+             '30 3 * * * /home/bitrix/dehydrated/dehydrated -c\n'),
+            ('grep -rlF', '/etc/cron.d/bx-dehydrated\n'),
+        ])
+        root, files = bx.find_dehydrated_cron(c)
+        assert 'dehydrated -c' in root and files == ['/etc/cron.d/bx-dehydrated']
+
+    def test_find_dehydrated_cron_dedups_and_sorts(self):
+        c = FakeSSH(routes=[
+            ('grep -rlF', '/etc/cron.daily/x\n/etc/cron.d/dehydrated\n'
+                         '/etc/cron.daily/x\n'),
+        ])
+        root, files = bx.find_dehydrated_cron(c)
+        assert root == ''
+        assert files == ['/etc/cron.d/dehydrated', '/etc/cron.daily/x']
+
+    def test_report_cron_d_is_not_an_error(self):
+        # штатная раскладка BitrixVM: задания нет в root crontab, оно в cron.d
+        c = FakeSSH(routes=[
+            ('ls -1', 'site.ru\n'),
+            ('openssl', 'notAfter=Oct 12 13:45:00 2099 GMT'),
+            ('grep -rlF', '/etc/cron.d/dehydrated\n'),
+        ])
+        out = bx.bitrix_ssl_report(c)
+        assert '✅ Перевыпуск настроен вне root crontab' in out
+        assert '/etc/cron.d/dehydrated' in out
+        assert 'придётся вручную' not in out
+
+    def test_report_root_cron_shows_the_line(self):
+        c = FakeSSH(routes=[
+            ('crontab -l 2>/dev/null | grep -F dehydrated',
+             '30 3 * * * cd /home/bitrix/dehydrated && ./dehydrated -c\n'),
+        ])
+        out = bx.bitrix_ssl_report(c)
+        assert '✅ Перевыпуск настроен в crontab root' in out
+        assert '30 3 * * *' in out
+
+    def test_report_searches_all_cron_dirs(self):
+        # отчёт обязан смотреть не только spool root: периодика BitrixVM — в cron.*
+        c = FakeSSH()
+        bx.bitrix_ssl_report(c)
+        grep_cmd = c.find('grep -rlF')
+        assert grep_cmd is not None
+        for path in bx.DEHYDRATED_CRON_DIRS:
+            assert path in grep_cmd, f'{path} не ищется'
 
     def test_renew_requires_binary(self):
         c = FakeSSH()
