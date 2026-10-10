@@ -74,6 +74,7 @@ from bitrix import (  # noqa: F401
     bitrix_mysql_report, bitrix_mysql_tune, bitrix_db_check,
     bitrix_db_tables_report,
     bitrix_php_report, bitrix_cron_report, bitrix_mail_report,
+    bitrix_perms_report, bitrix_perms_fix,
 )
 
 # --- fmanager ---

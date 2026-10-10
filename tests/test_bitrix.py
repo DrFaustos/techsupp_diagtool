@@ -5,6 +5,7 @@ notAfter, mailq) проверяются напрямую; отчёты — ма�
 FakeSSH. Порядок маршрутов важен: первое совпадение по подстроке выигрывает.
 """
 import os
+import shlex
 import sys
 from datetime import datetime
 
@@ -274,6 +275,85 @@ class TestTopTables:
                     client=FakeSftpClient())
         out = bx.bitrix_db_tables_report(c)
         assert '⚠️' in out and 'information_schema' in out
+
+
+# ==================== права файлов сайта ====================
+def _perms_routes(owner_cnt='0', world_cnt='0', dirs='ok'):
+    """Маршруты для bitrix_perms_report: dirs — ответ на test -d/test -w."""
+    return [
+        ('ls -ld', 'drwxr-xr-x 42 bitrix bitrix 4096 Oct 10 12:00 /home/bitrix/www'),
+        ('! -user', owner_cnt + '\n'),
+        ('-perm -o+w', world_cnt + '\n'),
+        ('test -d', dirs + '\n'),
+    ]
+
+
+class TestPerms:
+    def test_report_all_good(self):
+        c = FakeSSH(routes=_perms_routes())
+        out = bx.bitrix_perms_report(c)
+        assert '✅ Все файлы принадлежат bitrix' in out
+        assert '✅ world-writable файлов нет' in out
+        assert '✅ upload: запись есть' in out
+        assert '/home/bitrix/www' in out
+
+    def test_report_flags_broken_owners_and_perms(self):
+        c = FakeSSH(routes=_perms_routes(owner_cnt='1234', world_cnt='7'))
+        out = bx.bitrix_perms_report(c)
+        assert 'Файлов с другим владельцем: 1234' in out
+        assert 'доступных на запись всем (o+w): 7' in out
+
+    def test_report_readonly_cache_dir(self):
+        routes = _perms_routes()
+        # кеш-каталог есть, но без записи — кеш и агенты работать не будут
+        routes.append(('bitrix/cache', 'ro\n'))
+        c = FakeSSH(routes=[routes[-1]] + routes[:-1])
+        out = bx.bitrix_perms_report(c)
+        assert '❌ bitrix/cache' in out
+
+    def test_report_missing_docroot_stops(self):
+        c = FakeSSH(routes=[('ls -ld', ('', 'No such file or directory', 1))])
+        out = bx.bitrix_perms_report(c)
+        assert '❌' in out and '/home/bitrix/www' in out
+        assert c.find('! -user') is None      # дальше не идём
+
+    def test_report_unparsable_count(self):
+        c = FakeSSH(routes=_perms_routes(owner_cnt='find: error'))
+        out = bx.bitrix_perms_report(c)
+        assert 'Не удалось посчитать владельцев' in out
+
+    def test_fix_requires_group(self):
+        # группы bitrix нет -> chown отправлять нельзя
+        c = FakeSSH()
+        out = bx.bitrix_perms_fix(c)
+        assert '❌' in out and 'bitrix' in out   # имя группы названо в ошибке
+        assert c.find('chown') is None
+
+    def test_fix_runs_expected_commands(self):
+        c = FakeSSH(routes=[('getent group', 'ok')])
+        out = bx.bitrix_perms_fix(c)
+        assert '✅ Владелец bitrix:bitrix восстановлен' in out
+        assert '✅ Каталогам выставлены 755' in out
+        assert '✅ Файлам выставлены 644' in out
+        assert 'upload' in out
+        # {} в find -exec обязан доехать буквально, без удвоения
+        assert c.find('-exec chmod 755 {} +') is not None
+        assert c.find("-exec chmod g+w {} +") is not None
+        # q() НЕ кавычит путь из одних безопасных символов — проверяем аргумент
+        # разбором, а не поиском кавычек в строке.
+        chown_cmd = c.find('chown -R')
+        assert chown_cmd is not None
+        parts = shlex.split(chown_cmd)
+        assert parts[:3] == ['chown', '-R', 'bitrix:bitrix']
+        assert '/home/bitrix/www' in parts
+
+    def test_fix_reports_chown_failure(self):
+        c = FakeSSH(routes=[
+            ('getent group', 'ok'),
+            ('chown -R', ('chown: cannot access', '', 1)),
+        ])
+        out = bx.bitrix_perms_fix(c)
+        assert '❌ chown (rc=1)' in out
 
 
 # ==================== PHP / cron / почта ====================

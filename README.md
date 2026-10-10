@@ -71,6 +71,9 @@
   подсказки по «мусорщикам» Битрикса (`b_user_session`, `b_cache_tag`,
   `b_stat_hit`, `b_log`, `b_sale_basket`); удалять руками `b_cache_tag` нельзя —
   чистится штатной «Очисткой кеша»
+- **Права файлов сайта** — владельцы `/home/bitrix/www` (норма `bitrix:bitrix`),
+  world-writable файлы и запись в `bitrix/cache`, `bitrix/managed_cache`,
+  `bitrix/data`, `upload`; «починить» — `chown -R` + 755/644 + `g+w` на `upload`
 - **PHP** — версия, параметры `/opt/php*`, обязательные модули из check.php
 - **Cron-агенты** — наличие задания `cron.sh` (без него агенты крутятся на каждом хите)
 - **Почта** — состояние postfix, глубина очереди `mailq`, хвост `/var/log/maillog`

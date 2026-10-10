@@ -510,6 +510,99 @@ def bitrix_db_tables_report(checker):
     return '\n'.join(lines)
 
 
+# ==================== ПРАВА ФАЙЛОВ САЙТА ====================
+# В BitrixVM сайт принадлежит пользователю/группе bitrix: php работает от него,
+# а www (Apache/nginx) входит в группу bitrix и только поэтому читает файлы.
+# После «распаковали архив под root» или cp -r владельцы уезжают в root — и
+# сайт падает на записи кеша/upload.
+SITE_OWNER = 'bitrix'
+SITE_GROUP = 'bitrix'
+
+# Каталоги, без записи в которых Битрикс не работает (пути от корня сайта).
+WRITABLE_DIRS = ('bitrix/cache', 'bitrix/managed_cache', 'bitrix/data',
+                 'upload', 'bitrix/php_interface')
+
+
+def bitrix_perms_report(checker):
+    lines = ['=== ПРАВА ФАЙЛОВ САЙТА ===']
+    out, _, rc = checker.run(f'ls -ld {q(BITRIX_DOCROOT)} 2>/dev/null')
+    if rc != 0 or not out.strip():
+        lines.append(f'❌ {BITRIX_DOCROOT} не найден — проверьте корень сайта')
+        return '\n'.join(lines)
+    lines.append(f'Корень сайта: {out.strip()}')
+
+    out, _, _ = checker.run(
+        f'find {q(BITRIX_DOCROOT)} -mindepth 1 ! -user {q(SITE_OWNER)} 2>/dev/null | wc -l')
+    cnt = out.strip()
+    if cnt == '0':
+        lines.append(f'✅ Все файлы принадлежат {SITE_OWNER}')
+    elif cnt.isdigit():
+        lines.append(f'⚠️ Файлов с другим владельцем: {cnt} — починка: '
+                     '«Права файлов: починить» ниже в меню')
+    else:
+        lines.append('⚠️ Не удалось посчитать владельцев (find не отработал)')
+
+    out, _, _ = checker.run(
+        f'find {q(BITRIX_DOCROOT)} -type f -perm -o+w 2>/dev/null | wc -l')
+    cnt = out.strip()
+    if cnt == '0':
+        lines.append('✅ world-writable файлов нет')
+    elif cnt.isdigit():
+        lines.append(f'⚠️ Файлов, доступных на запись всем (o+w): {cnt} — '
+                     'потенциальная дыра, ищите через '
+                     f'find {BITRIX_DOCROOT} -type f -perm -o+w')
+
+    for rel in WRITABLE_DIRS:
+        path = f'{BITRIX_DOCROOT}/{rel}'
+        out, _, _ = checker.run(
+            f'test -d {q(path)} && (test -w {q(path)} && echo ok || echo ro)')
+        mark = out.strip()
+        if mark == 'ok':
+            lines.append(f'✅ {rel}: запись есть')
+        elif mark == 'ro':
+            lines.append(f'❌ {rel}: каталог есть, но НЕ доступен для записи — '
+                         'кеш/агенты работать не будут')
+        else:
+            lines.append(f'⚠️ {rel}: каталог не найден')
+    return '\n'.join(lines)
+
+
+def bitrix_perms_fix(checker):
+    lines = ['=== ВОССТАНОВЛЕНИЕ ПРАВ САЙТА ===']
+    out, _, _ = checker.run(f'getent group {q(SITE_GROUP)} >/dev/null && echo ok')
+    if out.strip() != 'ok':
+        lines.append(f'❌ Группы {SITE_GROUP} нет в системе — прервано, '
+                     'chown на несуществующую группу ничего не починит')
+        return '\n'.join(lines)
+
+    lines.append('⚠️ Идём по всему документ-корню: на больших сайтах 1-5 минут.')
+    out, err, rc = checker.run(
+        f'chown -R {SITE_OWNER}:{SITE_GROUP} {q(BITRIX_DOCROOT)} 2>&1 | tail -5')
+    lines.append(f'❌ chown (rc={rc}): {(out or err).strip() or "нет вывода"}'
+                 if rc != 0 else f'✅ Владелец {SITE_OWNER}:{SITE_GROUP} восстановлен')
+
+    out, err, rc = checker.run(
+        f'find {q(BITRIX_DOCROOT)} -type d -exec chmod 755 {{}} + 2>&1 | tail -3')
+    lines.append('✅ Каталогам выставлены 755' if rc == 0
+                 else f'❌ chmod каталогов (rc={rc}): {(out or err).strip()}')
+
+    out, err, rc = checker.run(
+        f'find {q(BITRIX_DOCROOT)} -type f -exec chmod 644 {{}} + 2>&1 | tail -3')
+    lines.append('✅ Файлам выставлены 644' if rc == 0
+                 else f'❌ chmod файлов (rc={rc}): {(out or err).strip()}')
+
+    # upload пишет веб-процесс от www — ему нужна запись GROUP'ой
+    # (владельцем upload остаётся bitrix, 664 + группа bitrix достаточно).
+    out, err, rc = checker.run(
+        f'find {q(BITRIX_DOCROOT)}/upload -exec chmod g+w {{}} + 2>&1 | tail -3')
+    lines.append('✅ upload: добавлена запись группой (www в группе bitrix)'
+                 if rc == 0 else '⚠️ upload: chmod g+w не прошёл')
+    lines.append('💡 Если php-FPM работает от bitrix (FastPanel/ISPmanager '
+                 'иногда ставят www) — сверьте владельца процессов: '
+                 'ps -o user,cmd -C php-fpm')
+    return '\n'.join(lines)
+
+
 # ==================== PHP ====================
 def bitrix_php_report(checker):
     lines = ['=== PHP ПОД БИТРИКС ===']

@@ -15,6 +15,7 @@ from diagnostic import (
     bitrix_mysql_report, bitrix_mysql_tune, bitrix_db_check,
     bitrix_db_tables_report,
     bitrix_php_report, bitrix_cron_report, bitrix_mail_report,
+    bitrix_perms_report, bitrix_perms_fix,
 )
 
 # Состав меню: (подпись пункта, имя метода класса). None — разделитель:
@@ -28,9 +29,11 @@ BITRIX_MENU = [
     ("PHP: параметры и модули", "run_bx_php"),
     ("Cron-агенты Битрикс", "run_bx_cron"),
     ("Почта: postfix и mailq", "run_bx_mail"),
+    ("Права файлов сайта (проверка)", "run_bx_perms"),
     None,
     ("Перевыпустить сертификаты (dehydrated)", "run_bx_ssl_renew"),
     ("MySQL: применить тюнинг", "run_bx_mysql_tune"),
+    ("Права файлов: починить (chown/chmod)", "run_bx_perms_fix"),
 ]
 
 
@@ -94,6 +97,25 @@ class BitrixMixin:
             return
         self._run_in_thread(bitrix_db_tables_report, self.bx_menu_btn,
                             self.checker, cache_key='bx_db_tables')
+
+    def run_bx_perms(self):
+        if not self.checker:
+            return
+        self._run_in_thread(bitrix_perms_report, self.bx_menu_btn, self.checker,
+                            cache_key='bx_perms')
+
+    def run_bx_perms_fix(self):
+        if not self.checker:
+            return
+        if messagebox.askyesno(
+            "Подтверждение",
+            "Перевести ВСЕ файлы /home/bitrix/www во владельца bitrix:bitrix и "
+            "выставить 755 каталогам / 644 файлам?\n"
+            "⚠️ На больших сайтах займёт 1-5 минут; индивидуально выставленные "
+            "права будут перезаписаны.",
+            parent=self.root
+        ):
+            self._run_in_thread(bitrix_perms_fix, self.bx_menu_btn, self.checker)
 
     def run_bx_php(self):
         if not self.checker:
