@@ -10,21 +10,144 @@ import ast
 import os
 import sys
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from support import FakeSSH
+import gui_swap as gs
 from gui_swap import SwapMixin
 
 
 class _Host(SwapMixin):
-    """Минимальный владелец миксина: у _do_* методов нужен только checker."""
+    """Владелец миксина: у _do_* нужен только checker, у публичных методов —
+    ещё dialog-обвязка; _run_simple записывается, поток не запускается."""
 
     def __init__(self, checker):
         self.checker = checker
-        self.swap_btn = None
-        self.fstab_btn = None
+        self.root = None
+        self.swap_btn = object()
+        self.fstab_btn = object()
+        self.simples = []
+
+    def _run_simple(self, func, btn=None, on_done=None, *args):
+        self.simples.append((func, btn, on_done, args))
+
+
+class _Dialogs:
+    """Двойник simpledialog: очередь ответов askstring + запись обращений."""
+
+    def __init__(self, answers=()):
+        self.answers = list(answers)
+        self.string_asks = []
+
+    def askstring(self, title, prompt, parent=None, initialvalue=None):
+        self.string_asks.append({'title': title, 'parent': parent})
+        return self.answers.pop(0) if self.answers else None
+
+
+class _Msg:
+    def __init__(self, askyesno_ret=True):
+        self.askyesno_ret = askyesno_ret
+        self.events = []   # (kind, title, msg)
+        self.asks = []
+
+    def askyesno(self, title, msg, parent=None):
+        self.asks.append((title, msg))
+        return self.askyesno_ret
+
+    def showerror(self, title, msg, parent=None):
+        self.events.append(('error', title, msg))
+
+
+def _patch(monkeypatch, answers=(), askyesno_ret=True):
+    dialogs = _Dialogs(answers)
+    msg = _Msg(askyesno_ret)
+    monkeypatch.setattr(gs, 'simpledialog', dialogs)
+    monkeypatch.setattr(gs, 'messagebox', msg)
+    return dialogs, msg
+
+
+# ==================== публичные методы: диалог и подтверждение =========
+#
+# Непокрытая часть модуля — обёртки create_swap/add_swap_to_fstab: guard по
+# подключению, разбор размера и подтверждение. Именно здесь рождается число,
+# которое потом уходит в fallocate, поэтому «abc» обязана быть отклонена ДО
+# фоновой задачи, а «Нет» в подтверждении — не запускать поток вовсе.
+
+
+class TestCreateSwapDialog:
+    def test_silent_without_connection(self, monkeypatch):
+        dialogs, msg = _patch(monkeypatch, answers=['1024'])
+        host = _Host(checker=None)
+        host.create_swap()
+        assert host.simples == []
+        assert dialogs.string_asks == []   # размер даже не спрашивали
+        assert msg.asks == []
+
+    def test_cancelled_size_launches_nothing(self, monkeypatch):
+        dialogs, msg = _patch(monkeypatch, answers=[None])
+        host = _Host(FakeSSH())
+        host.create_swap()
+        assert len(dialogs.string_asks) == 1
+        assert host.simples == [] and msg.asks == []
+
+    def test_blank_size_launches_nothing(self, monkeypatch):
+        # пустая строка — тот же отказ, что и «Отмена»: int('') не бросаем
+        _d, msg = _patch(monkeypatch, answers=[''])
+        host = _Host(FakeSSH())
+        host.create_swap()
+        assert host.simples == [] and msg.events == [] and msg.asks == []
+
+    def test_non_numeric_size_rejected_with_error(self, monkeypatch):
+        _d, msg = _patch(monkeypatch, answers=['abc'])
+        host = _Host(FakeSSH())
+        host.create_swap()
+        assert msg.events == [('error', 'Ошибка', 'Введите целое число')]
+        assert msg.asks == []          # до подтверждения не дошло
+        assert host.simples == []
+
+    def test_declined_confirmation_runs_no_thread(self, monkeypatch):
+        _d, msg = _patch(monkeypatch, answers=['1024'], askyesno_ret=False)
+        host = _Host(FakeSSH())
+        host.create_swap()
+        assert msg.asks                # спросил
+        assert host.simples == []      # и не сделал
+
+    def test_confirmed_passes_int_size_to_background(self, monkeypatch):
+        _d, msg = _patch(monkeypatch, answers=['2048'])
+        host = _Host(FakeSSH())
+        host.create_swap()
+        assert len(host.simples) == 1
+        fn, btn, on_done, args = host.simples[0]
+        assert fn == host._do_create_swap      # метод миксина, не голая функция
+        assert btn is host.swap_btn
+        assert on_done is None
+        assert args == (2048,)                 # именно int, а не строка
+        # в подтверждении — размер, который уйдёт в fallocate
+        assert '2048' in msg.asks[0][1]
+
+
+class TestAddSwapToFstabDialog:
+    def test_silent_without_connection(self, monkeypatch):
+        _patch(monkeypatch)
+        host = _Host(checker=None)
+        host.add_swap_to_fstab()
+        assert host.simples == []
+
+    def test_runs_in_background_without_confirmation(self, monkeypatch):
+        # метод идемпотентен (пишет только при отсутствии записи) — спрашивать
+        # нечего, уходит сразу в фон
+        _d, msg = _patch(monkeypatch)
+        host = _Host(FakeSSH())
+        host.add_swap_to_fstab()
+        assert len(host.simples) == 1
+        fn, btn, on_done, args = host.simples[0]
+        assert fn == host._do_add_swap_to_fstab
+        assert btn is host.fstab_btn
+        assert args == () and msg.asks == []
 
 
 # ==================== создание swap-файла ====================
