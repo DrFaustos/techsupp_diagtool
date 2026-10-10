@@ -262,3 +262,95 @@ class TestCancelClose:
 
     def test_close_without_client_is_quiet(self):
         _checker().close()  # не должно бросить
+
+
+# ==================== ветки «всё сломалось и молча живём» ====================
+#
+# В ssh_client четыре `except Exception: pass`. Каждая — не декорация: без неё
+# обрыв TCP или мёртвый канал роняет прогон посреди диагностики (а _busy в GUI
+# зависает навсегда). Именно их и не видно в coverage, пока двойники не начнут
+# бросать. Проверяем, что бросок из paramiko/TCP не выходит наружу и состояние
+# остаётся согласованным.
+
+class _Boom:
+    """Объект, у которого все методы бросают (замена канала/потока)."""
+
+    channel = None
+
+    def close(self):
+        raise OSError('channel already closed')
+
+    def read(self):
+        raise OSError('connection reset')
+
+
+class TestSwallowedErrors:
+    def test_cancel_with_dead_channel_still_flags_cancellation(self):
+        # канал умер до cancel(): close() бросает, но флаг отмены обязан встать,
+        # иначе следующая команда уйдёт на сервер вместо отмены
+        c = _checker()
+        c.connect()
+        c._current_channel = _Boom()
+        c.cancel()                      # не должно бросить
+        assert c.cancel_event.is_set()
+        with pytest.raises(Exception, match='Операция отменена'):
+            c.run('ls')
+
+    def test_load_host_keys_failure_does_not_block_connect(self, monkeypatch):
+        # ~/.ssh/known_hosts есть, но прочитать нельзя (права) — подключение
+        # с RejectPolicy всё равно должно состояться
+        monkeypatch.setattr(os.path, 'exists', lambda p: True)
+
+        def boom(self, path):
+            raise OSError('known_hosts unreadable')
+
+        monkeypatch.setattr(FakeSSHClient, 'load_host_keys', boom)
+        ok, msg = _checker().connect()
+        assert ok is True, msg
+        client = FakeSSHClient.instances[0]
+        assert client.policies == ['_Policy']   # политику это не отменило
+
+    def test_stream_read_failure_yields_empty_output_but_keeps_rc(self):
+        # оба потока бросают на read (обрыв посреди команды): вывод пустой,
+        # но канал живой — rc обязан прийти с канала (recv_exit_status), а
+        # наружу бросок не идёт
+        class _ReadBoomStream:
+            def __init__(self, channel):
+                self.channel = channel
+
+            def read(self):
+                raise OSError('connection reset')
+
+        c = _checker()
+        c.connect()
+        client = FakeSSHClient.instances[0]
+        channel = _Channel(exit_status=7)
+        client.exec_command = lambda cmd: (
+            None, _ReadBoomStream(channel), _ReadBoomStream(channel))
+        assert c.run('ls') == ('', '', 7)
+
+    def test_dead_channel_after_read_gives_rc_minus_one(self):
+        # и сам канал мёртв (recv_exit_status бросает) — rc = -1, не исключение
+        c = _checker()
+        c.connect()
+        client = FakeSSHClient.instances[0]
+        dead = _Channel(raise_status=True)
+        client.exec_command = lambda cmd: (None, _Boom(), _Boom())
+        # у _Boom.channel == None -> recv_exit_status бросает AttributeError,
+        # что ровно и воспроизводит «канал умер»: обработчик обязан дать -1
+        assert c.run('ls') == ('', '', -1)
+        assert dead  # канал в тесте не использовался, лишь бы не мешал
+
+    def test_close_failure_still_clears_client(self):
+        # client.close() бросает — клиент всё равно обязан быть сброшен в None,
+        # иначе GUI продолжит слать команды в мёртвое соединение
+        c = _checker()
+        c.connect()
+        client = FakeSSHClient.instances[0]
+
+        def boom():
+            raise OSError('close failed')
+
+        client.close = boom
+        c.close()                       # не должно бросить
+        assert c.client is None
