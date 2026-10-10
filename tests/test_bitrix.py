@@ -400,3 +400,122 @@ class TestMail:
         c = FakeSSH(routes=[('mailq', '-- 42 Messages')])
         out = bx.bitrix_mail_report(c)
         assert '42' in out and '⚠️' in out
+
+
+# ==================== установка cron-агентов ====================
+# Порядок маршрутов: игла '| crontab -' — подстрока КОМАНДЫ УСТАНОВКИ
+# ({ crontab -l 2>/dev/null; echo ...; } | crontab -), поэтому она обязана
+# стоять раньше 'crontab -l 2>/dev/null', иначе установка получила бы ответ
+# от маршрута чтения текущего crontab.
+def _install_routes(grep_out='', cur='', setup=('', '', 0)):
+    return [
+        ('| crontab -', setup),
+        ('crontab -l 2>/dev/null | grep', grep_out),
+        ('crontab -l 2>/dev/null', cur),
+        ('test -f', 'ok'),
+    ]
+
+
+class TestCronInstall:
+    def test_missing_script_does_not_touch_crontab(self):
+        c = FakeSSH()          # test -f -> '' (скрипта нет)
+        out = bx.bitrix_cron_install(c)
+        assert '❌' in out and 'cron.sh' in out
+        assert c.find('| crontab -') is None
+
+    def test_existing_entry_is_not_duplicated(self):
+        already = bx.CRON_LINE
+        c = FakeSSH(routes=_install_routes(cur=already + '\n'))
+        out = bx.bitrix_cron_install(c)
+        assert '⚠️' in out and 'дублировать' in out
+        assert c.find('| crontab -') is None
+
+    def test_installs_and_reads_back(self):
+        c = FakeSSH(routes=_install_routes(grep_out=bx.CRON_LINE))
+        out = bx.bitrix_cron_install(c)
+        assert '✅ Задание в crontab:' in out and 'Агенты начнут' in out
+        setup = c.find('| crontab -')
+        assert setup is not None
+        # строка в команде заэкранирована и доехала целиком
+        assert bx.CRON_LINE in shlex.split(setup)[-1] or bx.CRON_LINE in setup
+        assert c.find('crontab -l >') is not None      # бэкап до правки
+
+    def test_crontab_rejects_line(self):
+        c = FakeSSH(routes=_install_routes(setup=('bad field count', '', 1)))
+        out = bx.bitrix_cron_install(c)
+        assert '❌' in out and 'bad field count' in out
+
+    def test_silent_write_is_reported_missing(self):
+        # rc=0, но в crontab строки нет — верить на слово нельзя
+        c = FakeSSH(routes=_install_routes(grep_out=''))
+        out = bx.bitrix_cron_install(c)
+        assert '❌ Строка в crontab не появилась' in out
+
+    def test_report_and_install_share_one_line(self):
+        # отчёт рекомендует ровно то, что ставит кнопка
+        rep = bx.bitrix_cron_report(FakeSSH())
+        assert bx.CRON_LINE in rep
+
+
+# ==================== кеш (Redis / Memcached) ====================
+SETTINGS_REDIS = "<?php return array('type' => 'redis', 'host' => 'localhost');"
+SETTINGS_PLAIN = "<?php return array('type' => 'files');"
+
+
+class TestCache:
+    def test_detect_backends_needs_quoted_literal(self):
+        assert bx.detect_cache_backends(SETTINGS_REDIS) == ['redis']
+        assert bx.detect_cache_backends('"memcached"') == ['memcached']
+        # слово без кавычек — текст комментария, а не бэкенд
+        assert bx.detect_cache_backends('// redis отключён') == []
+        assert bx.detect_cache_backends('') == []
+        assert bx.detect_cache_backends(None) == []
+
+    def test_first_active_unit_prefers_debian_name(self):
+        # 'is-active redis' — подстрока 'is-active redis-server': порядок важен
+        c = FakeSSH(routes=[
+            ('is-active redis-server', 'active\n'),
+            ('is-active redis', 'inactive\n'),
+        ])
+        assert bx.first_active_unit(c, ('redis', 'redis-server')) == 'redis-server'
+
+    def test_first_active_unit_none(self):
+        assert bx.first_active_unit(FakeSSH(), ('redis',)) is None
+
+    def test_report_redis_ok(self):
+        c = FakeSSH(routes=[
+            ('cat', SETTINGS_REDIS),
+            ('redis-cli ping', 'PONG'),
+            ('is-active redis', 'active\n'),
+            ('du -sh', '2.1G\t/home/bitrix/www/bitrix/cache\n'),
+        ])
+        out = bx.bitrix_cache_report(c)
+        assert 'Бэкенд(ы) кеша в .settings.php: redis' in out
+        assert '✅ redis: служба redis активна' in out
+        assert '✅ redis-cli ping: PONG' in out
+        assert '• memcached: не используется' in out
+        assert 'bitrix/cache: 2.1G' in out
+
+    def test_report_backend_configured_but_down(self):
+        c = FakeSSH(routes=[('cat', SETTINGS_REDIS), ('is-active', 'inactive')])
+        out = bx.bitrix_cache_report(c)
+        assert '❌ redis в .settings.php указан, но служба не запущена' in out
+
+    def test_report_ping_not_pong(self):
+        c = FakeSSH(routes=[
+            ('cat', SETTINGS_REDIS),
+            ('is-active redis', 'active\n'),
+            ('redis-cli ping', "NOAUTH Authentication required."),
+        ])
+        out = bx.bitrix_cache_report(c)
+        assert '⚠️ redis-cli ping' in out
+
+    def test_report_no_backend_is_the_common_case(self):
+        c = FakeSSH(routes=[('cat', SETTINGS_PLAIN)])
+        out = bx.bitrix_cache_report(c)
+        assert '⚠️ В .settings.php кеш-бэкенда нет' in out
+
+    def test_report_unreadable_settings(self):
+        c = FakeSSH(routes=[('cat', ('', 'Permission denied', 1))])
+        out = bx.bitrix_cache_report(c)
+        assert '.settings.php не читается' in out

@@ -73,7 +73,8 @@ from bitrix import (  # noqa: F401
     bitrix_ssl_report, bitrix_ssl_renew,
     bitrix_mysql_report, bitrix_mysql_tune, bitrix_db_check,
     bitrix_db_tables_report,
-    bitrix_php_report, bitrix_cron_report, bitrix_mail_report,
+    bitrix_php_report, bitrix_cron_report, bitrix_cron_install,
+    bitrix_cache_report, bitrix_mail_report,
     bitrix_perms_report, bitrix_perms_fix,
 )
 
@@ -104,6 +105,13 @@ __all__ = [
     'ispmanager_check_cron_path', 'ispmanager_fix_cron_path',
     'fastpanel_unit', 'find_fastpanel_logs', 'fastpanel_restart',
     'fastpanel_logs', 'fastpanel_status', 'fastpanel_restart_web',
+    'detect_bitrix_env', 'bitrix_sites', 'bitrix_sites_report',
+    'bitrix_ssl_report', 'bitrix_ssl_renew',
+    'bitrix_mysql_report', 'bitrix_mysql_tune', 'bitrix_db_check',
+    'bitrix_db_tables_report',
+    'bitrix_php_report', 'bitrix_cron_report', 'bitrix_cron_install',
+    'bitrix_cache_report', 'bitrix_mail_report',
+    'bitrix_perms_report', 'bitrix_perms_fix',
     'full_diagnostic_report',
     'ssl_cert_report', 'whois_report', 'port_scan_report',
     'grep_logs_report', 'list_common_reports',

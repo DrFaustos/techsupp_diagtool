@@ -14,7 +14,8 @@ from diagnostic import (
     bitrix_ssl_report, bitrix_ssl_renew,
     bitrix_mysql_report, bitrix_mysql_tune, bitrix_db_check,
     bitrix_db_tables_report,
-    bitrix_php_report, bitrix_cron_report, bitrix_mail_report,
+    bitrix_php_report, bitrix_cron_report, bitrix_cron_install,
+    bitrix_cache_report, bitrix_mail_report,
     bitrix_perms_report, bitrix_perms_fix,
 )
 
@@ -24,6 +25,7 @@ BITRIX_MENU = [
     ("Сайты в BitrixVM", "run_bx_sites"),
     ("SSL Let's Encrypt: состояние", "run_bx_ssl"),
     ("MySQL: состояние и рекомендация", "run_bx_mysql"),
+    ("Кеш: Redis / Memcached", "run_bx_cache"),
     ("Доступ к базе (dbconn.php)", "run_bx_db"),
     ("Топ-таблицы базы (размер)", "run_bx_db_tables"),
     ("PHP: параметры и модули", "run_bx_php"),
@@ -33,6 +35,7 @@ BITRIX_MENU = [
     None,
     ("Перевыпустить сертификаты (dehydrated)", "run_bx_ssl_renew"),
     ("MySQL: применить тюнинг", "run_bx_mysql_tune"),
+    ("Cron-агенты: установить в crontab", "run_bx_cron_install"),
     ("Права файлов: починить (chown/chmod)", "run_bx_perms_fix"),
 ]
 
@@ -87,6 +90,12 @@ class BitrixMixin:
         self._run_in_thread(bitrix_mysql_report, self.bx_menu_btn, self.checker,
                             cache_key='bx_mysql')
 
+    def run_bx_cache(self):
+        if not self.checker:
+            return
+        self._run_in_thread(bitrix_cache_report, self.bx_menu_btn, self.checker,
+                            cache_key='bx_cache')
+
     def run_bx_db(self):
         if not self.checker:
             return
@@ -128,6 +137,19 @@ class BitrixMixin:
             return
         self._run_in_thread(bitrix_cron_report, self.bx_menu_btn, self.checker,
                             cache_key='bx_cron')
+
+    def run_bx_cron_install(self):
+        if not self.checker:
+            return
+        if messagebox.askyesno(
+            "Подтверждение",
+            "Дописать в crontab root строку запуска cron.sh (агенты Битрикса)?\n"
+            "⚠️ Текущий crontab сохраняется в бэкап перед правкой; дубликат "
+            "создано не будет, если задание уже есть.",
+            parent=self.root
+        ):
+            self._run_in_thread(bitrix_cron_install, self.bx_menu_btn,
+                                self.checker)
 
     def run_bx_mail(self):
         if not self.checker:

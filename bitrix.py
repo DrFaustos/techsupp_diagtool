@@ -9,7 +9,7 @@ Access denied для пользователя БД из dbconn.php, молчащ
 import re
 from datetime import datetime, timezone
 
-from common import q, write_remote_file
+from common import q, save_crontab_backup, write_remote_file
 
 # ==================== ПУТИ BITRIXVM ====================
 # Раскладку не «исправляем»: в реальном BitrixVM каталог vhost'ов пишется с
@@ -27,6 +27,11 @@ MYSQL_CNF_DIR = '/etc/my.cnf.d'
 TUNE_FILE = f'{MYSQL_CNF_DIR}/bitrix-tuning.cnf'
 DBCHECK_CNF = '/tmp/.techsupp_dbcheck.cnf'
 CRON_SH = f'{BITRIX_DOCROOT}/bitrix/modules/main/tools/cron.sh'
+SETTINGS_PATH = f'{BITRIX_DOCROOT}/bitrix/.settings.php'
+
+# Строка, которую Битрикс рекомендует держать в crontab root для агентов.
+# Один литерал на весь модуль: отчёт и установка обязаны предлагать одно.
+CRON_LINE = f'*/1 * * * * sudo -u bitrix {CRON_SH} >/dev/null 2>&1'
 
 # Параметры PHP, на которые смотрит тест «Битрикс» и которые чаще всего ломают
 # загрузку каталога/импорта.
@@ -648,7 +653,121 @@ def bitrix_cron_report(checker):
         lines.append('⚠️ Задания cron.sh в crontab нет: агенты крутятся на каждом')
         lines.append('   хите и тормозят отдачу страниц. Рекомендуемая строка')
         lines.append('   (crontab -e от root):')
-        lines.append(f'   */1 * * * * sudo -u bitrix {CRON_SH} >/dev/null 2>&1')
+        lines.append(f'   {CRON_LINE}')
+    return '\n'.join(lines)
+
+
+def bitrix_cron_install(checker):
+    """Добавить cron.sh в crontab root: агенты перестают крутиться на каждом хите.
+
+    Задание ищется по полному пути скрипта: второе такое же заставило бы
+    агентов бежать дважды. Перед правкой crontab уходит в бэкап (common),
+    после — строка читается обратно, а не верится на слово.
+    """
+    lines = ['=== УСТАНОВКА CRON-АГЕНТОВ В CRONTAB ===']
+    out, _, _ = checker.run(f'test -f {q(CRON_SH)} && echo ok')
+    if out.strip() != 'ok':
+        lines.append(f'❌ {CRON_SH} не найден — добавлять в cron нечего')
+        return '\n'.join(lines)
+
+    out, _, _ = checker.run('crontab -l 2>/dev/null')
+    existing = [ln for ln in out.splitlines() if CRON_SH in ln]
+    if existing:
+        lines.append('⚠️ Задание cron.sh уже есть в crontab, дублировать не буду:')
+        lines.extend('   ' + ln for ln in existing)
+        return '\n'.join(lines)
+
+    backup = save_crontab_backup(checker)
+    lines.append(f'✅ Резервная копия crontab: {backup}' if backup
+                 else '⚠️ Текущий crontab пуст — бэкап не требуется')
+
+    out, err, rc = checker.run(
+        f'{{ crontab -l 2>/dev/null; echo {q(CRON_LINE)}; }} | crontab - 2>&1')
+    if rc != 0:
+        lines.append(f'❌ crontab не принял строку (rc={rc}): '
+                     f'{(out or err).strip() or "нет вывода"}')
+        return '\n'.join(lines)
+
+    out, _, _ = checker.run('crontab -l 2>/dev/null | grep -F cron.sh')
+    if out.strip():
+        lines.append('✅ Задание в crontab:')
+        lines.append(out.strip())
+        lines.append('💡 Агенты начнут отрабатывать в течение минуты; сверьте '
+                     'Настройки → Производительность → Агенты в админке.')
+    else:
+        lines.append('❌ Строка в crontab не появилась — проверьте crontab -l '
+                     'вручную')
+    return '\n'.join(lines)
+
+
+# ==================== КЕШ ====================
+# Бэкенды кеша Битрикс прописывает в .settings.php строковыми литералами —
+# ищем вместе с кавычками, чтобы не поймать слово redis в обычном тексте.
+CACHE_BACKENDS = ('redis', 'memcached', 'apcu', 'xcache')
+
+# Служба в CentOS (база BitrixVM) называется redis, в Debian/Ubuntu —
+# redis-server; спрашиваем варианты по очереди.
+CACHE_UNITS = {
+    'redis': ('redis', 'redis-server'),
+    'memcached': ('memcached',),
+}
+
+# Каталоги файлового кеша: их размер виден даже без доступа к базе.
+CACHE_DIRS = ('bitrix/cache', 'bitrix/managed_cache', 'bitrix/merged_cache')
+
+
+def detect_cache_backends(text):
+    """Бэкенды кеша, упомянутые в .settings.php как строковый литерал."""
+    low = (text or '').lower()
+    return [name for name in CACHE_BACKENDS
+            if f"'{name}'" in low or f'"{name}"' in low]
+
+
+def first_active_unit(checker, names):
+    """Первый запущенный systemd-юнит из candidates (или None)."""
+    for unit in names:
+        out, _, _ = checker.run(f'systemctl is-active {q(unit)} 2>/dev/null')
+        if out.strip() == 'active':
+            return unit
+    return None
+
+
+def bitrix_cache_report(checker):
+    lines = ['=== КЕШ БИТРИКС (Redis / Memcached) ===']
+    out, _, rc = checker.run(f'cat {q(SETTINGS_PATH)} 2>/dev/null')
+    backends = []
+    if rc != 0 or not out.strip():
+        lines.append(f'⚠️ {SETTINGS_PATH} не читается — проверьте, что сайт в '
+                     f'{BITRIX_DOCROOT}')
+    else:
+        backends = detect_cache_backends(out)
+        lines.append('Бэкенд(ы) кеша в .settings.php: ' + ', '.join(backends)
+                     if backends else
+                     '⚠️ В .settings.php кеш-бэкенда нет: всё пишется в файлы — '
+                     'на нагруженном сайте это главная причина тормозов')
+
+    for backend in ('redis', 'memcached'):
+        units = CACHE_UNITS[backend]
+        unit = first_active_unit(checker, units)
+        if unit:
+            lines.append(f'✅ {backend}: служба {unit} активна')
+            if backend == 'redis':
+                out, _, _ = checker.run('redis-cli ping 2>&1 | head -1')
+                pong = out.strip()
+                if pong:
+                    mark = '✅' if 'PONG' in pong.upper() else '⚠️'
+                    lines.append(f'{mark} redis-cli ping: {pong}')
+        elif backend in backends:
+            lines.append(f'❌ {backend} в .settings.php указан, но служба не '
+                         f'запущена ({", ".join(units)})')
+        else:
+            lines.append(f'• {backend}: не используется')
+
+    for rel in CACHE_DIRS:
+        path = f'{BITRIX_DOCROOT}/{rel}'
+        out, _, _ = checker.run(f'du -sh {q(path)} 2>/dev/null')
+        if out.strip():
+            lines.append(f'{rel}: {out.strip().split()[0]}')
     return '\n'.join(lines)
 
 
