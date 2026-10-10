@@ -75,7 +75,7 @@ from bitrix import (  # noqa: F401
     bitrix_db_tables_report,
     bitrix_db_grants_report, bitrix_db_grants_fix,
     bitrix_php_report, bitrix_cron_report, bitrix_cron_install,
-    bitrix_cache_report, bitrix_mail_report,
+    bitrix_cache_report, bitrix_mail_report, bitrix_mail_send_test,
     bitrix_perms_report, bitrix_perms_fix,
 )
 
@@ -112,7 +112,7 @@ __all__ = [
     'bitrix_db_tables_report',
     'bitrix_db_grants_report', 'bitrix_db_grants_fix',
     'bitrix_php_report', 'bitrix_cron_report', 'bitrix_cron_install',
-    'bitrix_cache_report', 'bitrix_mail_report',
+    'bitrix_cache_report', 'bitrix_mail_report', 'bitrix_mail_send_test',
     'bitrix_perms_report', 'bitrix_perms_fix',
     'full_diagnostic_report',
     'ssl_cert_report', 'whois_report', 'port_scan_report',

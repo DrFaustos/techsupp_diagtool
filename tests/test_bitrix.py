@@ -632,6 +632,101 @@ class TestMail:
         assert '42' in out and '⚠️' in out
 
 
+# ==================== почта: тест отправки ====================
+SENT_ENTRY = ('Oct 10 12:00:01 host postfix/smtp[123]: AAA111: '
+              'to=<operator@example.com>, relay=mx.example.com[1.2.3.4]:25, '
+              'status=sent (250 2.0.0 Ok)')
+BOUNCE_ENTRY = ('Oct 10 12:00:01 host postfix/smtp[123]: AAA111: '
+                'to=<operator@example.com>, relay=none, '
+                'status=bounced (host not found)')
+
+# 'printf %s' — команда отправки; '/var/log/maillog' — поиск записи теста;
+# 'journalctl -u postfix -n 50' — fallback; 'mailq' — очередь.
+_MAIL_SEND_ROUTES = [
+    ('command -v sendmail', '/usr/sbin/sendmail'),
+]
+
+
+def _send_routes(log_entry='', queue='Mail queue is empty', send_rc=0):
+    return _MAIL_SEND_ROUTES + [
+        ('printf %s', ('', '', send_rc)),
+        ('/var/log/maillog', log_entry),
+        ('journalctl -u postfix -n 50', ''),
+        ('mailq 2>&1', queue),
+    ]
+
+
+class TestMailSend:
+    def test_valid_email(self):
+        assert bx.valid_email('a@b.ru') and bx.valid_email('op+1@site.co.uk')
+        assert not bx.valid_email('a@b')            # без точки в домене
+        assert not bx.valid_email('a@b.ru; rm - /')  # пробелы/точки с запятой
+        assert not bx.valid_email('@b.ru') and not bx.valid_email('')
+        assert not bx.valid_email(None)
+
+    def test_bad_email_sends_nothing(self):
+        c = FakeSSH()
+        out = bx.bitrix_mail_send_test(c, 'плохой адрес')
+        assert '❌' in out and 'не отправляю' in out
+        assert c.commands == []                     # ни одной команды
+
+    def test_no_sendmail(self):
+        c = FakeSSH()                               # command -v -> пусто
+        out = bx.bitrix_mail_send_test(c, 'op@example.com')
+        assert '❌ sendmail не найден' in out
+        assert c.find('printf %s') is None
+
+    def test_sendmail_failure_reported(self):
+        c = FakeSSH(routes=_send_routes(send_rc=1))
+        out = bx.bitrix_mail_send_test(c, 'op@example.com')
+        assert '❌ sendmail вернул rc=1' in out
+
+    def test_sent_status_is_success(self):
+        c = FakeSSH(routes=_send_routes(log_entry=SENT_ENTRY))
+        out = bx.bitrix_mail_send_test(c, 'operator@example.com')
+        assert '✅ Письмо ушло с сервера (status=sent)' in out
+        assert 'SPF/PTR' in out                     # подсказка про «не дошло»
+        # поиск записи шёл по точному получателю
+        log_cmd = c.find('/var/log/maillog')
+        assert log_cmd is not None
+        assert 'to=<operator@example.com>' in log_cmd
+        # письмо собиралось через q(): переносы строк доехали экранированными;
+        # формат команды: printf %s <msg> | /usr/sbin/sendmail -t 2>&1
+        send_cmd = c.find('printf %s')
+        assert send_cmd is not None
+        tokens = shlex.split(send_cmd)
+        assert tokens[:2] == ['printf', '%s']
+        assert '/usr/sbin/sendmail' in tokens
+        assert 'Subject: ' + bx.MAIL_TEST_SUBJECT in tokens[2]
+
+    def test_bounce_is_red(self):
+        c = FakeSSH(routes=_send_routes(log_entry=BOUNCE_ENTRY))
+        out = bx.bitrix_mail_send_test(c, 'operator@example.com')
+        assert '❌ Письмо отбито (status=bounced)' in out
+
+    def test_no_entry_but_queued(self):
+        c = FakeSSH(routes=_send_routes(queue='-- 3 Messages'))
+        out = bx.bitrix_mail_send_test(c, 'operator@example.com')
+        assert '⚠️ В очереди 3 писем' in out
+
+    def test_no_entry_empty_queue_points_to_mail_log(self):
+        # Debian пишет в /var/log/mail.log, а мы его не читаем — честная подсказка
+        c = FakeSSH(routes=_send_routes())
+        out = bx.bitrix_mail_send_test(c, 'operator@example.com')
+        assert '/var/log/mail.log' in out and 'ls -l /var/log/mail*' in out
+
+    def test_log_and_mailq_both_dead(self):
+        c = FakeSSH(routes=[
+            ('command -v sendmail', '/usr/sbin/sendmail'),
+            ('printf %s', ('', '', 0)),
+            ('/var/log/maillog', ''),
+            ('journalctl -u postfix -n 50', ''),
+            ('mailq 2>&1', 'postqueue: fatal: unable to connect'),
+        ])
+        out = bx.bitrix_mail_send_test(c, 'operator@example.com')
+        assert '⚠️ Ни лог, ни mailq не отвечают' in out
+
+
 # ==================== установка cron-агентов ====================
 # Порядок маршрутов: игла '| crontab -' — подстрока КОМАНДЫ УСТАНОВКИ
 # ({ crontab -l 2>/dev/null; echo ...; } | crontab -), поэтому она обязана

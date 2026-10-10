@@ -7,7 +7,7 @@ Backend-функции живут в bitrix.py; здесь — состав ме
 
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 
 from diagnostic import (
     detect_bitrix_env, bitrix_sites_report,
@@ -16,7 +16,7 @@ from diagnostic import (
     bitrix_db_tables_report,
     bitrix_db_grants_report, bitrix_db_grants_fix,
     bitrix_php_report, bitrix_cron_report, bitrix_cron_install,
-    bitrix_cache_report, bitrix_mail_report,
+    bitrix_cache_report, bitrix_mail_report, bitrix_mail_send_test,
     bitrix_perms_report, bitrix_perms_fix,
 )
 
@@ -38,6 +38,7 @@ BITRIX_MENU = [
     ("Перевыпустить сертификаты (dehydrated)", "run_bx_ssl_renew"),
     ("MySQL: применить тюнинг", "run_bx_mysql_tune"),
     ("Права на базу: выдать недостающие", "run_bx_db_grants_fix"),
+    ("Почта: отправить тестовое письмо", "run_bx_mail_test"),
     ("Cron-агенты: установить в crontab", "run_bx_cron_install"),
     ("Права файлов: починить (chown/chmod)", "run_bx_perms_fix"),
 ]
@@ -165,6 +166,20 @@ class BitrixMixin:
             return
         self._run_in_thread(bitrix_mail_report, self.bx_menu_btn, self.checker,
                             cache_key='bx_mail')
+
+    def run_bx_mail_test(self):
+        # Адрес спрашиваем ДО запуска фона: _run_in_thread не умеет диалоги,
+        # а без адреса отправлять нечего.
+        if not self.checker:
+            return
+        addr = simpledialog.askstring(
+            "Тест отправки почты",
+            "Отправить тестовое письмо на адрес:",
+            parent=self.root)
+        if not addr or not addr.strip():
+            return
+        self._run_in_thread(bitrix_mail_send_test, self.bx_menu_btn,
+                            self.checker, addr.strip())
 
     def run_bx_ssl_renew(self):
         if not self.checker:

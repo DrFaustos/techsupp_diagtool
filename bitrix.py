@@ -1064,3 +1064,89 @@ def bitrix_mail_report(checker):
             lines.append('--- journalctl -u postfix (15 строк) ---')
             lines.append(out.strip())
     return '\n'.join(lines)
+
+
+# ==================== ПОЧТА: ТЕСТ ОТПРАВКИ ====================
+# Адрес валидируется ДО отправки: он попадёт в заголовок To: и в grep по логу.
+# Регулярка сознательно строгая: кавычек и пробелов в наборе нет, так что
+# экранирование q() — вторая линия защиты, а не единственная.
+EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$')
+MAIL_TEST_SUBJECT = 'ServerDiagnostic: test message'
+
+
+def valid_email(addr):
+    """True, если строка проходит базовую форму e-mail."""
+    return bool(addr) and bool(EMAIL_RE.match(str(addr).strip()))
+
+
+def bitrix_mail_send_test(checker, to_addr):
+    """Отправить тестовое письмо и разобрать запись postfix о нём.
+
+    Передаёт письмо в sendmail postfix, затем читает лог (CentOS — maillog,
+    Debian — journalctl) и mailq. rc=0 у sendmail означает лишь «postfix
+    принял», а не «дошло»: поэтому ответ всегда по записи лога, с status.
+    """
+    lines = ['=== ПОЧТА: ТЕСТ ОТПРАВКИ ===']
+    addr = (to_addr or '').strip()
+    if not valid_email(addr):
+        lines.append(f'❌ {addr!r} не похоже на e-mail — не отправляю')
+        return '\n'.join(lines)
+
+    out, _, _ = checker.run('command -v sendmail')
+    sendmail = out.strip()
+    if not sendmail:
+        lines.append('❌ sendmail не найден в PATH — postfix обычно даёт '
+                     '/usr/sbin/sendmail; проверьте, что postfix установлен')
+        return '\n'.join(lines)
+
+    msg = (f'To: {addr}\nSubject: {MAIL_TEST_SUBJECT}\n\n'
+           'Test message from ServerDiagnostic: if you see it, mail leaves '
+           'the server.\n')
+    out, err, rc = checker.run(f'printf %s {q(msg)} | {q(sendmail)} -t 2>&1')
+    if rc != 0:
+        lines.append(f'❌ sendmail вернул rc={rc}: '
+                     + ((out or err).strip() or 'нет вывода'))
+        return '\n'.join(lines)
+    lines.append('✅ Письмо передано в postfix (rc=0) — но это «принято», '
+                 'смотрим, что было дальше...')
+
+    # Запись теста ищем по точному получателю: в плотном потоке чужих писем
+    # общий tail по логу бесполезен.
+    needle = f'to=<{addr}>'
+    out, _, _ = checker.run(
+        f'tail -n 50 /var/log/maillog 2>/dev/null '
+        f'| grep -F {q(needle)} | tail -3')
+    entry = out.strip()
+    if not entry:
+        out, _, _ = checker.run(
+            f'journalctl -u postfix -n 50 --no-pager 2>/dev/null '
+            f'| grep -F {q(needle)} | tail -3')
+        entry = out.strip()
+
+    out, _, _ = checker.run('mailq 2>&1')
+    count = parse_mailq_count(out)
+
+    if entry:
+        lines.append('--- запись лога о тестовом письме ---')
+        lines.append(entry)
+        if 'status=sent' in entry:
+            lines.append('✅ Письмо ушло с сервера (status=sent). Если адресат '
+                         'его не видит — причина дальше: SPF/PTR, спам-фильтр, '
+                         'blacklist IP.')
+        elif 'status=bounced' in entry:
+            lines.append('❌ Письмо отбито (status=bounced) — причина в строке '
+                         'выше (адресат, relay, спам-фильтр).')
+        else:
+            lines.append('⚠️ Запись есть, но без знакомого status — смотрите '
+                         'полную строку лога.')
+    elif count:
+        lines.append(f'⚠️ В очереди {count} писем, теста в логе не видно: '
+                     'postfix ещё не добрался — вернётесь к отчёту через минуту.')
+    elif count == 0:
+        lines.append('⚠️ Очередь пуста, но записи теста ни в maillog, ни в '
+                     'journalctl нет — лог может писаться в /var/log/mail.log; '
+                     'проверьте ls -l /var/log/mail*')
+    else:
+        lines.append('⚠️ Ни лог, ни mailq не отвечают — проверьте вручную: '
+                     'mailq; ls -l /var/log/mail*')
+    return '\n'.join(lines)
