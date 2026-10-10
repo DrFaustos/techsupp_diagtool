@@ -129,8 +129,10 @@ class TestNoLostSelfAttributes:
         """
         from gui_isp import ISPMANAGER_MENU
         from gui_fastpanel import FASTPANEL_MENU
+        from gui_bitrix import BITRIX_MENU
         for name, items in (('ISPMANAGER_MENU', ISPMANAGER_MENU),
-                            ('FASTPANEL_MENU', FASTPANEL_MENU)):
+                            ('FASTPANEL_MENU', FASTPANEL_MENU),
+                            ('BITRIX_MENU', BITRIX_MENU)):
             methods = [m for item in items if item is not None for m in (item[1],)]
             assert methods, f'{name} пуст'
             lost = sorted(m for m in methods if not hasattr(gui_mod.DiagnosticApp, m))
@@ -181,6 +183,7 @@ class TestWindowBuilds:
                      'disk_btn', 'send_btn', 'cancel_btn', 'ispmanager_frame',
                      'isp_menu_btn', 'isp_menu',
                      'fastpanel_frame', 'fp_menu_btn', 'fp_menu',
+                     'bitrix_frame', 'bx_menu_btn', 'bx_menu',
                      'ip_var', 'port_var', 'user_var', 'password_var', 'key_var'):
             assert hasattr(app, attr), f'нет виджета/поля {attr}'
 
@@ -189,7 +192,7 @@ class TestWindowBuilds:
         assert app.checker is None
         for attr in ('full_btn', 'disk_btn', 'network_btn', 'firewall_btn',
                      'logs_btn', 'send_btn', 'cancel_btn',
-                     'isp_menu_btn', 'fp_menu_btn'):
+                     'isp_menu_btn', 'fp_menu_btn', 'bx_menu_btn'):
             # cget отдаёт Tcl-объект, а не str — сравниваем приведённое значение
             state = str(getattr(app, attr).cget('state'))
             assert state == tk.DISABLED, f'{attr} активен до подключения ({state})'

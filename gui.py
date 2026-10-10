@@ -18,11 +18,12 @@ from gui_dns import DnsMixin
 from gui_admin import AdminMixin
 from gui_isp import IspmanagerMixin, ISPMANAGER_MENU
 from gui_fastpanel import FastpanelMixin, FASTPANEL_MENU
+from gui_bitrix import BitrixMixin, BITRIX_MENU
 from gui_files import FilesMixin
 from common import __version__
 
 
-class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin, FastpanelMixin, FilesMixin):
+class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin, FastpanelMixin, BitrixMixin, FilesMixin):
     def __init__(self):
         self.initial_theme = detect_system_theme()
         self.root = tb.Window(themename=self.initial_theme)
@@ -451,6 +452,14 @@ class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, Checks
         self.fastpanel_frame.pack_forget()
         self.fp_menu_btn, self.fp_menu = self._build_panel_menu(
             self.fastpanel_frame, "🛠 FastPanel ▾", "info", FASTPANEL_MENU)
+
+        # Меню «Битрикс» видно только на BitrixVM — включает _detect_bitrix()
+        # после подключения (gui_runner._on_connect_success).
+        self.bitrix_frame = tb.Frame(btn_frame, bootstyle="secondary")
+        self.bitrix_frame.pack(side=tk.LEFT, padx=5)
+        self.bitrix_frame.pack_forget()
+        self.bx_menu_btn, self.bx_menu = self._build_panel_menu(
+            self.bitrix_frame, "🧩 Битрикс ▾", "success", BITRIX_MENU)
 
         # ---------- КНОПКИ SWAP ----------
         swap_frame = tb.Frame(self.root, bootstyle="secondary")

@@ -2,7 +2,7 @@
 
 [![тесты](https://img.shields.io/github/actions/workflow/status/DrFaustos/techsupp_diagtool/tests.yml?branch=main&label=tests)](https://github.com/DrFaustos/techsupp_diagtool/actions/workflows/tests.yml) [![Лицензия: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python 3.7+](https://img.shields.io/badge/python-3.7%2B-blue)](https://www.python.org/downloads/)
 
-Многофункциональный инструмент для диагностики и администрирования удалённых серверов через SSH с поддержкой панелей управления **FastPanel** и **ISPmanager**.
+Многофункциональный инструмент для диагностики и администрирования удалённых серверов через SSH с поддержкой панелей управления **FastPanel** и **ISPmanager** и набором проверок для серверов **1С-Битрикс (BitrixVM)**.
 
 ---
 
@@ -55,6 +55,21 @@
 - Отключение панели (`chmod -x /usr/local/mgr5/bin/core && killall core && killall ihttpd`)
 - Отключение модуля авторизации GeoIP (`usrparam setgeoip=off sok=ok`)
 - Проверка и исправление переменной PATH в crontab (для корректной работы SSL)
+
+### 🧩 1С-Битрикс (BitrixVM)
+Меню «🧩 Битрикс ▾» появляется автоматически, если на сервере найдены
+`/opt/webdir` и `/home/bitrix`:
+- **SSL Let's Encrypt** — срок остатка сертификатов dehydrated, хвост
+  `dehydrated_update.log`, задание cron, перевыпуск `dehydrated -c`
+- **MySQL** — `innodb_buffer_pool_size` и hit ratio InnoDB, рекомендация от объёма
+  RAM (40%, округление до chunk 128M); «применить тюнинг» пишет
+  `/etc/my.cnf.d/bitrix-tuning.cnf`, не трогая текущий `my.cnf`
+- **Доступ к базе** — проверка подключения реквизитами из `dbconn.php` (`SELECT 1`);
+  пароль передаётся временным файлом 0600 и не попадает ни в командную строку, ни в
+  отчёт; при Access denied подсказывает `SHOW GRANTS`/`GRANT`
+- **PHP** — версия, параметры `/opt/php*`, обязательные модули из check.php
+- **Cron-агенты** — наличие задания `cron.sh` (без него агенты крутятся на каждом хите)
+- **Почта** — состояние postfix, глубина очереди `mailq`, хвост `/var/log/maillog`
 
 ### 💾 Управление Swap
 - Создание swap-файла с указанием размера (проверка свободного места)
@@ -125,7 +140,9 @@ Diagn/
 ├── gui_swap.py         # Swap и fstab
 ├── gui_dns.py          # DNS-проверки и резолверы
 ├── gui_admin.py        # Замена IP, перезапуск служб, редактор конфигов
-├── gui_isp.py          # Кнопки ISPmanager
+├── gui_isp.py          # Меню ISPmanager
+├── gui_fastpanel.py    # Меню FastPanel
+├── gui_bitrix.py       # Меню «Битрикс» (BitrixVM)
 ├── gui_files.py        # Файловый менеджер (окно, операции)
 ├── fmanager.py         # Файловые операции SFTP + строки таблицы
 ├── diagnostic.py       # Фасад диагностики (реэкспорт, обратная совместимость)
@@ -134,7 +151,8 @@ Diagn/
 ├── logs.py             # Поиск/анализ логов, домены, поиск OOM
 ├── dns.py              # DNS-проверки и работа с резолверами
 ├── files.py            # Файлы, конфиги, замена IP, перезапуск служб
-├── panels.py           # Управление панелью ISPmanager
+├── panels.py           # Управление панелями ISPmanager и FastPanel
+├── bitrix.py           # Диагностика BitrixVM: SSL, MySQL, БД, PHP, cron, почта
 ├── reports.py          # Сводный отчёт по диагностике
 ├── webcheck.py         # SSL-сертификаты, WHOIS, порты, grep логов
 ├── ssh_client.py       # SSH-подключение (Paramiko)
@@ -157,7 +175,9 @@ Diagn/
 | gui_swap.py | Swap: создание файла подкачки и запись в `/etc/fstab` |
 | gui_dns.py | DNS: проверка доменов, резолверы сервера, диалог их замены |
 | gui_admin.py | Администрирование: замена IPv4/IPv6, перезапуск служб, bash-история, редактор конфигов |
-| gui_isp.py | Панель ISPmanager: перезапуск, kill core, обновление, SSL, отключение, GeoIP, cron |
+| gui_isp.py | Меню ISPmanager: перезапуск, kill core, обновление, SSL, отключение, GeoIP, cron |
+| gui_fastpanel.py | Меню FastPanel: состояние панели и стека, логи, перезапуск панели и nginx+php-fpm |
+| gui_bitrix.py | Меню «Битрикс»: SSL dehydrated, MySQL, доступ к базе, PHP, cron-агенты, почта |
 | gui_files.py | Файловый менеджер сервера по SFTP: навигация, правка текстовых файлов, скачать/загрузить |
 | fmanager.py | Файловые операции SFTP (list/mkdir/create/delete/rename/get/put) и подготовка строк таблицы |
 | diagnostic.py | Фасад: реэкспортирует функции из модулей ниже (сохранён для совместимости) |
@@ -166,7 +186,8 @@ Diagn/
 | logs.py | find_logs, analyze_access_log, get_domains, check_site_logs, search_oom_logs |
 | dns.py | dns_report, dns_report_local, dns_resolvers_report, set_dns_resolvers |
 | files.py | read_file, write_file, get_config_files, replace_ipv4/ipv6, restart_services |
-| panels.py | Функции управления ISPmanager (restart, update, ssl, disable и т.д.) |
+| panels.py | Функции управления ISPmanager и FastPanel (restart, status, logs, ssl и т.д.) |
+| bitrix.py | Диагностика BitrixVM: dehydrated, тюнинг InnoDB, dbconn.php, PHP, cron.sh, postfix |
 | reports.py | full_diagnostic_report — сводный отчёт |
 | ssh_client.py | Класс SSH-подключения через Paramiko (exec_command + run с кодом возврата) |
 | tests/ | Юнит-тесты (pytest) для чистых функций |
@@ -192,7 +213,8 @@ Diagn/
 | Диагностика | Полная диагностика, Диски и память, Сеть, Фаервол, Конфиги веб, Логи сайтов, Анализ логов доступа, Поиск OOM |
 | DNS | DNS-проверка, DNS-резолверы, Изменить DNS |
 | Администрирование | Заменить IPv4, Заменить IPv6, Перезапустить службы, Редактор конфигов, Файлы |
-| ISPmanager | Перезапустить панель, Kill core, Обновить панель, Выпуск SSL, Отключить панель, Отключить GeoIP, Проверить CRON, Исправить CRON |
+| Панели | 🛠 ISPmanager ▾ (перезапустить, kill core, обновить, выпуск SSL, отключить, GeoIP, CRON PATH), 🛠 FastPanel ▾ (состояние, логи, перезапуск панели, nginx+php-fpm) |
+| 1С-Битрикс | 🧩 Битрикс ▾ (сайты, SSL dehydrated, MySQL, доступ к базе, PHP, cron-агенты, почта) — видно на BitrixVM |
 | Swap | Создать swap файл, Прописать swap в fstab |
 | Доп. проверки | SSL-сертификат, WHOIS, Порты, Grep логов |
 | Терминал | Send, История |
@@ -229,6 +251,15 @@ Diagn/
 - Поиск доменов через `mgrctl -m webdomain list` или в `/etc/nginx/vhosts/*/*.conf`
 - Логи сайтов в `/var/www/httpd-logs/domain.log`
 - Полный набор кнопок управления панелью
+
+### 1С-Битрикс (BitrixVM)
+- Определение по наличию `/opt/webdir` и `/home/bitrix` — меню «🧩 Битрикс ▾»
+  появляется само, независимо от определённой панели
+- Сертификаты выпускает `dehydrated` (не certbot): `/home/bitrix/dehydrated`,
+  лог `/home/bitrix/dehydrated_update.log`
+- Реквизиты базы — в `/home/bitrix/www/bitrix/php_interface/dbconn.php`
+- PHP-сборки лежат в `/opt/php*`, конфиги сайтов — в `/etc/nginx/bx/site_avaliable`
+  (историческая опечатка в имени каталога — на части сборок другой нет)
 
 ### Без панели
 - Определение доменов из стандартных конфигов nginx/apache

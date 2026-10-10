@@ -93,6 +93,8 @@ class RunnerMixin:
 
         # Меню действий панели: видно только меню определённой панели
         self._set_panel_menus_visible(self.panel_type)
+        # Меню «Битрикс» — отдельная проверка: BitrixVM бывает и без панели.
+        self._detect_bitrix()
 
         self.connect_btn.config(text="Отключиться", bootstyle="danger", command=self.disconnect)
         self.connect_btn.config(state=tk.NORMAL)
@@ -316,6 +318,7 @@ class RunnerMixin:
         self.send_btn.config(state=tk.DISABLED)
 
         self._set_panel_menus_visible(None)
+        self._set_bitrix_menu_visible(False)
 
         self.connect_btn.config(text="Подключиться", bootstyle="success", command=self.connect)
         self.log("Соединение закрыто.")

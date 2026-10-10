@@ -67,6 +67,14 @@ from webcheck import (  # noqa: F401
     grep_logs_report, list_common_reports,
 )
 
+# --- bitrix ---
+from bitrix import (  # noqa: F401
+    detect_bitrix_env, bitrix_sites, bitrix_sites_report,
+    bitrix_ssl_report, bitrix_ssl_renew,
+    bitrix_mysql_report, bitrix_mysql_tune, bitrix_db_check,
+    bitrix_php_report, bitrix_cron_report, bitrix_mail_report,
+)
+
 # --- fmanager ---
 from fmanager import (  # noqa: F401
     list_dir, make_dir, create_file, delete_path, rename_path,
