@@ -257,3 +257,73 @@ class TestGeneratedCommandsAreValidShell:
             proc = subprocess.run(['bash', '-n', '-c', cmd],
                                   capture_output=True, text=True)
             assert proc.returncode == 0, f'bash -n не принял:\n{cmd}\n{proc.stderr}'
+
+
+# ==================== ISPmanager: ветки, которых не было ====================
+class TestIspmanagerRestart:
+    def test_success_path(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr exit', ('', '', 0)),
+                            ('sysinfo', 'kernel=linux')])
+        out = panels_mod.ispmanager_restart(c)
+        assert '✅ Команда на перезапуск отправлена через mgrctl' in out
+        assert '✅ Панель работает' in out
+        assert c.find('sleep 3') is not None
+
+    def test_failure_reports_rc_and_warns_when_panel_down(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr exit',
+                             ('', 'connection refused', 1)),
+                            ('sysinfo', 'connection failed: error')])
+        out = panels_mod.ispmanager_restart(c)
+        assert '❌ Ошибка (rc=1): connection refused' in out
+        assert '⚠️ Панель возможно не запустилась' in out
+
+
+class TestIspmanagerKillCore:
+    def test_core_gone_after_kill(self):
+        c = FakeSSH(routes=[('ps aux | grep core', '')])
+        out = panels_mod.ispmanager_kill_core(c)
+        assert '✅ Процесс core завершён' in out
+        assert c.find('killall core') is not None
+        assert c.find('pkill -9 core') is not None
+        assert c.find('sleep 2') is not None
+
+    def test_core_still_running_is_warned(self):
+        c = FakeSSH(routes=[('ps aux | grep core',
+                             'root 1 0.0 /usr/local/mgr5/bin/core\n')])
+        out = panels_mod.ispmanager_kill_core(c)
+        assert '⚠️ Процесс core всё ещё работает' in out
+
+
+class TestIspmanagerDisable:
+    def test_disable_blocks_binary_and_kills_daemons(self):
+        c = FakeSSH()
+        out = panels_mod.ispmanager_disable(c)
+        assert '✅ Панель отключена' in out
+        assert '⚠️ Для включения выполните: chmod +x' in out
+        assert c.find('chmod -x /usr/local/mgr5/bin/core') is not None
+        assert c.find('killall core') is not None
+        assert c.find('killall ihttpd') is not None
+
+
+class TestIspmanagerCronFixBackupFailure:
+    def test_missing_backup_warns_but_fix_still_runs(self):
+        # test -f с rc=1: create_backup возвращает None (ни источника, ни бэкапа)
+        c = FakeSSH(routes=[('crontab -l > /tmp', ('', '', 0)),
+                            ('mkdir -p', ('created', '', 0)),
+                            ('test -f', ('', '', 1)),
+                            ('| sed', ('', '', 0))])
+        out = panels_mod.ispmanager_fix_cron_path(c)
+        assert '⚠️ Не удалось создать резервную копию crontab' in out
+        assert '✅ Переменная PATH закомментирована' in out
+
+
+class TestFastpanelRestartWebNoFpm:
+    def test_missing_php_fpm_units_reported(self):
+        c = FakeSSH(routes=[('nginx -t', TestFastpanelRestartWeb.GOOD),
+                            ('systemctl restart nginx', ('', '', 0)),
+                            ('list-units', '')])
+        out = panels_mod.fastpanel_restart_web(c)
+        assert 'nginx перезапущен' in out
+        assert '⚠️ Службы php*-fpm не найдены' in out
+        # перезапуск должен остаться ровно один (nginx): без юнитов луп пуст
+        assert c.count('systemctl restart') == 1
