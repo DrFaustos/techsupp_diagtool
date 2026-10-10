@@ -221,6 +221,187 @@ class TestDbCheck:
         assert '❌' in out and 'dbconn.php' in out
 
 
+# ==================== права на базу (GRANTS) ====================
+# Формат вывода SHOW GRANTS — как у MySQL 8: объект базы в backticks сидит в
+# середине ('`db`.*'), учётка — `user`@`host`.
+GRANTS_USAGE_ONLY = 'GRANT USAGE ON *.* TO `bitrix_user`@`localhost`\n'
+GRANTS_PARTIAL = ('GRANT USAGE ON *.* TO `bitrix_user`@`localhost`\n'
+                  'GRANT SELECT, INSERT, UPDATE, DELETE ON `bitrix_db`.* '
+                  'TO `bitrix_user`@`localhost`\n')
+GRANTS_FULL = ('GRANT ALL PRIVILEGES ON `bitrix_db`.* '
+               'TO `bitrix_user`@`localhost`\n')
+GRANTS_GLOBAL_ALL = ('GRANT ALL PRIVILEGES ON *.* '
+                     "TO `bitrix_user`@`localhost` WITH GRANT OPTION\n")
+GRANTS_OTHER_DB = (
+    'GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, '
+    'CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, TRIGGER, SHOW VIEW, '
+    'EVENT ON `old_db`.* TO `bitrix_user`@`localhost`\n')
+GRANTS_TABLE_LEVEL = (GRANTS_PARTIAL +
+                      'GRANT SELECT ON `bitrix_db`.`b_module` '
+                      'TO `bitrix_user`@`localhost`\n')
+
+
+def _grants_routes(show):
+    """Иглы для чтения прав. 'SHOW GRANTS' стоит раньше любых 'GRANT'-игл:
+    первое совпадение по подстроке выигрывает."""
+    return [('cat', DBCONN_TEXT),
+            ('SELECT CURRENT_USER()', 'bitrix_user@localhost\n'),
+            ('SHOW GRANTS FOR CURRENT_USER()', show)]
+
+
+class TestGrantsPure:
+    def test_parse_current_user(self):
+        assert bx.parse_current_user('bitrix_user@localhost') == \
+            ('bitrix_user', 'localhost')
+        assert bx.parse_current_user('u@%\n') == ('u', '%')
+        assert bx.parse_current_user('') == (None, None)
+        assert bx.parse_current_user('без собачки') == (None, None)
+
+    def test_parse_grants_partial(self):
+        parsed = bx.parse_grants(GRANTS_PARTIAL, 'bitrix_db')
+        assert parsed['db'] == {'SELECT', 'INSERT', 'UPDATE', 'DELETE'}
+        assert parsed['global'] == set()      # USAGE прав не даёт
+        assert parsed['dbs'] == {'bitrix_db'}
+        missing = bx.missing_grants(parsed)
+        assert 'CREATE' in missing and 'SELECT' not in missing
+        assert missing[0] == 'CREATE'         # порядок = порядок GRANT_REQUIRED
+
+    def test_parse_grants_all_on_db(self):
+        parsed = bx.parse_grants(GRANTS_FULL, 'bitrix_db')
+        assert parsed['db_all'] is True
+        assert bx.missing_grants(parsed) == []
+
+    def test_parse_grants_all_global(self):
+        parsed = bx.parse_grants(GRANTS_GLOBAL_ALL, 'bitrix_db')
+        assert parsed['all'] is True
+        assert bx.missing_grants(parsed) == []
+
+    def test_parse_grants_table_level_collected(self):
+        parsed = bx.parse_grants(GRANTS_TABLE_LEVEL, 'bitrix_db')
+        assert ('b_module', {'SELECT'}) in parsed['tables']
+        assert parsed['db'] == {'SELECT', 'INSERT', 'UPDATE', 'DELETE'}
+
+    def test_parse_grants_wrong_db(self):
+        # «переименовали базу»: права полные, но на другой базе
+        parsed = bx.parse_grants(GRANTS_OTHER_DB, 'bitrix_db')
+        assert parsed['dbs'] == {'old_db'}
+        assert parsed['db'] == set()
+        assert bx.missing_grants(parsed) == list(bx.GRANT_REQUIRED)
+
+    def test_grants_sql_shape(self):
+        sql = bx.grants_sql('bitrix_db', 'bitrix_user', 'localhost',
+                            ['CREATE', 'DROP'])
+        assert sql == ("GRANT CREATE, DROP ON `bitrix_db`.* "
+                       "TO 'bitrix_user'@'localhost'; FLUSH PRIVILEGES")
+
+    def test_ident_safe(self):
+        assert bx.ident_safe('bitrix_db') and bx.ident_safe('db-1')
+        assert bx.ident_safe('u') and bx.ident_safe('%')       # хост-маска
+        assert not bx.ident_safe("bad'name") and not bx.ident_safe('a;b')
+        assert not bx.ident_safe('') and not bx.ident_safe(None)
+
+
+class TestGrantsReport:
+    def test_report_full_set(self):
+        c = FakeSSH(routes=_grants_routes(GRANTS_FULL),
+                    client=FakeSftpClient())
+        out = bx.bitrix_db_grants_report(c)
+        assert '✅ Набор привилегий' in out
+        assert 'bitrix_user@localhost' in out
+        # пароль — только в defaults-файл; права читались ровно 2 запросом
+        assert 'sup3r-secret' not in ' '.join(c.commands)
+        assert c.count('--defaults-extra-file') == 2
+        assert c.find('rm -f') is not None
+
+    def test_report_missing_lists_and_shows_sql(self):
+        out = bx.bitrix_db_grants_report(
+            FakeSSH(routes=_grants_routes(GRANTS_PARTIAL),
+                    client=FakeSftpClient()))
+        assert '⚠️ Не хватает: CREATE, DROP' in out
+        assert 'FLUSH PRIVILEGES' in out
+
+    def test_report_usage_only_is_red(self):
+        out = bx.bitrix_db_grants_report(
+            FakeSSH(routes=_grants_routes(GRANTS_USAGE_ONLY),
+                    client=FakeSftpClient()))
+        assert 'Не хватает' in out and 'SELECT' in out
+
+    def test_report_wrong_db_hint(self):
+        out = bx.bitrix_db_grants_report(
+            FakeSSH(routes=_grants_routes(GRANTS_OTHER_DB),
+                    client=FakeSftpClient()))
+        assert 'Строк прав на DBName=bitrix_db нет' in out and 'old_db' in out
+
+    def test_report_connection_failed(self):
+        c = FakeSSH(routes=[
+            ('cat', DBCONN_TEXT),
+            ('SELECT CURRENT_USER()', ('ERROR 2002 cannot connect', '', 1)),
+        ], client=FakeSftpClient())
+        out = bx.bitrix_db_grants_report(c)
+        assert '❌ Подключение к базе не прошло' in out
+
+    def test_report_missing_dbconn(self):
+        out = bx.bitrix_db_grants_report(
+            FakeSSH(routes=[('cat', ('', 'no such file', 1))]))
+        assert '❌' in out and 'dbconn.php' in out
+
+
+class TestGrantsFix:
+    def test_fix_nothing_to_grant(self):
+        c = FakeSSH(routes=_grants_routes(GRANTS_FULL),
+                    client=FakeSftpClient())
+        out = bx.bitrix_db_grants_fix(c)
+        assert '⚠️ Выдавать нечего' in out
+        assert c.find('mysql -N -e') is None          # GRANT не отправляли
+
+    def test_fix_grants_and_rereads(self):
+        # после выдачи перечитывание обязан увидеть полный набор —
+        # для этого у иглы два последовательных ответа
+        c = FakeSSH(routes=[
+            ('cat', DBCONN_TEXT),
+            ('SELECT CURRENT_USER()', ['bitrix_user@localhost',
+                                       'bitrix_user@localhost']),
+            ('SHOW GRANTS FOR CURRENT_USER()', [GRANTS_PARTIAL, GRANTS_FULL]),
+        ], client=FakeSftpClient())
+        out = bx.bitrix_db_grants_fix(c)
+        assert '✅ Права выданы' in out
+        assert 'sup3r-secret' not in ' '.join(c.commands)
+        grant_cmd = c.find('mysql -N -e')
+        assert grant_cmd is not None
+        sql = shlex.split(grant_cmd)[-2]      # последний токен — '2>&1'
+        assert 'GRANT CREATE' in sql and 'FLUSH PRIVILEGES' in sql
+        # 4 обращения через defaults-файл: до выдачи и после перечитывания
+        assert c.count('--defaults-extra-file') == 4
+
+    def test_fix_root_denied(self):
+        c = FakeSSH(routes=_grants_routes(GRANTS_PARTIAL) +
+                    [('mysql -N -e', ('ERROR 1045 Access denied for root',
+                                      '', 1))],
+                    client=FakeSftpClient())
+        out = bx.bitrix_db_grants_fix(c)
+        assert '❌ mysql (под root) не принял' in out
+        assert '.my.cnf' in out
+
+    def test_fix_still_missing_after_grant(self):
+        # перечитывание видит те же неполные права (у root нет GRANT OPTION)
+        c = FakeSSH(routes=_grants_routes(GRANTS_PARTIAL),
+                    client=FakeSftpClient())
+        out = bx.bitrix_db_grants_fix(c)
+        assert '⚠️ После выдачи всё ещё не хватает' in out
+        assert 'GRANT OPTION' in out
+
+    def test_fix_refuses_unsafe_ident(self):
+        bad = DBCONN_TEXT.replace('"bitrix_db"', '"bitrix;db"')
+        c = FakeSSH(routes=[('cat', bad),
+                            ('SELECT CURRENT_USER()', 'bitrix_user@localhost'),
+                            ('SHOW GRANTS FOR CURRENT_USER()',
+                             GRANTS_PARTIAL)],
+                    client=FakeSftpClient())
+        out = bx.bitrix_db_grants_fix(c)
+        assert '❌' in out and 'вне безопасного' in out
+        assert c.find('mysql -N -e') is None
+
+
 # ==================== топ-таблицы БД ====================
 TOP_TABLES_OUT = (
     'b_cache_tag\t1843.2\t12000000\n'

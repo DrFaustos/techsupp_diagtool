@@ -13,18 +13,34 @@ class FakeSSH:
     def __init__(self, routes=None, default=('', '', 0), client=None):
         self.routes = []
         for needle, res in (routes or []):
-            if isinstance(res, str):
-                res = (res, '', 0)
-            elif len(res) == 2:
-                res = (res[0], res[1], 0)
+            if isinstance(res, list):
+                # Последовательность ответов на одну иглу: каждое следующее
+                # совпадение получает следующий элемент (для сценариев
+                # «проверил — починил — проверил снова»). Последний элемент —
+                # постоянный.
+                res = [self._norm(r) for r in res]
+            else:
+                res = self._norm(res)
             self.routes.append((needle, res))
         self.default = default
         self.client = client
         self.commands = []
 
+    @staticmethod
+    def _norm(res):
+        if isinstance(res, str):
+            return (res, '', 0)
+        if len(res) == 2:
+            return (res[0], res[1], 0)
+        return res
+
     def _answer(self, cmd):
         for needle, res in self.routes:
             if needle in cmd:
+                if isinstance(res, list):
+                    if len(res) > 1:
+                        return res.pop(0)
+                    return res[0]
                 return res
         return self.default
 

@@ -178,6 +178,115 @@ def parse_mailq_count(text):
     return None
 
 
+# ==================== ПРАВА НА БАЗУ (ЧИСТЫЕ ФУНКЦИИ) ====================
+# Без чего Битрикс штатно не работает: DML + DDL. Обновления ядра и setup.php
+# создают и меняют таблицы, поэтому одних SELECT/INSERT мало.
+GRANT_REQUIRED = (
+    'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER',
+    'INDEX', 'CREATE TEMPORARY TABLES', 'LOCK TABLES', 'EXECUTE', 'TRIGGER',
+    'SHOW VIEW', 'EVENT',
+)
+
+# Имена базы/учётки подставляются в SQL как идентификаторы. Разрешаем только
+# безопасные символы: `%` (хост-маска) и `$` (имена БД) допустимы, кавычки — нет.
+IDENT_SAFE_RE = re.compile(r'^[A-Za-z0-9_$%.\-]+$')
+
+_GRANT_LINE_RE = re.compile(
+    r'^\s*GRANT\s+(?P<privs>.*?)\s+ON\s+(?P<obj>\S+)\s+TO\b', re.IGNORECASE)
+
+
+def _unquote_ident(name):
+    """Снять backticks с идентификатора/объекта из вывода mysql.
+
+    MySQL 8 пишет GRANT-объект как `db`.* — backtick сидит В середине строки
+    ('`db`.*'), поэтому strip('`') не спасает: убираем все вхождения.
+    """
+    return (name or '').replace('`', '').strip()
+
+
+def parse_current_user(text):
+    """'bitrix_user@localhost' -> ('bitrix_user', 'localhost'); иначе (None, None).
+
+    Хост берём именно отсюда, а не из DBHost: в mysql.user записан хост-паттерн
+    ('%', '%.site.ru'), а DBHost — адрес ПОДКЛЮЧЕНИЯ. GRANT на 'user'@'localhost'
+    при учётке 'user'@'%' ничего не чинит, а создаёт вторую учётку.
+    """
+    line = (text or '').strip().splitlines()[0] if (text or '').strip() else ''
+    user, sep, host = line.partition('@')
+    if not sep or not user.strip() or not host.strip():
+        return None, None
+    return user.strip(), host.strip()
+
+
+def parse_grants(text, db_name=''):
+    """Вывод SHOW GRANTS -> {all, db_all, global, db, tables, dbs}.
+
+    USAGE прав не даёт (это «вход есть, делать нечего») — выбрасываем.
+    db_name — база из dbconn.php: строки по чужим базам попадают только в 'dbs',
+    чтобы отчёт показал классическое «переименовали базу, права остались на старой».
+    """
+    parsed = {'all': False, 'db_all': False, 'global': set(), 'db': set(),
+              'tables': [], 'dbs': set()}
+    want = (db_name or '').lower()
+    for line in (text or '').splitlines():
+        m = _GRANT_LINE_RE.match(line)
+        if not m:
+            continue
+        obj = _unquote_ident(m.group('obj'))
+        obj_db, _, obj_tbl = obj.partition('.')
+        obj_db = _unquote_ident(obj_db).lower()
+        obj_tbl = _unquote_ident(obj_tbl).lower()
+        raw = m.group('privs').strip()
+        is_all = raw.upper().startswith('ALL')
+        privs = set()
+        if not is_all:
+            privs = {p.strip().upper() for p in raw.split(',') if p.strip()}
+            privs -= {'USAGE', 'GRANT OPTION'}
+        if obj_db == '*' and obj_tbl == '*':
+            if is_all:
+                parsed['all'] = True
+            parsed['global'] |= privs
+        elif obj_tbl == '*':
+            if obj_db:
+                parsed['dbs'].add(obj_db)
+            if not want or obj_db == want:
+                if is_all:
+                    parsed['db_all'] = True
+                parsed['db'] |= privs
+        else:
+            if obj_db:
+                parsed['dbs'].add(obj_db)
+            if want and obj_db == want:
+                parsed['tables'].append((obj_tbl, privs))
+    return parsed
+
+
+def missing_grants(parsed, required=GRANT_REQUIRED):
+    """Список недостающих привилегий (пустой — прав хватает).
+
+    ALL PRIVILEGES на нужную базу закрывает всё; ALL на *.* — тем более.
+    """
+    if parsed.get('all') or parsed.get('db_all'):
+        return []
+    have = set(parsed.get('global') or ()) | set(parsed.get('db') or ())
+    return [p for p in required if p not in have]
+
+
+def grants_sql(db, user, host, privs):
+    """Один GRANT недостающих привилегий на всю базу + FLUSH PRIVILEGES.
+
+    Вызывается только после ident_safe(); одинарная кавычка в именах невозможна,
+    поэтому строку можно и показать оператору, и отправить в mysql как есть.
+    """
+    return (f"GRANT {', '.join(privs)} ON `{db}`.* TO '{user}'@'{host}'; "
+            'FLUSH PRIVILEGES')
+
+
+def ident_safe(name):
+    """Можно ли подставлять имя в SQL без ручного разбора."""
+    return bool(name) and bool(IDENT_SAFE_RE.match(str(name)))
+
+
 # ==================== ОКРУЖЕНИЕ И САЙТЫ ====================
 def detect_bitrix_env(checker):
     """True, если на сервере BitrixVM: есть и /opt/webdir, и /home/bitrix."""
@@ -423,6 +532,129 @@ def bitrix_db_check(checker):
     elif "can't connect" in low or 'connection refused' in low:
         lines.append('💡 MySQL не слушает адрес из DBHost: проверьте службу '
                      'mysqld и DBHost (localhost vs 127.0.0.1 vs контейнер).')
+    return '\n'.join(lines)
+
+
+# ==================== ПРАВА НА БАЗУ (GRANTS) ====================
+def _current_grants(checker, db_name):
+    """(info, None) либо (None, строка-ошибка); info = {user, host, parsed}.
+
+    Привилегии читаем через CURRENT_USER(): это ровно та учётка, под которой
+    сработало подключение из dbconn.php. DBHost как host не используем: в
+    mysql.user записан хост-паттерн ('%', '%.site.ru'), и GRANT на другую
+    строку учётки создал бы вторую, ничего не починив.
+    """
+    ok, out = _db_query(checker, 'SELECT CURRENT_USER()')
+    if not ok:
+        return None, ('❌ Подключение к базе не прошло: '
+                      + (out or 'mysql: нет вывода').strip())
+    user, host = parse_current_user(out)
+    if not user:
+        return None, f'❌ Не удалось разобрать CURRENT_USER(): {out!r}'
+    ok, out = _db_query(checker, 'SHOW GRANTS FOR CURRENT_USER()')
+    if not ok:
+        return None, ('❌ SHOW GRANTS не прошёл:\n'
+                      + (out or 'mysql: нет вывода').strip())
+    return {'user': user, 'host': host,
+            'parsed': parse_grants(out, db_name)}, None
+
+
+def bitrix_db_grants_report(checker):
+    lines = ['=== ПРАВА НА БАЗУ (SHOW GRANTS) ===']
+    vals, errors = _db_credentials(checker)
+    if vals is None:
+        lines.extend(errors or [])
+        return '\n'.join(lines)
+
+    info, error = _current_grants(checker, vals['DBName'])
+    if info is None:
+        lines.append(error or 'не удалось прочитать права')
+        return '\n'.join(lines)
+
+    parsed = info['parsed']
+    lines.append(f"Активная учётка: {info['user']}@{info['host']}, "
+                 f"DBName={vals['DBName']}")
+
+    if (parsed['dbs'] and vals['DBName'].lower() not in parsed['dbs']
+            and not (parsed['all'] or parsed['db_all'] or parsed['global'])):
+        lines.append(f"⚠️ Строк прав на DBName={vals['DBName']} нет — права "
+                     'остались на другой базе: '
+                     + ', '.join(sorted(parsed['dbs']))
+                     + '. Типично после переноса сайта/переименования базы.')
+
+    if parsed['tables']:
+        lines.append(f"• Прав на отдельные таблицы: {len(parsed['tables'])} "
+                     'строк — при обновлении ядру может не хватить их на '
+                     'новых таблицах.')
+
+    missing = missing_grants(parsed)
+    if not missing:
+        lines.append('✅ Набор привилегий ядра Битрикса на месте '
+                     '(DML + DDL + события).')
+        return '\n'.join(lines)
+
+    lines.append('⚠️ Не хватает: ' + ', '.join(missing))
+    db, user, host = vals['DBName'], info['user'], info['host']
+    if ident_safe(db) and ident_safe(user) and ident_safe(host):
+        lines.append('   Выполнить от root (mysql без пароля — /root/.my.cnf):')
+        lines.append('   ' + grants_sql(db, user, host, missing))
+        lines.append('   Или пунктом меню «Права на базу: выдать недостающие» '
+                     '— тот же SQL с перечитыванием после выдачи.')
+    else:
+        lines.append('   Имя базы/учётки содержит символы вне '
+                     '[A-Za-z0-9_$%.-] — соберите GRANT вручную.')
+    return '\n'.join(lines)
+
+
+def bitrix_db_grants_fix(checker):
+    """Выдать ядру Битрикса недостающие привилегии на базу сайта (нужен root)."""
+    lines = ['=== ПРАВА НА БАЗУ: ВЫДАЧА ===']
+    vals, errors = _db_credentials(checker)
+    if vals is None:
+        lines.extend(errors or [])
+        return '\n'.join(lines)
+
+    info, error = _current_grants(checker, vals['DBName'])
+    if info is None:
+        lines.append(error or 'не удалось прочитать права')
+        return '\n'.join(lines)
+
+    missing = missing_grants(info['parsed'])
+    if not missing:
+        lines.append('⚠️ Выдавать нечего: привилегий уже достаточно.')
+        return '\n'.join(lines)
+
+    db, user, host = vals['DBName'], info['user'], info['host']
+    if not (ident_safe(db) and ident_safe(user) and ident_safe(host)):
+        lines.append('❌ Имя базы/учётки/хоста содержит символы вне безопасного '
+                     'набора — SQL не отправляем, сделайте GRANT вручную '
+                     '(подсказка в отчёте «Права на базу»).')
+        return '\n'.join(lines)
+
+    sql = grants_sql(db, user, host, missing)
+    lines.append('Выдаю: ' + sql)
+    out, err, rc = checker.run(f'mysql -N -e {q(sql)} 2>&1')
+    if rc != 0:
+        lines.append(f'❌ mysql (под root) не принял (rc={rc}): '
+                     + ((out or err).strip() or 'нет вывода'))
+        lines.append('   Если root ходит в mysql по паролю — выполните GRANT '
+                     'вручную или заведите /root/.my.cnf.')
+        return '\n'.join(lines)
+
+    # Вера на слово недопустима: перечитываем права той же учётки.
+    info2, error2 = _current_grants(checker, db)
+    if info2 is None:
+        lines.append('⚠️ GRANT выполнен, но перечитать права не вышло: '
+                     + str(error2))
+        return '\n'.join(lines)
+    still = missing_grants(info2['parsed'])
+    if not still:
+        lines.append('✅ Права выданы: перечитывание показало полный набор '
+                     'для ядра Битрикса.')
+    else:
+        lines.append('⚠️ После выдачи всё ещё не хватает: '
+                     + ', '.join(still)
+                     + ' — обычно значит, что у root нет GRANT OPTION.')
     return '\n'.join(lines)
 
 

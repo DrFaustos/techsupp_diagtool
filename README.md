@@ -70,6 +70,10 @@
 - **Доступ к базе** — проверка подключения реквизитами из `dbconn.php` (`SELECT 1`);
   пароль передаётся временным файлом 0600 и не попадает ни в командную строку, ни в
   отчёт; при Access denied подсказывает `SHOW GRANTS`/`GRANT`
+- **Права на базу** — `SHOW GRANTS` под учёткой из `CURRENT_USER()` (хост-паттерн,
+  а не `DBHost`), сравнение с минимумом ядра Битрикса, «права остались на другой
+  базе» и правки по таблицам; «выдать недостающие» — `GRANT`+`FLUSH PRIVILEGES`
+  под root с перечитыванием после выдачи (имена проверяются на безопасный набор)
 - **Топ-таблицы базы** — 20 крупнейших таблиц по `DATA_LENGTH + INDEX_LENGTH` и
   подсказки по «мусорщикам» Битрикса (`b_user_session`, `b_cache_tag`,
   `b_stat_hit`, `b_log`, `b_sale_basket`); удалять руками `b_cache_tag` нельзя —
@@ -164,7 +168,7 @@ Diagn/
 ├── dns.py              # DNS-проверки и работа с резолверами
 ├── files.py            # Файлы, конфиги, замена IP, перезапуск служб
 ├── panels.py           # Управление панелями ISPmanager и FastPanel
-├── bitrix.py           # Диагностика BitrixVM: SSL, MySQL, БД, PHP, cron, почта
+├── bitrix.py           # Диагностика BitrixVM: SSL, MySQL, БД (GRANTS), PHP, cron, почта
 ├── reports.py          # Сводный отчёт по диагностике
 ├── webcheck.py         # SSL-сертификаты, WHOIS, порты, grep логов
 ├── ssh_client.py       # SSH-подключение (Paramiko)
@@ -189,7 +193,7 @@ Diagn/
 | gui_admin.py | Администрирование: замена IPv4/IPv6, перезапуск служб, bash-история, редактор конфигов |
 | gui_isp.py | Меню ISPmanager: перезапуск, kill core, обновление, SSL, отключение, GeoIP, cron |
 | gui_fastpanel.py | Меню FastPanel: состояние панели и стека, логи, перезапуск панели и nginx+php-fpm |
-| gui_bitrix.py | Меню «Битрикс»: SSL dehydrated, MySQL, кеш Redis/Memcached, доступ к базе, PHP, cron-агенты, почта |
+| gui_bitrix.py | Меню «Битрикс»: SSL dehydrated, MySQL, кеш Redis/Memcached, доступ к базе и права (GRANTS), PHP, cron-агенты, почта |
 | gui_files.py | Файловый менеджер сервера по SFTP: навигация, правка текстовых файлов, скачать/загрузить |
 | fmanager.py | Файловые операции SFTP (list/mkdir/create/delete/rename/get/put) и подготовка строк таблицы |
 | diagnostic.py | Фасад: реэкспортирует функции из модулей ниже (сохранён для совместимости) |
@@ -199,7 +203,7 @@ Diagn/
 | dns.py | dns_report, dns_report_local, dns_resolvers_report, set_dns_resolvers |
 | files.py | read_file, write_file, get_config_files, replace_ipv4/ipv6, restart_services |
 | panels.py | Функции управления ISPmanager и FastPanel (restart, status, logs, ssl и т.д.) |
-| bitrix.py | Диагностика BitrixVM: dehydrated, тюнинг InnoDB, кеш (Redis/Memcached), dbconn.php, PHP, cron.sh, postfix |
+| bitrix.py | Диагностика BitrixVM: dehydrated, тюнинг InnoDB, кеш (Redis/Memcached), dbconn.php, SHOW GRANTS, PHP, cron.sh, postfix |
 | reports.py | full_diagnostic_report — сводный отчёт |
 | ssh_client.py | Класс SSH-подключения через Paramiko (exec_command + run с кодом возврата) |
 | tests/ | Юнит-тесты (pytest) для чистых функций |
@@ -226,7 +230,7 @@ Diagn/
 | DNS | DNS-проверка, DNS-резолверы, Изменить DNS |
 | Администрирование | Заменить IPv4, Заменить IPv6, Перезапустить службы, Редактор конфигов, Файлы |
 | Панели | 🛠 ISPmanager ▾ (перезапустить, kill core, обновить, выпуск SSL, отключить, GeoIP, CRON PATH), 🛠 FastPanel ▾ (состояние, логи, перезапуск панели, nginx+php-fpm) |
-| 1С-Битрикс | 🧩 Битрикс ▾ (сайты, SSL dehydrated, MySQL, кеш, доступ к базе, PHP, cron-агенты, почта) — видно на BitrixVM |
+| 1С-Битрикс | 🧩 Битрикс ▾ (сайты, SSL dehydrated, MySQL, кеш, доступ к базе, права на базу, PHP, cron-агенты, почта) — видно на BitrixVM |
 | Swap | Создать swap файл, Прописать swap в fstab |
 | Доп. проверки | SSL-сертификат, WHOIS, Порты, Grep логов |
 | Терминал | Send, История |

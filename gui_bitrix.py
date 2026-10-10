@@ -14,6 +14,7 @@ from diagnostic import (
     bitrix_ssl_report, bitrix_ssl_renew,
     bitrix_mysql_report, bitrix_mysql_tune, bitrix_db_check,
     bitrix_db_tables_report,
+    bitrix_db_grants_report, bitrix_db_grants_fix,
     bitrix_php_report, bitrix_cron_report, bitrix_cron_install,
     bitrix_cache_report, bitrix_mail_report,
     bitrix_perms_report, bitrix_perms_fix,
@@ -27,6 +28,7 @@ BITRIX_MENU = [
     ("MySQL: состояние и рекомендация", "run_bx_mysql"),
     ("Кеш: Redis / Memcached", "run_bx_cache"),
     ("Доступ к базе (dbconn.php)", "run_bx_db"),
+    ("Права на базу (SHOW GRANTS)", "run_bx_db_grants"),
     ("Топ-таблицы базы (размер)", "run_bx_db_tables"),
     ("PHP: параметры и модули", "run_bx_php"),
     ("Cron-агенты Битрикс", "run_bx_cron"),
@@ -35,6 +37,7 @@ BITRIX_MENU = [
     None,
     ("Перевыпустить сертификаты (dehydrated)", "run_bx_ssl_renew"),
     ("MySQL: применить тюнинг", "run_bx_mysql_tune"),
+    ("Права на базу: выдать недостающие", "run_bx_db_grants_fix"),
     ("Cron-агенты: установить в crontab", "run_bx_cron_install"),
     ("Права файлов: починить (chown/chmod)", "run_bx_perms_fix"),
 ]
@@ -100,6 +103,12 @@ class BitrixMixin:
         if not self.checker:
             return
         self._run_in_thread(bitrix_db_check, self.bx_menu_btn, self.checker)
+
+    def run_bx_db_grants(self):
+        if not self.checker:
+            return
+        self._run_in_thread(bitrix_db_grants_report, self.bx_menu_btn,
+                            self.checker, cache_key='bx_db_grants')
 
     def run_bx_db_tables(self):
         if not self.checker:
@@ -180,3 +189,18 @@ class BitrixMixin:
             parent=self.root
         ):
             self._run_in_thread(bitrix_mysql_tune, self.bx_menu_btn, self.checker)
+
+    def run_bx_db_grants_fix(self):
+        if not self.checker:
+            return
+        if messagebox.askyesno(
+            "Подтверждение",
+            "Выдать Битрикс-пользователю недостающие привилегии на базу сайта "
+            "(GRANT + FLUSH PRIVILEGES)?\n"
+            "⚠️ Нужен доступ root к mysql без пароля (/root/.my.cnf). Права "
+            "расширяются на всю базу — выдаются только те, что названы в отчёте "
+            "«Права на базу», и только учётке из dbconn.php.",
+            parent=self.root
+        ):
+            self._run_in_thread(bitrix_db_grants_fix, self.bx_menu_btn,
+                                self.checker)
