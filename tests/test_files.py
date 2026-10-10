@@ -79,6 +79,14 @@ class TestGetConfigFiles:
     def test_no_existing_paths_returns_empty(self):
         assert files_mod.get_config_files(FakeSSH(), 'none') == []
 
+    def test_existing_path_with_empty_listing_appends_itself(self):
+        # ls -d нашёл путь, ls -1 пуст -> в список попадает сам путь: иначе
+        # одиночные конфиги (nginx.conf, my.cnf) терялись бы из редактора
+        c = FakeSSH(routes=[('ls -d', 'exists\n'), ('ls -1', '')])
+        files = files_mod.get_config_files(c, 'none')
+        assert '/etc/nginx/nginx.conf' in files
+        assert '/etc/mysql/my.cnf' in files
+
 
 class TestReplaceIpv4ErrorBranch:
     def test_failed_find_shows_warning(self):
@@ -95,6 +103,15 @@ class TestReplaceIpv6BackupFailure:
         c = FakeSSH(routes=[('tar czf', ('', 'tar: /etc: permission denied', 2))])
         out = files_mod.replace_ipv6(c, 'a::a', 'b::b')
         assert '⚠️ Не удалось создать резервную копию /etc' in out
+        assert '✅ IPv6 заменён' in out
+
+    def test_sed_failure_warns_but_operation_continues(self):
+        # та же ветка, что уже закрыта для IPv4: rc!=0 у find/sed —
+        # предупреждение с текстом STDERR, но отчёт не обрывается
+        c = FakeSSH(routes=[('find /etc', ('', "sed: couldn't edit", 1))])
+        out = files_mod.replace_ipv6(c, 'a::a', 'b::b')
+        assert '⚠️ Возможны ошибки (rc=1)' in out
+        assert "sed: couldn't edit" in out
         assert '✅ IPv6 заменён' in out
 
 

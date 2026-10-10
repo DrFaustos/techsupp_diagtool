@@ -298,6 +298,32 @@ class TestReplaceIPv4:
         assert 'nginx' in msg.asks[0][1]
 
 
+# ==================== отмена на втором вопросе ====================
+class TestCancelledSecondQuestion:
+    def test_ipv4_new_ip_cancelled_launches_nothing(self, monkeypatch):
+        # старый IP валиден, новый не введён («Отмена»): подтверждение не
+        # открывается, replace_ipv4 не уходит
+        dialogs, msg = _patch_dialogs(monkeypatch, answers=['10.0.0.1', None])
+        host = _Host(FakeSSH())
+        host.run_replace_ipv4()
+        assert len(dialogs.string_asks) == 2
+        assert msg.asks == [] and msg.events == [] and host.threads == []
+
+    def test_ipv6_old_ip_cancelled(self, monkeypatch):
+        dialogs, msg = _patch_dialogs(monkeypatch, answers=[None])
+        host = _Host(FakeSSH())
+        host.run_replace_ipv6()
+        assert len(dialogs.string_asks) == 1   # второй раз не спрашивали
+        assert msg.asks == [] and msg.events == [] and host.threads == []
+
+    def test_ipv6_new_ip_cancelled(self, monkeypatch):
+        dialogs, msg = _patch_dialogs(monkeypatch, answers=['2001:db8::1', ''])
+        host = _Host(FakeSSH())
+        host.run_replace_ipv6()
+        assert len(dialogs.string_asks) == 2
+        assert msg.asks == [] and msg.events == [] and host.threads == []
+
+
 # ==================== валидатор IPv6 ====================
 class TestValidIPv6:
     @pytest.mark.parametrize("value,ok", [

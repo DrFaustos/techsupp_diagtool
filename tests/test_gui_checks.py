@@ -394,6 +394,37 @@ class TestDomainHandlers:
         host.run_whois()
         assert host.simples == []
 
+    def test_ssl_cancelled_domain_sends_nothing(self, monkeypatch):
+        # «Отмена» в диалоге домена: SSH-запрос уходить не должен
+        host = _Host(FakeSSH())
+        self._patch(monkeypatch)
+        monkeypatch.setattr(gc, 'simpledialog', _Dialogs(answers=[]))
+        host.run_ssl_check()
+        assert host.simples == []
+
+    def test_whois_uses_entered_domain(self, monkeypatch):
+        checker = FakeSSH()
+        host = _Host(checker)
+        self._patch(monkeypatch)
+        monkeypatch.setattr(gc, 'simpledialog',
+                            _Dialogs(answers=['site.local']))
+        host.run_whois()
+        assert len(host.simples) == 1
+        fn, btn, on_done, args = host.simples[0]
+        assert fn is gc.whois_report
+        assert btn is host.whois_btn and on_done is None
+        assert args == (checker, 'site.local')
+
+    def test_grep_cancelled_domain_sends_nothing(self, monkeypatch):
+        # пустой домен отсекается ДО второго вопроса (про паттерн не спрашиваем)
+        dialogs = _Dialogs(answers=[])
+        host = _Host(FakeSSH())
+        self._patch(monkeypatch)
+        monkeypatch.setattr(gc, 'simpledialog', dialogs)
+        host.run_grep_logs()
+        assert host.simples == []
+        assert len(dialogs.string_asks) == 1
+
     def test_port_scan_uses_ip_entry(self, monkeypatch):
         checker = FakeSSH()
         host = _Host(checker)
