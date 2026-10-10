@@ -163,8 +163,12 @@ def check_web_config(checker):
 
 
 # ==================== ОТЧЁТЫ ====================
-def metrics_report(checker):
-    metrics = get_metrics(checker)
+def metrics_report(checker, metrics=None):
+    # metrics — уже собранный get_metrics() словарь: сводный отчёт
+    # (reports.full_diagnostic_report) собирает метрики один раз и отдаёт их
+    # сюда и в firewall_report, а не по разу на каждый этап.
+    if metrics is None:
+        metrics = get_metrics(checker)
     lines = []
     lines.append("=== МЕТРИКИ СИСТЕМЫ ===")
     lines.append("Диски:\n" + metrics['disk'])
@@ -178,8 +182,9 @@ def metrics_report(checker):
     return "\n".join(lines)
 
 
-def firewall_report(checker):
-    metrics = get_metrics(checker)
+def firewall_report(checker, metrics=None):
+    if metrics is None:
+        metrics = get_metrics(checker)
     lines = ["=== ФАЙРВОЛ ==="]
     for fw, output in metrics['firewall'].items():
         lines.append(f"{fw}:\n{output}")

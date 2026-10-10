@@ -25,6 +25,11 @@ class FakeSSH:
         self.default = default
         self.client = client
         self.commands = []
+        # ServerChecker живёт с host/port (их печатает сводный отчёт), поэтому
+        # заглушка тоже их имеет — иначе тестам приходится приклеивать атрибуты
+        # снаружи.
+        self.host = 'test-host'
+        self.port = 22
 
     @staticmethod
     def _norm(res):
