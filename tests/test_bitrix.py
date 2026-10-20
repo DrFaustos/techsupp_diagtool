@@ -5,9 +5,10 @@ notAfter, mailq) проверяются напрямую; отчёты — ма�
 FakeSSH. Порядок маршрутов важен: первое совпадение по подстроке выигрывает.
 """
 import os
+import re
 import shlex
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -844,3 +845,241 @@ class TestCache:
         c = FakeSSH(routes=[('cat', ('', 'Permission denied', 1))])
         out = bx.bitrix_cache_report(c)
         assert '.settings.php не читается' in out
+
+
+# ==================== оставшиеся ветки отчётов ====================
+#
+# Маршруты ниже обязаны учитывать порядок запросов внутри отчётов: игла
+# 'test -d' подстрокой покрывает и 'test -w' (одна команда в отчёте прав),
+# 'mailq 2>&1' стоит отдельно от 'mailq' в тесте отправки, а '/var/log/maillog'
+# встречается и в отчёте, и в поиске записи теста.
+
+class TestParseEdgeBranches:
+    def test_cnf_size_kibibytes(self):
+        # 'K' в my.cnf — KiB: округление вниз, 1024K = ровно 1M
+        assert bx.parse_cnf_size('2048K') == 2
+        assert bx.parse_cnf_size('1023K') == 0
+        assert bx.parse_cnf_size(' 2g ') == 2048      # пробелы и нижний регистр
+
+    def test_buffer_stats_skips_non_numeric(self):
+        # строка похожа по префиксу, но значение не int — строка пропускается,
+        # hit ratio считается по валидным строкам (None только если валидных нет)
+        text = ('Innodb_buffer_pool_read_requests abc\n'
+                'Innodb_buffer_pool_read_requests 100\n'
+                'Innodb_buffer_pool_reads 5\n')
+        assert bx.parse_buffer_stats(text) == 95.0
+        # без валидных строк — None, отчёт обязан это пережить
+        assert bx.parse_buffer_stats(
+            'Innodb_buffer_pool_read_requests abc\n') is None
+
+    def test_notafter_garbage_date_returns_none(self):
+        # формат совпадает, даты такой нет: strptime бросает ValueError -> None,
+        # SSL-отчёт обязан поставить ⚠️, а не упасть
+        assert bx.parse_notafter('notAfter=Xxx 99 99:99:99 2026 GMT') is None
+
+    def test_mailq_count_non_numeric_message_line(self):
+        assert bx.parse_mailq_count('-- lots Messages') is None
+        assert bx.parse_mailq_count('-- 3 Messages') == 3
+
+    def test_grants_ignores_garbage_lines(self):
+        # в выводе SHOW GRANTS оказался мусор (mysql warning) — строка
+        # пропускается, остальное разбирается как обычно
+        parsed = bx.parse_grants(GRANTS_PARTIAL + 'Warning: misc output\n',
+                                 'bitrix_db')
+        assert parsed['db'] == {'SELECT', 'INSERT', 'UPDATE', 'DELETE'}
+        assert parsed['dbs'] == {'bitrix_db'}
+
+
+def _notafter(days_ahead):
+    """notAfter в формате openssl — относительно СЕЙЧАС.
+
+    Фикстированная дата ('Oct 20 2026') сделала бы тест зависимым от системных
+    часов: через месяц он падал бы не из-за регресса. Держим срок в днях.
+    """
+    dt = datetime.now(timezone.utc) + timedelta(days=days_ahead)
+    return 'notAfter=' + dt.strftime('%b %d %H:%M:%S %Y') + ' GMT'
+
+
+class TestSSLReportMarks:
+    # ПОРЯДОК маршрутов обязателен: путь сертификата содержит '/certs', так что
+    # игла '/certs' покрывает и openssl-запрос. Специфичная 'openssl' идёт
+    # первой, иначе openssl получил бы список доменов (первое совпадение
+    # выигрывает) и тест проходил бы ложно.
+    def test_expiring_soon_is_red(self):
+        # days < 14 — красный маркер: dehydrated перевыпускает за 30 дней,
+        # если до истечения меньше двух недель — задание уже не работает
+        c = FakeSSH(routes=[
+            ('openssl', _notafter(5)),
+            ('/certs', 'shop.ru\n'),
+        ])
+        out = bx.bitrix_ssl_report(c)
+        assert '❌ shop.ru' in out and 'осталось' in out
+
+    def test_long_lived_certificate_is_green(self):
+        c = FakeSSH(routes=[
+            ('openssl', _notafter(120)),
+            ('/certs', 'shop.ru\n'),
+        ])
+        out = bx.bitrix_ssl_report(c)
+        # .days у timedelta урезан (notAfter на несколько часов позже «сейчас»
+        # съедает остаток суток), поэтому вместо точного '120' сверяется
+        # диапазон; точная арифметика дней закреплена юнит-тестом
+        # test_parse_notafter
+        assert '✅ shop.ru' in out
+        m = re.search(r'осталось (\d+) дн\.', out)
+        assert m and 118 <= int(m.group(1)) <= 120
+
+    def test_unparsable_certificate_is_warning(self):
+        c = FakeSSH(routes=[
+            ('openssl', 'Could not read certificate from /x'),
+            ('/certs', 'shop.ru\n'),
+        ])
+        out = bx.bitrix_ssl_report(c)
+        assert '⚠️ shop.ru' in out and 'осталось' not in out
+
+    def test_dehydrated_log_tail_shown(self):
+        c = FakeSSH(routes=[('tail -n 15', 'Processing domain shop.ru\n')])
+        out = bx.bitrix_ssl_report(c)
+        assert 'dehydrated_update.log (последние 15 строк)' in out
+        assert 'Processing domain shop.ru' in out
+
+
+class TestSitesReportEmpty:
+    def test_no_vhosts_says_so(self):
+        out = bx.bitrix_sites_report(FakeSSH())
+        assert 'nginx/bx' in out and '⚠️' in out
+
+
+class TestMySQLReportBranches:
+    def test_ram_unparsable_does_not_crash(self):
+        # строка 'Mem:' без числа (ломаный free): int() бросает, отчёт обязан
+        # продолжить работу без RAM и без рекомендации
+        c = FakeSSH(routes=[('free -m', 'Mem:\n')])
+        out = bx.bitrix_mysql_report(c)
+        assert 'Не удалось определить RAM' in out
+        assert 'дефолт 128M' in out
+
+    def test_pool_close_to_recommendation_is_not_alarming(self):
+        # 8G RAM -> рекомендация 3200M; пул 3072M: не «мало в два раза» и не
+        # «не меньше рекомендации» — честная ветка «близко, критичным не выглядит»
+        c = FakeSSH(routes=[
+            ('free -m', MEM8),
+            ('grep -E', 'innodb_buffer_pool_size = 3072M\n'),
+        ])
+        out = bx.bitrix_mysql_report(c)
+        assert 'близко, критичным не выглядит' in out
+
+    def test_tune_write_failure_reported(self):
+        store = _WriteFailClient()
+        c = FakeSSH(routes=[('free -m', MEM8), ('grep -Eq', 'ok')], client=store)
+        out = bx.bitrix_mysql_tune(c)
+        assert '❌ Не удалось записать' in out
+        assert 'Применится после' not in out
+
+
+class _WriteFailClient:
+    """open_sftp живой, но запись файла бросает (read-only, диск полон)."""
+
+    def open_sftp(self):
+        raise IOError('Read-only file system')
+
+
+class TestGrantsErrorPaths:
+    def test_report_incomplete_dbconn_names_missing_key(self):
+        bad = DBCONN_TEXT.replace('define("DBName", "bitrix_db");', '')
+        out = bx.bitrix_db_grants_report(FakeSSH(routes=[('cat', bad)]))
+        assert 'не найдено: DBName' in out
+
+    def test_report_grants_query_failure(self):
+        # подключение есть (CURRENT_USER прочитался), а SHOW GRANTS отбит —
+        # отдельная ветка, её operators видят при read-only учётке
+        c = FakeSSH(routes=[
+            ('cat', DBCONN_TEXT),
+            ('SELECT CURRENT_USER()', 'bitrix_user@localhost\n'),
+            ('SHOW GRANTS FOR CURRENT_USER()',
+             ('ERROR 1045: access denied', '', 1)),
+        ], client=FakeSftpClient())
+        out = bx.bitrix_db_grants_report(c)
+        assert 'SHOW GRANTS не прошёл' in out
+        assert '1045' in out
+
+    def test_report_mentions_table_level_grants(self):
+        out = bx.bitrix_db_grants_report(
+            FakeSSH(routes=_grants_routes(GRANTS_TABLE_LEVEL),
+                    client=FakeSftpClient()))
+        assert 'Прав на отдельные таблицы: 1' in out
+
+    def test_report_unsafe_ident_points_to_manual(self):
+        # имя базы с запрещённым символом: SQL не отправляем даже в подсказке
+        bad = DBCONN_TEXT.replace('"bitrix_db"', '"bitrix db"')
+        out = bx.bitrix_db_grants_report(
+            FakeSSH(routes=[
+                ('cat', bad),
+                ('SELECT CURRENT_USER()', 'bitrix_user@localhost'),
+                ('SHOW GRANTS FOR CURRENT_USER()', GRANTS_PARTIAL),
+            ], client=FakeSftpClient()))
+        assert 'соберите GRANT вручную' in out
+
+    def test_fix_incomplete_dbconn(self):
+        bad = DBCONN_TEXT.replace('define("DBName", "bitrix_db");', '')
+        out = bx.bitrix_db_grants_fix(FakeSSH(routes=[('cat', bad)]))
+        assert 'не найдено: DBName' in out
+
+    def test_fix_reread_failure_is_reported(self):
+        # GRANT прошёл (rc=0), но перечитать права не удалось: второй заход
+        # CURRENT_USER падает — «верить на слово» нельзя, обязано быть ⚠️
+        c = FakeSSH(routes=[
+            ('cat', DBCONN_TEXT),
+            ('SELECT CURRENT_USER()', ['bitrix_user@localhost',
+                                       ('ERROR 2002 can\'t connect', '', 1)]),
+            ('SHOW GRANTS FOR CURRENT_USER()', GRANTS_PARTIAL),
+        ], client=FakeSftpClient())
+        out = bx.bitrix_db_grants_fix(c)
+        assert 'перечитать права не вышло' in out
+        assert '✅ Права выданы' not in out
+
+
+class TestPermsMissingDirs:
+    def test_absent_writable_dir_is_warning(self):
+        # ни ok, ни ro: каталога нет (например, merged_cache в старой сборке) —
+        # ⚠️ «каталог не найден», а не ❌ «нет доступа»
+        c = FakeSSH(routes=_perms_routes(dirs=''))
+        out = bx.bitrix_perms_report(c)
+        assert 'каталог не найден' in out
+
+    def test_world_writable_count_unparsable_stays_quiet(self):
+        # счётчик o+w не разобрался — врать про «дыру» нельзя: строки с числом
+        # в отчёте не будет вообще
+        c = FakeSSH(routes=_perms_routes(world_cnt='find: error'))
+        out = bx.bitrix_perms_report(c)
+        assert 'доступных на запись всем' not in out
+
+
+class TestMailReportBranches:
+    def test_mailq_dead_is_reported(self):
+        c = FakeSSH(routes=[('mailq 2>&1', '')])
+        out = bx.bitrix_mail_report(c)
+        assert '⚠️ mailq не отвечает' in out
+
+    def test_journalctl_fallback_when_maillog_empty(self):
+        # Debian пишет не в maillog: при пустом maillog отчёт обязан показать
+        # journalctl, а не сделать вид, что логов нет
+        c = FakeSSH(routes=[
+            ('/var/log/maillog', ''),
+            ('journalctl -u postfix -n 15', 'postfix/master: daemon started'),
+        ])
+        out = bx.bitrix_mail_report(c)
+        assert 'journalctl -u postfix' in out
+        assert 'daemon started' in out
+
+
+class TestMailSendUnknownStatus:
+    def test_entry_without_known_status(self):
+        # запись по получателю есть, но status= не распознан (deferred/OE) —
+        # отчёт обязан сказать «смотрите полную строку», а не «✅ ушло»
+        entry = ('Oct 10 12:00:01 host postfix/smtp[1]: AAA1: '
+                 'to=<operator@example.com>, relay=none, delayed 3600 secs')
+        c = FakeSSH(routes=_send_routes(log_entry=entry))
+        out = bx.bitrix_mail_send_test(c, 'operator@example.com')
+        assert 'без знакомого status' in out
+        assert 'status=sent' not in out

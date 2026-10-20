@@ -216,3 +216,26 @@ class TestWindowBuilds:
         app.switch_theme(names[0])
         assert app.current_theme == names[0]
         assert app.output.cget('bg') == gui_mod.get_theme_colors(names[0])['bg']
+
+    def test_panel_menus_switch_by_panel_type(self, app):
+        # меню панелей управляются одним методом, а тесты миксинов подменяют
+        # _set_panel_menus_visible двойником — здесь проверяется сам метод на
+        # реальных виджетах: активна ровно та панель, которая определена
+        for panel, active, inactive in (
+                ('ispmanager', 'isp', 'fp'),
+                ('fastpanel', 'fp', 'isp'),
+                (None, None, None)):
+            app._set_panel_menus_visible(panel)
+            app.root.update()
+            for side, state in ((active, 'normal'), (inactive, 'disabled')):
+                if side is None:
+                    continue
+                btn = getattr(app, f'{side}_menu_btn')
+                assert str(btn.cget('state')) == state, f'{panel}: {side}'
+            for side, mapped in (('isp', panel == 'ispmanager'),
+                                 ('fp', panel == 'fastpanel')):
+                frame = getattr(app, f'{side}manager_frame' if side == 'isp'
+                                else 'fastpanel_frame')
+                # winfo_manager == '' значит pack_forget отработал: меню чужой
+                # панели не должно оставаться в тулбаре
+                assert (frame.winfo_manager() != '') is mapped, f'{panel}: {side}'
