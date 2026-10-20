@@ -229,3 +229,210 @@ def fastpanel_restart_web(checker):
     if done:
         lines.append("✅ php-fpm перезапущен: " + ", ".join(done))
     return "\n".join(lines)
+
+
+# ==================== ISPmanager: ДИАГНОСТИКА «ПАНЕЛЬ НЕ ОТКРЫВАЕТСЯ» ====
+# Самое частое обращение по ISPmanager: веб-интерфейс на :1500 молчит, либо
+# «Access to the panel is blocked by the administrator», либо слетела лицензия
+# после переустановки/смены IP. Пути логов и команды — из документации
+# ispmanager (knowledge-base «Useful commands for ispmanager 6»):
+#   core ispmgr -V          — версия
+#   licctl info|fetch       — лицензия
+#   mgrctl -m ispmgr -u/-l  — разблокировка/блокировка
+#   var/ispmgr.log, core.log, pkg.log — логи модуля, ядра и установщика
+ISP_LOG_PATHS = [
+    '/usr/local/mgr5/var/ispmgr.log',
+    '/usr/local/mgr5/var/core.log',
+    '/usr/local/mgr5/var/pkg.log',
+]
+ISP_PANEL_PORT = 1500
+
+
+def ispmanager_logs_report(checker, tail=40):
+    """Хвосты логов панели (пути — константы модуля, q() для защитного цитирования)."""
+    lines = ["=== ЛОГИ ПАНЕЛИ ISPmanager ==="]
+    found = False
+    for path in ISP_LOG_PATHS:
+        out, _, _ = checker.run(f'test -f {q(path)} && echo yes')
+        if out.strip() != 'yes':
+            continue
+        found = True
+        out, _, _ = checker.run(f'tail -n {int(tail)} {q(path)} 2>&1')
+        lines.append(f"\n--- {path} (последние {tail} строк) ---")
+        lines.append(out.strip() or "(файл пуст)")
+    if not found:
+        lines.append("⚠️ Логи панели не найдены по путям: " + ", ".join(ISP_LOG_PATHS))
+    return "\n".join(lines)
+
+
+def ispmanager_panel_diag(checker):
+    """Почему панель не открывается: процессы, порт, API, лицензия, лог."""
+    lines = ["=== ДИАГНОСТИКА ПАНЕЛИ ISPmanager ==="]
+
+    out, _, _ = checker.run('/usr/local/mgr5/bin/core ispmgr -V 2>&1')
+    version = out.strip()
+    lines.append(f"Версия панели: {version or 'не определена (файл core повреждён?)'}")
+
+    out, _, _ = checker.run('pgrep -f "/usr/local/mgr5/bin/core" >/dev/null && echo yes')
+    core_up = out.strip() == 'yes'
+    out, _, _ = checker.run('pgrep -f "/usr/local/mgr5/bin/ihttpd" >/dev/null && echo yes')
+    ihttpd_up = out.strip() == 'yes'
+    lines.append(f"Процесс core: {'✅ запущен' if core_up else '❌ не запущен'}")
+    lines.append(f"Веб-сервер панели ihttpd: "
+                 f"{'✅ запущен' if ihttpd_up else '❌ не запущен'}")
+
+    out, _, _ = checker.run(
+        "curl -sk -m 5 -o /dev/null -w '%{http_code}' "
+        f"https://127.0.0.1:{ISP_PANEL_PORT}/ 2>/dev/null")
+    code = out.strip() or '000'
+    lines.append(f"Веб-интерфейс :{ISP_PANEL_PORT} (https с localhost): {code}")
+    if code in ('000', ''):
+        lines.append("⚠️ Порт панели не отвечает — панель недоступна даже локально.")
+
+    out, _, rc = checker.run(
+        '/usr/local/mgr5/sbin/mgrctl -m ispmgr sysinfo 2>&1 | head -3')
+    probe = (out or '').strip()
+    low = probe.lower()
+    # Пустой вывод = mgrctl не ответил (ядро мертво или сокет недоступен),
+    # а rc при этом бывает нулевой — считать такое «API отвечает» нельзя.
+    if rc != 0 or not probe or 'error' in low or 'block' in low:
+        lines.append(f"⚠️ Ответ API панели: {probe or 'молчит'}")
+        lines.append("   Если есть «Access to the panel is blocked by the")
+        lines.append("   administrator» — панель заблокирована (часто это идёт")
+        lines.append("   штатное обновление): см. «Разблокировать панель».")
+    else:
+        lines.append("✅ API панели отвечает")
+
+    out, _, _ = checker.run('/usr/local/mgr5/sbin/licctl info ispmgr 2>&1 | head -10')
+    lic = out.strip()
+    lines.append("\nЛицензия (licctl info ispmgr):")
+    lines.append(lic or "⚠️ licctl молчит — попробуйте «Лицензия: обновить»")
+    low = lic.lower()
+    if 'not found' in low or 'invalid' in low or 'expired' in low:
+        lines.append("⚠️ Лицензия не активна: панель работает ещё несколько дней, "
+                     "затем откажет полностью. Проверьте IP панели в биллинге — "
+                     "лицензия привязана к IP (licctl fetch перетянет под текущий).")
+
+    out, _, _ = checker.run(
+        f'tail -n 15 {q(ISP_LOG_PATHS[0])} 2>/dev/null')
+    if out.strip():
+        lines.append(f"\n--- {ISP_LOG_PATHS[0]} (последние 15 строк) ---")
+        lines.append(out.strip())
+    return "\n".join(lines)
+
+
+def ispmanager_unlock(checker):
+    """mgrctl -u: снять блокировку модуля ispmgr и ядра (доки ispmanager)."""
+    lines = ["=== РАЗБЛОКИРОВАНИЕ ПАНЕЛИ ISPmanager ==="]
+    out, err, rc = checker.run('/usr/local/mgr5/sbin/mgrctl -m ispmgr -u 2>&1')
+    if rc != 0:
+        lines.append(f"❌ модуль ispmgr (rc={rc}): {err.strip() or out.strip()}")
+    else:
+        lines.append("✅ Модуль ispmgr разблокирован")
+    out2, err2, rc2 = checker.run('/usr/local/mgr5/sbin/mgrctl -m core -u 2>&1')
+    if rc2 != 0:
+        lines.append(f"❌ ядро core (rc={rc2}): {err2.strip() or out2.strip()}")
+    else:
+        lines.append("✅ Ядро панели разблокировано")
+    if rc == 0 or rc2 == 0:
+        lines.append("⚠️ Блокировка бывает штатной во время pkgupgrade: если")
+        lines.append("   обновление идёт прямо сейчас — дождитесь его окончания.")
+    return "\n".join(lines)
+
+
+def ispmanager_license_refresh(checker):
+    """licctl fetch ispmgr: перетянуть лицензию под текущий IP сервера."""
+    lines = ["=== ОБНОВЛЕНИЕ ЛИЦЕНЗИИ ISPmanager ==="]
+    out, err, rc = checker.run('/usr/local/mgr5/sbin/licctl fetch ispmgr 2>&1')
+    if rc == 0:
+        lines.append("✅ Запрос на сервер лицензий выполнен")
+    else:
+        lines.append(f"❌ Ошибка (rc={rc}): {err.strip() or out.strip()}")
+    out2, _, _ = checker.run('/usr/local/mgr5/sbin/licctl info ispmgr 2>&1 | head -10')
+    lines.append("\nСостояние лицензии теперь:")
+    lines.append(out2.strip() or "(licctl info вернул пусто)")
+    return "\n".join(lines)
+
+
+# ==================== FASTPANEL: ДИАГНОСТИКА И СБРОС ПАРОЛЯ ==============
+# По KB FASTPANEL (kb.fastpanel.direct/ru/troubleshoot/): 404 на :8888 чаще
+# всего означает снятый менеджером пакетов пакет fastpanel2. Пароль fastuser
+# меняется через mogwai chpasswd (docs.fastvps.ru FAQ).
+
+def fastpanel_package_status(checker):
+    """Строка пакета fastpanel2 (dpkg или rpm — ОС в парке разная) или ''."""
+    out, _, _ = checker.run(
+        "dpkg -l 2>/dev/null | grep -i 'fastpanel2' | head -3")
+    if out.strip():
+        return out.strip()
+    out, _, _ = checker.run('rpm -qa 2>/dev/null | grep -i fastpanel2 | head -3')
+    return out.strip()
+
+
+def fastpanel_diag(checker):
+    """Панель не открывается / 404: юнит, journal, пакет, порт, лог, hostname."""
+    lines = ["=== ДИАГНОСТИКА ПАНЕЛИ FASTPANEL ==="]
+
+    unit = fastpanel_unit(checker)
+    if unit:
+        out, _, _ = checker.run(f'systemctl is-active {q(unit)} 2>&1')
+        status = out.strip() or 'unknown'
+        icon = '✅' if status == 'active' else '❌'
+        lines.append(f"{icon} Служба {unit}: {status}")
+        out, _, _ = checker.run(
+            f'journalctl -u {q(unit)} -n 15 --no-pager 2>/dev/null')
+        if out.strip():
+            lines.append(f"--- journal {unit} (последние 15 строк) ---")
+            lines.append(out.strip())
+    else:
+        lines.append("❌ Служба панели не найдена (fastpanel2-engine / fastpanel)")
+
+    pkg = fastpanel_package_status(checker)
+    if pkg:
+        lines.append(f"\n✅ Пакет панели: {pkg}")
+    else:
+        lines.append("\n❌ Пакет fastpanel2 НЕ найден — типичная причина 404 на :8888:")
+        lines.append("   его снимает менеджер пакетов при разрешении зависимостей.")
+        lines.append("   Вернуть: apt install fastpanel2 (или yum install fastpanel2).")
+
+    out, _, _ = checker.run(
+        "curl -sk -m 5 -o /dev/null -w '%{http_code}' "
+        "https://127.0.0.1:8888/ 2>/dev/null")
+    code = out.strip() or '000'
+    lines.append(f"\nВеб-интерфейс :8888 (https с localhost): {code}")
+    if code in ('000', ''):
+        lines.append("⚠️ Порт 8888 не отвечает — смотрите статус службы и journal выше.")
+
+    logs = find_fastpanel_logs(checker, limit=1)
+    for path in logs[:1]:
+        out, _, _ = checker.run(f'tail -n 20 {q(path)} 2>&1')
+        lines.append(f"\n--- {path} (последние 20 строк) ---")
+        lines.append(out.strip() or "(файл пуст)")
+
+    out, _, _ = checker.run('hostname -f 2>/dev/null')
+    host_f = out.strip()
+    if host_f and '.' not in host_f:
+        lines.append(f"\n⚠️ hostname «{host_f}» без точки — ProFTPD и выпуск")
+        lines.append("   сертификатов могут ругаться. Лечение:")
+        lines.append("   hostnamectl hostname www.example.com")
+    return "\n".join(lines)
+
+
+def fastpanel_reset_password(checker, new_password):
+    """mogwai chpasswd: сброс пароля fastuser (доступен только под root)."""
+    lines = ["=== СБРОС ПАРОЛЯ fastuser (FASTPANEL) ==="]
+    if not new_password:
+        lines.append("❌ Пароль не задан")
+        return "\n".join(lines)
+    if len(new_password) < 8:
+        lines.append("❌ FASTPANEL требует пароль не короче 8 символов")
+        return "\n".join(lines)
+    out, err, rc = checker.run(
+        f'mogwai chpasswd --username=fastuser --password={q(new_password)} 2>&1')
+    if rc == 0:
+        lines.append("✅ Пароль изменён (логин входа в панель: fastuser)")
+    else:
+        lines.append(f"❌ Не удалось (rc={rc}): {err.strip() or out.strip()}")
+    lines.append("⚠️ Пароль передавался аргументом команды и был виден в ps:")
+    lines.append("   при возможности смените его на постоянный через панель.")
+    return "\n".join(lines)

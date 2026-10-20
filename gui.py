@@ -19,11 +19,12 @@ from gui_admin import AdminMixin
 from gui_isp import IspmanagerMixin, ISPMANAGER_MENU
 from gui_fastpanel import FastpanelMixin, FASTPANEL_MENU
 from gui_bitrix import BitrixMixin, BITRIX_MENU
+from gui_hosting import HostingMixin, HOSTING_MENU
 from gui_files import FilesMixin
 from common import __version__
 
 
-class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin, FastpanelMixin, BitrixMixin, FilesMixin):
+class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin, FastpanelMixin, BitrixMixin, HostingMixin, FilesMixin):
     def __init__(self):
         self.initial_theme = detect_system_theme()
         self.root = tb.Window(themename=self.initial_theme)
@@ -460,6 +461,14 @@ class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, Checks
         self.bitrix_frame.pack_forget()
         self.bx_menu_btn, self.bx_menu = self._build_panel_menu(
             self.bitrix_frame, "🧩 Битрикс ▾", "success", BITRIX_MENU)
+
+        # Меню «Хостинг» видно при ЛЮБОМ подключении: инвентарь сайтов/почты/зон
+        # работает и на сервере без панели. Включает его gui_runner после connect.
+        self.hosting_frame = tb.Frame(btn_frame, bootstyle="secondary")
+        self.hosting_frame.pack(side=tk.LEFT, padx=5)
+        self.hosting_frame.pack_forget()
+        self.host_menu_btn, self.host_menu = self._build_panel_menu(
+            self.hosting_frame, "🌐 Хостинг ▾", "primary", HOSTING_MENU)
 
         # ---------- КНОПКИ SWAP ----------
         swap_frame = tb.Frame(self.root, bootstyle="secondary")

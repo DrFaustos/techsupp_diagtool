@@ -47,7 +47,35 @@
 - **Замена IPv6** – замена IPv6-адреса во всех файлах в /etc (⚠️ включая бинарные; перед заменой создаётся бэкап /etc)
 - **Перезапуск служб** – перезапуск nginx, mysql, apache
 
+### 🌐 Инвентарь хостинга
+Меню «🌐 Хостинг ▾» видно при **любом** подключении — работает и на сервере без
+панели (сайты по vhost'ам, почта по картам postfix и dovecot):
+- **Полный инвентарь сервера** — сайты + почта + DNS-зоны одним отчётом
+- **Сайты: список и доступность** — панельный источник (`mgrctl webdomain` /
+  `mogwai sites list`) приоритетнее разбора конфигов: владельцем, docroot, версия
+  PHP и источник каждой записи показаны явно; у каждого сайта проверяются
+  http/https-коды и остаток SSL (не больше 25 внешних проб на прогон)
+- **Почта: домены, ящики, очередь** — домены из панели, `postfix virtual`,
+  `dovecot users` и `main.cf` с указанием источника; очередь `mailq`; статусы
+  postfix/dovecot/opendkim/rspamd одной командой. Правая часть строки карты —
+  адрес доставки на чужой сервер — почтовым доменом этого сервера не считается
+- **DNS-зоны на сервере** — `mgrctl dnszone` + файлы зон BIND/nsd с serial'ом;
+  пустой список означает, что NS живёт у регистратора
+- **Досье домена** — всё об одном домене: vhost, логи, http/https/SSL, `dig`
+  A/AAAA/MX с самого сервера, ящики домена и грабля из KB FASTPANEL — домен,
+  привязанный к 127.0.0.1 в `/etc/hosts` (ломает выпуск Let's Encrypt)
+
 ### 🎛️ Управление ISPmanager
+- **Диагностика панели (:1500)** — «почему не открывается» по частым причинам
+  отдельно: версия (`core ispmgr -V`), процессы `core`/`ihttpd`, ответ порта с
+  localhost, probe `mgrctl sysinfo` (ловит «Access to the panel is blocked by
+  the administrator»), лицензия `licctl info` с подсказкой про привязку к IP,
+  хвост `var/ispmgr.log`
+- **Логи панели** — хвосты `var/ispmgr.log`, `var/core.log`, `var/pkg.log`
+- **Разблокировать панель** — `mgrctl -m ispmgr -u` и `mgrctl -m core -u`
+  (с напоминанием: блокировка бывает штатной во время `pkgupgrade`)
+- **Лицензия: обновить** — `licctl fetch ispmgr` перетягивает лицензию под
+  текущий IP (после переноса сервера) и показывает свежий `licctl info`
 - Перезапуск панели (`mgrctl -m ispmgr exit`)
 - Принудительное завершение процесса core (`killall core`, `pkill -9 core`)
 - Обновление панели (`pkgupgrade.sh coremanager`)
@@ -164,6 +192,7 @@ Diagn/
 ├── gui_isp.py          # Меню ISPmanager
 ├── gui_fastpanel.py    # Меню FastPanel
 ├── gui_bitrix.py       # Меню «Битрикс» (BitrixVM)
+├── gui_hosting.py      # Меню «Хостинг»: инвентарь сайтов, почты и DNS-зон
 ├── gui_files.py        # Файловый менеджер (окно, операции)
 ├── fmanager.py         # Файловые операции SFTP + строки таблицы
 ├── diagnostic.py       # Фасад диагностики (реэкспорт, обратная совместимость)
@@ -172,7 +201,8 @@ Diagn/
 ├── logs.py             # Поиск/анализ логов, домены, поиск OOM
 ├── dns.py              # DNS-проверки и работа с резолверами
 ├── files.py            # Файлы, конфиги, замена IP, перезапуск служб
-├── panels.py           # Управление панелями ISPmanager и FastPanel
+├── panels.py           # Панели ISPmanager/FastPanel: управление + диагностика «не открывается»
+├── discovery.py        # Инвентарь хостинга: сайты, почта, DNS-зоны, досье домена
 ├── bitrix.py           # Диагностика BitrixVM: SSL, MySQL, БД (GRANTS), PHP, cron, почта
 ├── reports.py          # Сводный отчёт по диагностике
 ├── webcheck.py         # SSL-сертификаты, WHOIS, порты, grep логов
@@ -196,9 +226,10 @@ Diagn/
 | gui_swap.py | Swap: создание файла подкачки и запись в `/etc/fstab` |
 | gui_dns.py | DNS: проверка доменов, резолверы сервера, диалог их замены |
 | gui_admin.py | Администрирование: замена IPv4/IPv6, перезапуск служб, bash-история, редактор конфигов |
-| gui_isp.py | Меню ISPmanager: перезапуск, kill core, обновление, SSL, отключение, GeoIP, cron |
-| gui_fastpanel.py | Меню FastPanel: состояние панели и стека, логи, перезапуск панели и nginx+php-fpm |
+| gui_isp.py | Меню ISPmanager: диагностика «не открывается» (:1500) и логи панели, разблокировка, лицензия, перезапуск, kill core, обновление, SSL, отключение, GeoIP, cron |
+| gui_fastpanel.py | Меню FastPanel: состояние панели и стека, диагностика :8888 (юнит/journal/пакет/порт/hostname), логи, перезапуск панели и nginx+php-fpm, сброс пароля fastuser |
 | gui_bitrix.py | Меню «Битрикс»: SSL dehydrated, MySQL, кеш Redis/Memcached, доступ к базе и права (GRANTS), PHP, cron-агенты, почта |
+| gui_hosting.py | Меню «🌐 Хостинг»: полный инвентарь сервера, сайты и доступность, почта, DNS-зоны, досье домена |
 | gui_files.py | Файловый менеджер сервера по SFTP: навигация, правка текстовых файлов, скачать/загрузить |
 | fmanager.py | Файловые операции SFTP (list/mkdir/create/delete/rename/get/put) и подготовка строк таблицы |
 | diagnostic.py | Фасад: реэкспортирует функции из модулей ниже (сохранён для совместимости) |
@@ -207,7 +238,8 @@ Diagn/
 | logs.py | find_logs, analyze_access_log, get_domains, check_site_logs, search_oom_logs |
 | dns.py | dns_report, dns_report_local, dns_resolvers_report, set_dns_resolvers |
 | files.py | read_file, write_file, get_config_files, replace_ipv4/ipv6, restart_services |
-| panels.py | Функции управления ISPmanager и FastPanel (restart, status, logs, ssl и т.д.) |
+| panels.py | Управление ISPmanager и FastPanel (restart, status, logs, ssl) + диагностика «панель не открывается»: процессы, порт, лицензия, разблокировка, пакет fastpanel2, сброс пароля fastuser |
+| discovery.py | Инвентарь хостинга: сайты/почта/DNS-зоны из панели (mgrctl, mogwai) и конфигов, проверка доступности, досье домена |
 | bitrix.py | Диагностика BitrixVM: dehydrated, тюнинг InnoDB, кеш (Redis/Memcached), dbconn.php, SHOW GRANTS, PHP, cron.sh, postfix |
 | reports.py | full_diagnostic_report — сводный отчёт |
 | ssh_client.py | Класс SSH-подключения через Paramiko (exec_command + run с кодом возврата) |
@@ -234,7 +266,8 @@ Diagn/
 | Диагностика | Полная диагностика, Диски и память, Сеть, Фаервол, Конфиги веб, Логи сайтов, Анализ логов доступа, Поиск OOM |
 | DNS | DNS-проверка, DNS-резолверы, Изменить DNS |
 | Администрирование | Заменить IPv4, Заменить IPv6, Перезапустить службы, Редактор конфигов, Файлы |
-| Панели | 🛠 ISPmanager ▾ (перезапустить, kill core, обновить, выпуск SSL, отключить, GeoIP, CRON PATH), 🛠 FastPanel ▾ (состояние, логи, перезапуск панели, nginx+php-fpm) |
+| Панели | 🛠 ISPmanager ▾ (диагностика :1500, логи панели, разблокировать, лицензия, перезапустить, kill core, обновить, выпуск SSL, отключить, GeoIP, CRON PATH), 🛠 FastPanel ▾ (состояние, диагностика :8888, логи, перезапуск панели, nginx+php-fpm, сброс пароля fastuser) |
+| Хостинг | 🌐 Хостинг ▾ (полный инвентарь, сайты и доступность, почта, DNS-зоны, досье домена) — видно при любом подключении |
 | 1С-Битрикс | 🧩 Битрикс ▾ (сайты, SSL dehydrated, MySQL, кеш, доступ к базе, права на базу, PHP, cron-агенты, почта) — видно на BitrixVM |
 | Swap | Создать swap файл, Прописать swap в fstab |
 | Доп. проверки | SSL-сертификат, WHOIS, Порты, Grep логов |
@@ -263,15 +296,25 @@ Diagn/
 
 ### FastPanel
 - Определение по наличию `/usr/local/fastpanel/bin/fastpanel`
-- Поиск доменов в `/etc/nginx/fastpanel2-available/*/*.conf`
+- Список сайтов, почтовых доменов и ящиков — CLI панели `mogwai sites list` /
+  `mogwai emails domains list` / `mogwai emails boxes list`; конфиги
+  `/etc/nginx/fastpanel2-available/*/*.conf` — запасной источник
 - Логи сайтов в `/var/www/пользователь/data/logs/*.log`
 - Поддержка суффиксов `-frontend` и `-backend`
+- Диагностика :8888 — юнит (`fastpanel2-engine`/`fastpanel`) + journal,
+  **наличие пакета fastpanel2** (404 на :8888 по KB FASTPANEL чаще всего означает
+  пакет, снятый менеджером зависимостей), порт с localhost, лог, hostname без точки
+- Сброс пароля `fastuser` через `mogwai chpasswd` (проверка длины ≥ 8 на стороне
+  программы, предупреждение что пароль был виден в `ps`)
 
 ### ISPmanager
 - Определение по наличию `/usr/local/mgr5/bin/mgrctl`
-- Поиск доменов через `mgrctl -m webdomain list` или в `/etc/nginx/vhosts/*/*.conf`
-- Логи сайтов в `/var/www/httpd-logs/domain.log`
-- Полный набор кнопок управления панелью
+- Список сайтов/почтовых доменов/DNS-зон — `mgrctl -m ispmgr <element>` (text-формат
+  `key=value`, он отдаётся во всех версиях), владение и docroot — оттуда же; конфиги
+  `/etc/nginx/vhosts/*/*.conf` — запасной источник
+- Логи сайтов в `/var/www/httpd-logs/domain.log`; логи самой панели —
+  `/usr/local/mgr5/var/{ispmgr,core,pkg}.log`
+- Полный набор кнопок управления панелью, диагностика :1500, лицензия `licctl`
 
 ### 1С-Битрикс (BitrixVM)
 - Определение по наличию `/opt/webdir` и `/home/bitrix` — меню «🧩 Битрикс ▾»
@@ -285,6 +328,8 @@ Diagn/
 ### Без панели
 - Определение доменов из стандартных конфигов nginx/apache
 - Логи в `/var/log/nginx/`, `/var/log/apache2/`, `/var/log/httpd/`
+- Меню «🌐 Хостинг» работает и здесь: сайты по vhost'ам, почта по картам postfix,
+  `dovecot users` и `main.cf`, зоны BIND/nsd — панель для инвентаря не нужна
 
 ---
 

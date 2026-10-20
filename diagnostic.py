@@ -56,6 +56,16 @@ from panels import (  # noqa: F401
     ispmanager_check_cron_path, ispmanager_fix_cron_path,
     fastpanel_unit, find_fastpanel_logs, fastpanel_restart, fastpanel_logs,
     fastpanel_status, fastpanel_restart_web,
+    ispmanager_panel_diag, ispmanager_logs_report, ispmanager_unlock,
+    ispmanager_license_refresh,
+    fastpanel_diag, fastpanel_package_status, fastpanel_reset_password,
+)
+
+# --- discovery ---
+from discovery import (  # noqa: F401
+    discover_sites, discover_mail_domains, discover_mailboxes,
+    discover_dns_zones, site_health_report, mail_overview_report,
+    dns_zones_report, hosting_inventory_report, domain_detail_report,
 )
 
 # --- reports ---
@@ -104,8 +114,14 @@ __all__ = [
     'ispmanager_restart', 'ispmanager_kill_core', 'ispmanager_update',
     'ispmanager_ssl_issue', 'ispmanager_disable', 'ispmanager_disable_geoip',
     'ispmanager_check_cron_path', 'ispmanager_fix_cron_path',
+    'ispmanager_panel_diag', 'ispmanager_logs_report', 'ispmanager_unlock',
+    'ispmanager_license_refresh',
     'fastpanel_unit', 'find_fastpanel_logs', 'fastpanel_restart',
     'fastpanel_logs', 'fastpanel_status', 'fastpanel_restart_web',
+    'fastpanel_diag', 'fastpanel_package_status', 'fastpanel_reset_password',
+    'discover_sites', 'discover_mail_domains', 'discover_mailboxes',
+    'discover_dns_zones', 'site_health_report', 'mail_overview_report',
+    'dns_zones_report', 'hosting_inventory_report', 'domain_detail_report',
     'detect_bitrix_env', 'bitrix_sites', 'bitrix_sites_report',
     'bitrix_ssl_report', 'bitrix_ssl_renew',
     'bitrix_mysql_report', 'bitrix_mysql_tune', 'bitrix_db_check',

@@ -93,6 +93,8 @@ class RunnerMixin:
 
         # Меню действий панели: видно только меню определённой панели
         self._set_panel_menus_visible(self.panel_type)
+        # Меню «Хостинг» — при любом подключении: инвентарь не зависит от панели.
+        self._set_hosting_menu_visible(True)
         # Меню «Битрикс» — отдельная проверка: BitrixVM бывает и без панели.
         self._detect_bitrix()
 
@@ -319,6 +321,7 @@ class RunnerMixin:
 
         self._set_panel_menus_visible(None)
         self._set_bitrix_menu_visible(False)
+        self._set_hosting_menu_visible(False)
 
         self.connect_btn.config(text="Подключиться", bootstyle="success", command=self.connect)
         self.log("Соединение закрыто.")

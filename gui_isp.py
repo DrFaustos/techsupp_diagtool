@@ -10,17 +10,23 @@ from diagnostic import (
     ispmanager_restart, ispmanager_kill_core, ispmanager_update,
     ispmanager_ssl_issue, ispmanager_disable, ispmanager_disable_geoip,
     ispmanager_check_cron_path, ispmanager_fix_cron_path,
+    ispmanager_panel_diag, ispmanager_logs_report, ispmanager_unlock,
+    ispmanager_license_refresh,
 )
 
 # Состав меню: (подпись пункта, имя метода класса). None — разделитель:
 # отделяет повседневные действия от разрушительных (Kill core, отключение).
 ISPMANAGER_MENU = [
+    ("Диагностика панели (:1500)", "run_isp_diag"),
+    ("Логи панели", "run_isp_logs"),
     ("Перезапустить панель", "run_isp_restart"),
     ("Обновить панель", "run_isp_update"),
     ("Выпустить Let's Encrypt SSL", "run_isp_ssl"),
     ("Проверить CRON PATH", "run_isp_cron"),
     ("Исправить CRON PATH", "run_isp_fix_cron"),
     ("Отключить GeoIP", "run_isp_geoip"),
+    ("Лицензия: обновить (licctl fetch)", "run_isp_license"),
+    ("Разблокировать панель", "run_isp_unlock"),
     None,
     ("Kill core (принудительно)", "run_isp_kill"),
     ("Отключить панель", "run_isp_disable"),
@@ -84,3 +90,44 @@ class IspmanagerMixin:
             return
         if messagebox.askyesno("Подтверждение", "Закомментировать переменную PATH в crontab?\n⚠️ Это может повлиять на другие cron-задания!", parent=self.root):
             self._run_in_thread(ispmanager_fix_cron_path, self.isp_menu_btn, self.checker)
+
+    # ---------- ДИАГНОСТИКА «ПАНЕЛЬ НЕ ОТКРЫВАЕТСЯ» ----------
+
+    def run_isp_diag(self):
+        # Только чтение (версия, процессы, порт, API, лицензия, лог) —
+        # спрашивать нечего; кеш 60 с, как у отчётов FastPanel.
+        if not self.checker:
+            return
+        self._run_in_thread(ispmanager_panel_diag, self.isp_menu_btn,
+                            self.checker, cache_key='isp_diag')
+
+    def run_isp_logs(self):
+        if not self.checker:
+            return
+        self._run_in_thread(ispmanager_logs_report, self.isp_menu_btn,
+                            self.checker)
+
+    def run_isp_license(self):
+        if not self.checker:
+            return
+        if messagebox.askyesno(
+            "Подтверждение",
+            "Отправить запрос на сервер лицензий ISPsystem (licctl fetch)?\n"
+            "Лицензия привязана к IP панели: помогает после смены IP сервера.",
+            parent=self.root
+        ):
+            self._run_in_thread(ispmanager_license_refresh, self.isp_menu_btn,
+                                self.checker)
+
+    def run_isp_unlock(self):
+        if not self.checker:
+            return
+        if messagebox.askyesno(
+            "Подтверждение",
+            "Снять блокировку панели (mgrctl -u на ispmgr и core)?\n"
+            "⚠️ Блокировка бывает штатной во время обновления: если pkgupgrade "
+            "идёт прямо сейчас — дождитесь его окончания.",
+            parent=self.root
+        ):
+            self._run_in_thread(ispmanager_unlock, self.isp_menu_btn,
+                                self.checker)
