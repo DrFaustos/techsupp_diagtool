@@ -23,6 +23,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import shlex
+import subprocess
+
+import pytest
 
 import discovery as dc
 from support import FakeSSH
@@ -186,14 +189,57 @@ class TestZones:
 
 class TestSiteStatus:
     def test_parse(self):
-        assert dc.parse_site_status('HTTP=200\nHTTPS=301\nSSL=ok') == \
-            {'http': '200', 'https': '301', 'ssl': 'ok'}
+        assert dc.parse_site_status(
+            'HTTP=200\nHTTPS=301\nSSL=ok\nCERT=87') == \
+            {'http': '200', 'https': '301', 'ssl': 'ok', 'cert_days': 87}
+
+    def test_parse_expired_certificate_is_negative(self):
+        # Истёкший сертификат — отрицательное число дней: «истёк 3 дня назад»
+        # и «осталось 5» по одному флагу SSL=bad не различить
+        assert dc.parse_site_status(
+            'HTTP=200\nHTTPS=200\nSSL=bad\nCERT=-3')['cert_days'] == -3
+
+    def test_cert_none_is_not_a_number(self):
+        # Команда печатает CERT=none, когда TLS-хендшейк не состоялся:
+        # превращать это в 0 нельзя (0 означало бы «истекает сегодня»)
+        assert dc.parse_site_status('SSL=none\nCERT=none')['cert_days'] is None
 
     def test_empty_codes_become_000(self):
         assert dc.parse_site_status('') == {'http': '000', 'https': '000',
-                                            'ssl': ''}
+                                            'ssl': '', 'cert_days': None}
         assert dc.parse_site_status('HTTP=\nHTTPS=') == \
-            {'http': '000', 'https': '000', 'ssl': ''}
+            {'http': '000', 'https': '000', 'ssl': '', 'cert_days': None}
+
+    def test_generated_command_is_valid_shell(self):
+        # Команды уходят на сервер как есть — разбор shlex обязан сходиться
+        parts = shlex.split(dc.site_status_command('ex.com'))
+        joined = ' '.join(parts)
+        assert 'ex.com' in joined and ';' in joined
+        assert '-m 8' in joined
+        # Один TLS-хендшейк на домен: -enddate читается раз, из него же и
+        # признак ok/bad, и дни (второй s_client удваивал бы цену прогона)
+        assert joined.count('openssl s_client') == 1
+        assert 'CERT=' in joined
+
+    def test_cert_days_parser(self):
+        assert dc.parse_cert_days('CERT=87') == 87
+        assert dc.parse_cert_days('CERT=-3') == -3
+        assert dc.parse_cert_days('CERT=none') is None
+        assert dc.parse_cert_days('garbage') is None
+        assert dc.parse_cert_days('') is None
+        assert dc.parse_cert_days(None) is None
+
+    def test_cert_days_icons(self):
+        assert dc.cert_days_icon(None) == '❓'     # сертификат не получен
+        assert dc.cert_days_icon(-1) == '❌'        # истёк
+        assert dc.cert_days_icon(0) == '⚠️'         # истечёт сегодня
+        assert dc.cert_days_icon(29) == '⚠️'        # порог 30 дней
+        assert dc.cert_days_icon(30) == '✅'
+
+    def test_cert_days_label(self):
+        assert 'ИСТЁК 3 дн.' in dc.cert_days_label(-3)
+        assert 'осталось 87 дн.' in dc.cert_days_label(87)
+        assert 'не получен' in dc.cert_days_label(None)
 
     def test_generated_command_is_valid_shell(self):
         # Команды уходят на сервер как есть — разбор shlex обязан сходиться
@@ -415,22 +461,94 @@ class TestSiteHealth:
     def test_lists_sites_and_status(self):
         c = FakeSSH(routes=[
             ('mgrctl -m ispmgr webdomain', ISP_WEBDOMAIN),
-            ("printf 'HTTP=", 'HTTP=200\nHTTPS=301\nSSL=ok'),
+            ("printf 'HTTP=",
+             'HTTP=200\nHTTPS=301\nSSL=ok\nCERT=87'),
         ])
         out = dc.site_health_report(c, 'ispmanager')
         assert 'Найдено сайтов: 1' in out
         assert 'site1.ru' in out and 'http=200' in out and 'https=301' in out
-        assert 'SSL ok' in out
+        # Точный остаток вместо прежнего бинарного «SSL ok»: LE живёт 90 дней,
+        # оператору важно «87», а не «ok»
+        assert '✅ SSL осталось 87 дн.' in out
 
-    def test_https_dead_warns_ssl(self):
+    def test_expired_cert_shows_negative_days(self):
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain', ISP_WEBDOMAIN),
+            ("printf 'HTTP=",
+             'HTTP=200\nHTTPS=443\nSSL=bad\nCERT=-3'),
+        ])
+        out = dc.site_health_report(c, 'ispmanager')
+        assert '❌ SSL ИСТЁК 3 дн. назад' in out
+
+    def test_https_dead_reports_no_ssl_probe(self):
         c = FakeSSH(routes=[
             ('mgrctl -m ispmgr webdomain', ISP_WEBDOMAIN),
             ("printf 'HTTP=", 'HTTP=000\nHTTPS=000\nSSL=bad'),
         ])
         out = dc.site_health_report(c, 'ispmanager')
         assert '❌' in out
-        # SSL-пометка ставится только когда HTTPS вообще отвечает
-        assert 'SSL<30д' not in out
+        # HTTPS молчит — SSL-пометки нет: сертификат чужого хоста (дефолтный
+        # vhost) в строке домена выводить нельзя, оператор принял бы его за свой
+        assert 'SSL' not in out
+
+    def test_ssl_expiry_report_empty(self):
+        out = dc.ssl_expiry_report(FakeSSH(), 'none')
+        assert 'не на чём' in out
+
+    def test_ssl_expiry_groups_and_sorts(self):
+        # Ответы привязаны к домену иглой по «-servername домен»: маршрут по
+        # подстроке не зависит от порядка обхода, а значит тест не зависит от
+        # сортировки инвентаря (иначе порядок блоков зависел бы от случайного).
+        # Кавычек в игле нет намеренно: q() = shlex.quote, а домен состоит из
+        # безопасных символов — реальная команда уходит без кавычек.
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain',
+             'name=expired.tld elid=1\nname=soon.tld elid=2\n'
+             'name=ok.tld elid=3\nname=quiet.tld elid=4\n'),
+            ('s_client -servername expired.tld',
+             "HTTP=200\nHTTPS=443\nSSL=bad\nCERT=-5"),
+            ('s_client -servername soon.tld',
+             "HTTP=200\nHTTPS=200\nSSL=bad\nCERT=10"),
+            ('s_client -servername ok.tld',
+             "HTTP=200\nHTTPS=200\nSSL=ok\nCERT=200"),
+            ('s_client -servername quiet.tld',
+             "HTTP=200\nHTTPS=000\nSSL=none\nCERT=none"),
+        ])
+        out = dc.ssl_expiry_report(c, 'ispmanager')
+        assert 'Истекло: 1, истекает < 30 дн.: 1' in out
+        # Пробелы в именах доменов выравниваются, поэтому сравниваем позиции:
+        # мертвые сертификаты обязаны быть выше живых — за ними и открывают.
+        i_exp = out.index('СЕРТИФИКАТЫ ИСТЕКЛИ')
+        i_warn = out.index('ИСТЕКАЮТ МЕНЕЕ ЧЕМ ЗА 30 ДНЕЙ')
+        i_ok = out.index('В порядке')
+        i_quiet = out.index('СЕРТИФИКАТ НЕ ПОЛУЧЕН')
+        assert i_exp < i_warn < i_ok < i_quiet
+        assert 'expired.tld' in out[i_exp:i_warn]
+        assert 'soon.tld' in out[i_warn:i_ok]
+        assert 'ok.tld' in out[i_ok:i_quiet]
+        # У молчащего HTTPS отдельная причина — «https не отвечает», а не «истёк»
+        assert 'https не отвечает' in out[i_quiet:]
+        # Подсказка, где лечить, обязана быть, когда есть что лечить
+        assert "Let's Encrypt" in out
+
+    def test_ssl_expiry_healthy_has_no_scrolling(self):
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain', 'name=ok.tld elid=1\n'),
+            ('s_client -servername ok.tld',
+             "HTTP=200\nHTTPS=200\nSSL=ok\nCERT=87"),
+        ])
+        out = dc.ssl_expiry_report(c, 'ispmanager')
+        assert 'Истекло: 0, истекает < 30 дн.: 0' in out
+        assert 'СЕРТИФИКАТЫ ИСТЕКЛИ' not in out
+        assert 'СЕРТИФИКАТ НЕ ПОЛУЧЕН' not in out
+
+    def test_ssl_expiry_is_capped_too(self):
+        rows = ''.join(f'name=site{i}.tld elid={i} owner=u\n'
+                       for i in range(30))
+        c = FakeSSH(routes=[('mgrctl -m ispmgr webdomain', rows)])
+        out = dc.ssl_expiry_report(c, 'ispmanager')
+        assert 'Проверено доменов: 25 из 30' in out
+        assert c.count("s_client -servername") == 25
 
     def test_health_check_is_capped(self):
         rows = ''.join(f'name=site{i}.tld elid={i} owner=u\n'
@@ -523,3 +641,438 @@ class TestInventoryAndDomain:
         ])
         out = dc.domain_detail_report(c, 'site1.ru', 'ispmanager')
         assert 'Лог доступа: /var/www/biz/site1.ru/logs/access.log' in out
+
+
+# ==================== ОПЕРАЦИИ С ЯЩИКАМИ: чистые функции ====================
+class TestMailboxValidation:
+    def test_address_is_normalized(self):
+        # Панель хранит ящики строчными: 'Info@Site.RU' без нормализации создал
+        # бы дубль, который ни списком, ни удалением не находится
+        assert dc.parse_mailbox_address('  Info@Example.COM ') == \
+            (('info', 'example.com'), None)
+
+    def test_punycode_domain_accepted(self):
+        # Кириллический домен оператор обязан дать punycode — проверка это
+        # принимает и не пытается кодировать сам
+        assert dc.parse_mailbox_address('a@xn--80ak6aa92e.com')[0] == \
+            ('a', 'xn--80ak6aa92e.com')
+
+    def test_simple_two_level_domain_ok(self):
+        assert dc.parse_mailbox_address('a@b.c')[0] == ('a', 'b.c')
+
+    @pytest.mark.parametrize('bad,fragment', [
+        ('nodomain', 'полным адресом'),
+        ('two@@ex.com', 'полным адресом'),
+        ('bad name@ex.com', 'допустимы'),
+        ('info@ex..com', 'не похож на домен'),
+        ('info@-example.com', 'не похож на домен'),
+        ('info@рф.рф', 'punycode'),
+        ('', 'полным адресом'),
+        (None, 'полным адресом'),
+    ])
+    def test_rejected_with_human_reason(self, bad, fragment):
+        parsed, err = dc.parse_mailbox_address(bad)
+        assert parsed is None
+        assert fragment in err
+
+
+class TestMailboxCommands:
+    """Сборщики команд: синтаксис — из официальной документации панелей."""
+
+    def test_isp_create_matches_kb_script(self):
+        # KB ispmanager (массовое создание): email.edit domainname/name/plid/
+        # aliases/passwd/confirm/sok=ok, БЕЗ elid — именно создание
+        cmd = dc.isp_mailbox_create_command('info', 'example.com', 'Sec ret1')
+        assert 'email.edit' in cmd and 'elid' not in cmd
+        assert 'domainname=example.com' in cmd and 'name=info' in cmd
+        assert 'plid=example.com' in cmd and "aliases=''" in cmd
+        assert 'sok=ok' in cmd
+        assert "passwd='Sec ret1'" in cmd
+
+    def test_isp_passwd_targets_by_full_address(self):
+        # elid ящика — полный адрес (KB: email.responder elid=admin@domain.com)
+        cmd = dc.isp_mailbox_passwd_command('info@example.com', 'pw12345678')
+        assert 'email.edit' in cmd and 'elid=info@example.com' in cmd
+        assert 'sok=ok' in cmd
+
+    def test_isp_delete_uses_email_delete(self):
+        cmd = dc.isp_mailbox_delete_command('info@example.com')
+        assert 'email.delete' in cmd and 'elid=info@example.com' in cmd
+
+    def test_fp_create_matches_kb(self):
+        # KB FASTPANEL: mogwai emails boxes create --domain --login --password
+        cmd = dc.fp_mailbox_create_command('info', 'example.com', 'pw 12345')
+        assert 'mogwai emails boxes create' in cmd
+        assert '--domain=example.com' in cmd and '--login=info' in cmd
+        assert "--password='pw 12345'" in cmd
+
+    def test_fp_delete_takes_numeric_id_only(self):
+        assert dc.fp_mailbox_delete_command(7) == \
+            'mogwai emails boxes delete -b 7 2>&1'
+        # строка-цифра тоже проходит (из вывода boxes list приходят строки)
+        assert '-b 12' in dc.fp_mailbox_delete_command('12')
+        # мусор обязан упасть: 'delete -b <мусор>' хуже, чем исключение
+        with pytest.raises((ValueError, TypeError)):
+            dc.fp_mailbox_delete_command('7; rm -rf /')
+
+    def test_all_commands_are_valid_shell_and_injection_safe(self):
+        """Заражённое значение обязано остаться ОДНИМ параметром команды.
+
+        Считать «сколько раз встретилось rm -rf» бессмысленно: ISPmanager
+        требует passwd И confirm, то же значение входит в команду дважды — это
+        штатно. Проверяем другое: каждый токен, куда попало значение, начинается
+        с имени параметра. Кривая кавычка распала бы '$(rm -rf /)' на отдельные
+        аргументы (rm, -rf) — вот это и есть настоящая инъекция.
+        """
+        evil = "x'$(rm -rf /)`tick`\"dq\""
+        prefixes = ('passwd=', 'confirm=', '--password=', 'elid=')
+        for cmd in (dc.isp_mailbox_create_command('a', 'ex.com', evil),
+                    dc.isp_mailbox_passwd_command('a@ex.com', evil),
+                    dc.isp_mailbox_delete_command('a@ex.com; rm -rf /'),
+                    dc.fp_mailbox_create_command('a', 'ex.com', evil)):
+            parts = shlex.split(cmd)
+            tainted = [p for p in parts if 'rm -rf' in p]
+            assert tainted, cmd                       # значение дошло, а не исчезло
+            for token in tainted:
+                assert token.startswith(prefixes), (cmd, token)
+            assert 'rm' not in parts and '-rf' not in parts, cmd
+            proc = subprocess.run(['bash', '-n', '-c', cmd],
+                                  capture_output=True, text=True)
+            assert proc.returncode == 0, cmd
+
+    def test_isp_create_passes_password_twice_by_design(self):
+        # passwd + confirm — требование панели (форма создания ящика). Тест
+        # держит это как договор: убрав confirm, получим невнятную ошибку API.
+        parts = shlex.split(dc.isp_mailbox_create_command('a', 'ex.com', 'pw'))
+        assert parts.count('passwd=pw') == 1
+        assert parts.count('confirm=pw') == 1
+
+
+# ============ ОПЕРАЦИИ С ЯЩИКАМИ: пред-проверки и маскирование ============
+# Guard — единственное, что стоит между оператором и разрушающей командой
+# панели. Проверяем его отдельно от исполнения: на FakeSSH видно и «панель
+# ответила ошибкой», и «список не получен» — обе ветки обязаны отказывать.
+ISP_MAIL_ENV = [
+    ('mgrctl -m ispmgr maildomain', 'name=example.com elid=3\n'),
+    ('mgrctl -m ispmgr email',
+     'name=info@example.com domainname=example.com\n'),
+]
+
+
+class TestMailboxGuard:
+    def test_create_ok_for_new_box_on_mail_domain(self):
+        c = FakeSSH(routes=ISP_MAIL_ENV)
+        assert dc.mailbox_guard(c, 'new@example.com', 'ispmanager',
+                                'create') is None
+
+    def test_address_is_normalized_before_check(self):
+        # 'Info@EXAMPLE.com' — тот же ящик, что info@example.com: без
+        # нормализации guard пропустил бы дубль, а панель молча поменяла бы
+        # пароль существующего ящика
+        c = FakeSSH(routes=ISP_MAIL_ENV)
+        reason = dc.mailbox_guard(c, '  Info@EXAMPLE.COM ', 'ispmanager',
+                                  'create')
+        assert reason and 'уже существует' in reason
+
+    def test_create_requires_mail_domain(self):
+        c = FakeSSH(routes=ISP_MAIL_ENV)
+        reason = dc.mailbox_guard(c, 'a@other.tld', 'ispmanager', 'create')
+        assert 'не является почтовым доменом' in reason
+        # известные домены показаны: оператору нужно знать, куда идти
+        assert 'example.com' in reason
+
+    def test_passwd_requires_existing_box(self):
+        c = FakeSSH(routes=ISP_MAIL_ENV)
+        assert dc.mailbox_guard(c, 'info@example.com', 'ispmanager',
+                                'passwd') is None
+        reason = dc.mailbox_guard(c, 'ghost@example.com', 'ispmanager',
+                                  'delete')
+        assert 'не найден' in reason
+
+    def test_unknown_box_list_refuses_destructive_mode(self):
+        # Список ящиков НЕ получен (mgrctl упал): «не нашёл» и «не знаю» —
+        # разные вещи. Удалить по unverifiable-адресу дороже, чем не удалить.
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=example.com elid=3\n'),
+                            ('mgrctl -m ispmgr email',
+                             'ERROR: connection refused\n')])
+        known, ok = dc.known_mailbox_addresses(c, 'ispmanager')
+        assert known == set() and ok is False
+        reason = dc.mailbox_guard(c, 'info@example.com', 'ispmanager',
+                                  'delete')
+        assert 'Список ящиков панели не получен' in reason
+
+    def test_empty_list_is_a_real_empty_not_unknown(self):
+        # Панель ответла корректно и списком ничего: создать ПЕРВЫЙ ящик можно
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=example.com elid=3\n'),
+                            ('mgrctl -m ispmgr email', '')])
+        known, ok = dc.known_mailbox_addresses(c, 'ispmanager')
+        assert known == set() and ok is True
+        assert dc.mailbox_guard(c, 'first@example.com', 'ispmanager',
+                                'create') is None
+
+    def test_fastpanel_source_used(self):
+        c = FakeSSH(routes=[
+            ('mogwai emails domains list', 'ID\tNAME\n1\texample.com\n'),
+            ('mogwai emails boxes list', 'ID\tADDRESS\n5\tinfo@example.com\n'),
+        ])
+        known, ok = dc.known_mailbox_addresses(c, 'fastpanel')
+        assert known == {'info@example.com'} and ok
+        assert dc.mailbox_guard(c, 'info@example.com', 'fastpanel',
+                                'passwd') is None
+        assert 'не найден' in dc.mailbox_guard(c, 'nope@example.com',
+                                               'fastpanel', 'delete')
+
+    @pytest.mark.parametrize('mode', ['create', 'passwd', 'delete'])
+    def test_bad_address_never_reaches_panel(self, mode):
+        # Команда не отправляется вообще: проверок нет в маршрутах, и любой
+        # вызов run() попадёт в default -> команда была бы видна в c.commands
+        c = FakeSSH(routes=ISP_MAIL_ENV)
+        assert dc.mailbox_guard(c, 'garbage', 'ispmanager', mode) is not None
+        assert c.commands == []
+
+
+class TestIspRows:
+    def test_ok_rows(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr email',
+                             'name=a@b.c elid=1\n')])
+        rows, ok, raw = dc.isp_rows(c, 'email')
+        assert ok and rows[0]['name'] == 'a@b.c' and raw
+
+    def test_error_in_stdout_is_not_ok(self):
+        # mgrctl пишет ошибку в stdout, rc при этом бывает 0 — «успех»
+        # решается по содержимому, иначе guard посчитал бы пустоту списком
+        c = FakeSSH(routes=[('mgrctl -m ispmgr email',
+                             ('ERROR=access denied', '', 0))])
+        rows, ok, raw = dc.isp_rows(c, 'email')
+        assert ok is False and 'access denied' in raw
+
+    def test_stderr_shown_when_stdout_empty(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr email',
+                             ('', 'no such manager', 1))])
+        _rows, ok, raw = dc.isp_rows(c, 'email')
+        assert ok is False and raw == 'no such manager'
+
+
+class TestRedactSecrets:
+    def test_password_with_space_is_fully_masked(self):
+        # Regression: регэксп по пробелам съедал только первое слово,
+        # 'sup3r secret' уезжал в отчёт наполовину
+        cmd = dc.isp_mailbox_create_command('a', 'ex.com', 'sup3r secret')
+        out = dc.redact_secrets(cmd)
+        assert 'sup3r' not in out and 'secret' not in out
+        assert 'passwd=***' in out and 'confirm=***' in out
+
+    def test_plain_values_masked(self):
+        out = dc.redact_secrets(dc.fp_mailbox_create_command('a', 'ex.com',
+                                                            'pw12345678'))
+        assert 'pw12345678' not in out and '--password=***' in out
+
+    def test_multiline_output_masked_by_regex(self):
+        # Вывод панели — не команда, shlex по нему не проходит; значения в
+        # кавычках регэксп обязан снимать целиком
+        out = dc.redact_secrets('bad passwd=abc123\n'
+                               'confirm="with space" x')
+        assert 'abc123' not in out and 'with space' not in out
+
+    def test_benign_text_untouched(self):
+        cmd = 'mogwai emails boxes delete -b 7 2>&1'
+        assert dc.redact_secrets(cmd) == cmd
+
+    def test_empty_and_none_safe(self):
+        assert dc.redact_secrets('') == ''
+        assert dc.redact_secrets(None) == ''
+
+    def test_password_policy_refuses_short_before_panel(self):
+        assert dc.password_policy('') and 'не задан' in dc.password_policy('')
+        assert '8' in dc.password_policy('abc123')
+        assert dc.password_policy('longenough') is None
+        # ровно граница: 8 символов проходит
+        assert dc.password_policy('12345678') is None
+
+
+class TestFindFpMailboxId:
+    def test_found_case_insensitive(self):
+        rows = [{'ID': '12', 'ADDRESS': 'Info@Example.COM'}]
+        assert dc.find_fp_mailbox_id(rows, 'info@example.com') == 12
+
+    def test_missing_returns_none(self):
+        rows = [{'ID': '12', 'ADDRESS': 'info@example.com'}]
+        assert dc.find_fp_mailbox_id(rows, 'nope@example.com') is None
+
+    def test_non_numeric_id_is_none_not_crash(self):
+        rows = [{'ID': 'N/A', 'ADDRESS': 'a@b.c'}]
+        assert dc.find_fp_mailbox_id(rows, 'a@b.c') is None
+
+    def test_empty_rows(self):
+        assert dc.find_fp_mailbox_id([], 'a@b.c') is None
+
+
+# ==================== ДЕЙСТВИЯ С ЯЩИКАМИ: исполнение ====================
+# Иглы обязательно ТОЧНЫЕ: 'mgrctl -m ispmgr email' — подстрока команды
+# email.edit, и без хвоста '2>&1'mgrctl eats the sequence element meant for
+# the list re-read. Порядок маршрутов тоже решает: специфичные иглы вперёд.
+ISP_LIST = "mgrctl -m ispmgr email 2>&1"
+
+
+def isp_env(lists, edit=('maildomain', 'name=example.com elid=3\n')):
+    """FakeSSH с почтовым доменом, списком ящиков (последовательность) и edit."""
+    return FakeSSH(routes=[
+        ('mgrctl -m ispmgr maildomain', edit[1]),
+        ('mgrctl -m ispmgr email.edit', ('', '', 0)),
+        ('mgrctl -m ispmgr email.delete', ('', '', 0)),
+        (ISP_LIST, lists),
+    ])
+
+
+class TestMailboxActionsIspmanager:
+    def test_create_confirmed_by_list_reread(self):
+        c = isp_env(['name=info@example.com elid=5\n',
+                     'name=info@example.com elid=5\n'
+                     'name=new@example.com elid=6\n'])
+        out = dc.mailbox_create(c, ' new@Example.com ', 'Sup3rSecret!',
+                                'ispmanager')
+        assert '✅ Ящик new@example.com создан' in out
+        # Команда показана (повторить руками) и маска в ней
+        assert '$ /usr/local/mgr5/sbin/mgrctl -m ispmgr email.edit' in out
+        assert 'passwd=***' in out and 'confirm=***' in out
+        # Пароль не уехал ни в команду-эхо, ни в отчёт
+        assert 'Sup3rSecret!' not in out
+        # Предупреждение про ps — пароль был в аргументах, это факт
+        assert 'виден в ps' in out
+
+    def test_password_checked_before_any_panel_call(self):
+        # Короткий пароль: панель не дёргается вообще (ни maildomain, ни edit)
+        c = isp_env([''])
+        out = dc.mailbox_create(c, 'a@example.com', 'short', 'ispmanager')
+        assert '8 символов' in out
+        assert c.commands == []
+
+    def test_empty_password_no_call(self):
+        c = isp_env([''])
+        assert '❌ Пароль не задан' in dc.mailbox_create(c, 'a@example.com', '',
+                                                        'ispmanager')
+        assert c.commands == []
+
+    def test_create_blocked_before_panel_when_domain_not_mail(self):
+        c = isp_env([''])
+        out = dc.mailbox_create(c, 'a@other.tld', 'Sup3rSecret!', 'ispmanager')
+        assert '⛔ Операция отменена до отправки команды панели' in out
+        assert c.find('email.edit') is None      # разрушающей команды не было
+
+    def test_create_blocked_when_box_exists(self):
+        c = isp_env(['name=info@example.com elid=5\n'])
+        out = dc.mailbox_create(c, 'INFO@example.com', 'Sup3rSecret!',
+                                'ispmanager')
+        assert 'уже существует' in out
+        assert c.find('email.edit') is None
+
+    def test_panel_error_is_reported_and_not_claimed_ok(self):
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr maildomain', 'name=example.com elid=3\n'),
+            ('mgrctl -m ispmgr email.edit',
+             ('ERROR=weak password', 'rc', 0)),
+            (ISP_LIST, ''),
+        ])
+        out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!',
+                                'ispmanager')
+        assert 'weak password' in out
+        assert 'создан' not in out
+
+    def test_warning_when_list_unreadable_after_success(self):
+        # Команда прошла, но перечитать список не удалось: честно говорим
+        # «проверьте вручную», а не рапортуем успех по rc=0
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr maildomain', 'name=example.com elid=3\n'),
+            ('mgrctl -m ispmgr email.edit', ('', '', 0)),
+            (ISP_LIST, ['name=info@example.com\n', 'ERROR=timeout']),
+        ])
+        out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!',
+                                'ispmanager')
+        assert 'список ящиков после неё не получен' in out
+        assert '✅' not in out
+
+    def test_create_silent_panel_but_box_absent_warns(self):
+        c = isp_env(['name=info@example.com elid=5\n',
+                     'name=info@example.com elid=5\n'])
+        out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!',
+                                'ispmanager')
+        assert 'не появился в списке панели' in out
+        assert '✅' not in out
+
+    def test_delete_confirmed_absent(self):
+        c = isp_env(['name=info@example.com elid=5\n', ''])
+        out = dc.mailbox_delete(c, 'Info@Example.COM', 'ispmanager')
+        assert '✅ Ящик info@example.com удалён' in out
+        assert 'email.delete' in c.find('email.delete')
+
+    def test_delete_survives_despite_panel_silence_if_still_listed(self):
+        c = isp_env(['name=info@example.com elid=5\n'] * 2)
+        out = dc.mailbox_delete(c, 'info@example.com', 'ispmanager')
+        assert 'всё ещё в списке' in out
+        assert '✅' not in out
+
+    def test_passwd_confirmed(self):
+        c = isp_env(['name=info@example.com elid=5\n'] * 2)
+        out = dc.mailbox_passwd(c, 'info@example.com', 'Sup3rSecret!',
+                                'ispmanager')
+        assert '✅ Ящик info@example.com: пароль изменён' in out
+        assert 'elid=info@example.com' in c.find('email.edit')
+
+    def test_no_panel_means_no_command(self):
+        c = isp_env([''])
+        out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'none')
+        assert 'недоступно' in out and 'mogwai' in out
+        assert c.find('email.edit') is None
+
+
+class TestMailboxActionsFastpanel:
+    FP_ENV = [
+        ('mogwai emails domains list', 'ID\tNAME\n1\texample.com\n'),
+        ('mogwai emails boxes create', ('', '', 0)),
+        ('mogwai emails boxes delete', ('', '', 0)),
+        ('mogwai emails boxes list', 'ID\tADDRESS\n5\tinfo@example.com\n'),
+    ]
+
+    def test_create_uses_kb_command(self):
+        c = FakeSSH(routes=self.FP_ENV)
+        out = dc.mailbox_create(c, 'new@example.com', 'Sup3rSecret!',
+                                'fastpanel')
+        assert 'mogwai emails boxes create' in out
+        # ящика new@ в списке mogwai нет (заглушка отдаёт info@) — честное ⚠️
+        assert 'не появился в списке панели' in out
+        assert 'Sup3rSecret!' not in out
+
+    def test_delete_by_numeric_id(self):
+        c = FakeSSH(routes=[
+            ('mogwai emails domains list', 'ID\tNAME\n1\texample.com\n'),
+            ('mogwai emails boxes delete', ('', '', 0)),
+            ('mogwai emails boxes list',
+             ['ID\tADDRESS\n5\tinfo@example.com\n',
+              'ID\tADDRESS\n5\tinfo@example.com\n',
+              'ID\tADDRESS\n']),
+        ])
+        out = dc.mailbox_delete(c, 'info@example.com', 'fastpanel')
+        assert c.find('mogwai emails boxes delete -b 5') is not None
+        assert '✅ Ящик info@example.com удалён' in out
+
+    def test_delete_refused_without_numeric_id(self):
+        # ID не число → удалять нельзя: 'delete -b <мусор>' хуже отказа
+        c = FakeSSH(routes=[
+            ('mogwai emails domains list', 'ID\tNAME\n1\texample.com\n'),
+            ('mogwai emails boxes list', 'ID\tADDRESS\nN/A\tinfo@example.com\n'),
+        ])
+        out = dc.mailbox_delete(c, 'info@example.com', 'fastpanel')
+        assert 'не вернул числовой ID' in out
+        assert c.find('boxes delete') is None
+
+    def test_passwd_unsupported_without_inventing_flags(self):
+        # У mogwai нет смены пароля ящика — выдумывать --password нельзя;
+        # команда создания не должна быть вызвана «вместо» неё
+        c = FakeSSH(routes=self.FP_ENV)
+        out = dc.mailbox_passwd(c, 'info@example.com', 'Sup3rSecret!',
+                                'fastpanel')
+        assert 'не предусмотрена' in out
+        assert c.find('boxes create') is None
+        assert c.find('boxes delete') is None

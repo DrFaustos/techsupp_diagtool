@@ -7,6 +7,27 @@ FakeSSH имитирует ServerChecker: ответы подбираются п
 """
 
 
+def menu_handlers(menu):
+    """Имена обработчиков из состава меню — рекурсивно, включая подменю.
+
+    Состав меню: [(подпись, имя_метода)], None (разделитель) либо
+    (подпись, [пункты]) — вложенное подменю. Раньше тесты распаивали пару
+    списковым comprehension'ом; с появлением подменю он бросил бы TypeError на
+    getattr(список), поэтому сбор вынесен сюда и стал общим для всех меню.
+    Подписи подменю и разделители в список не попадают — обработчика у них нет.
+    """
+    out = []
+    for entry in menu:
+        if entry is None:
+            continue
+        _label, value = entry
+        if isinstance(value, (list, tuple)):
+            out.extend(menu_handlers(value))
+        else:
+            out.append(value)
+    return out
+
+
 class FakeSSH:
     """Заглушка ServerChecker с маршрутизацией команд по подстроке."""
 

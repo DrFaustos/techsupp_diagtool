@@ -16,7 +16,7 @@ if ROOT not in sys.path:
 
 import gui_fastpanel as gf
 from gui_fastpanel import FASTPANEL_MENU, FastpanelMixin
-from support import FakeSSH
+from support import FakeSSH, menu_handlers
 
 
 class _Btn:
@@ -52,8 +52,9 @@ class _Host(FastpanelMixin):
 
 
 # None в меню — разделитель (отделяет перезапуски), обработчика у него нет.
-# Фильтр ДО распаковки пары: распаковка None роняет сбор тестов.
-ALL_HANDLERS = [m for entry in FASTPANEL_MENU if entry for _, m in [entry]]
+# Сбор обработчиков — общий menu_handlers: разделители фильтрует и подменю
+# разворачивает рекурсивно.
+ALL_HANDLERS = menu_handlers(FASTPANEL_MENU)
 RESTART_MAP = [
     ("run_fp_restart", "fastpanel_restart"),
     ("run_fp_restart_web", "fastpanel_restart_web"),

@@ -20,7 +20,7 @@ if ROOT not in sys.path:
 
 import gui_bitrix as gb
 from gui_bitrix import BITRIX_MENU, BitrixMixin
-from support import FakeSSH
+from support import FakeSSH, menu_handlers
 
 
 class _Btn:
@@ -97,9 +97,10 @@ class _Host(BitrixMixin):
         fn(*args)
 
 
-# None в меню — разделитель перед действиями, меняющими сервер. Фильтр обязан
-# стоять ДО распаковки пары: распаковка None роняет сбор тестов.
-ALL_HANDLERS = [m for entry in BITRIX_MENU if entry for _, m in [entry]]
+# None в меню — разделитель перед действиями, меняющими сервер. Обработчики
+# собирает общий menu_handlers: разделители он пропускает, подменю разворачивает
+# рекурсивно — раньше это делал inline-компрегенс и на подменю он бы упал.
+ALL_HANDLERS = menu_handlers(BITRIX_MENU)
 
 # Отчёты: (обработчик, бэкенд, cache_key) — отчёт ничего не меняет, спрашивать
 # нечего, результат кешируется 60 с.
@@ -136,8 +137,7 @@ class TestMenuIntegrity:
     def test_separator_isolates_server_changing_actions(self):
         # После разделителя — только действия, меняющие сервер.
         sep = BITRIX_MENU.index(None)
-        after = [m for entry in BITRIX_MENU[sep + 1:] if entry
-                 for _, m in [entry]]
+        after = menu_handlers(BITRIX_MENU[sep + 1:])
         assert after == ["run_bx_ssl_renew", "run_bx_mysql_tune",
                          "run_bx_db_grants_fix", "run_bx_mail_test",
                          "run_bx_cron_install", "run_bx_perms_fix"]

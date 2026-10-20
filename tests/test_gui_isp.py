@@ -18,7 +18,7 @@ if ROOT not in sys.path:
 
 import gui_isp
 from gui_isp import ISPMANAGER_MENU, IspmanagerMixin
-from support import FakeSSH
+from support import FakeSSH, menu_handlers
 
 
 class _Btn:
@@ -57,9 +57,10 @@ class _Host(IspmanagerMixin):
         self.calls.append((target_func, btn, args, kwargs))
 
 
-# None в меню — разделитель, у него обработчика нет. Фильтр обязан стоять ДО
-# распаковки пары: распаковка None и есть та ошибка, которую ловили.
-ALL_HANDLERS = [m for entry in ISPMANAGER_MENU if entry for _, m in [entry]]
+# None в меню — разделитель, у него обработчика нет. Обработчики собирает общий
+# menu_handlers: он фильтрует разделители и понимает вложенные подменю
+# (распаковка пары списковым comprehension'ом упала бы на подменю).
+ALL_HANDLERS = menu_handlers(ISPMANAGER_MENU)
 # Каждый обработчик с подтверждением и бэкенд, который он обязан вызвать.
 CONFIRM_MAP = [
     ("run_isp_restart", "ispmanager_restart"),
