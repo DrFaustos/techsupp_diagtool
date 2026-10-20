@@ -133,3 +133,61 @@ class TestNoConfirmation:
         assert host.calls[0][0] is gui_isp.ispmanager_check_cron_path
         assert host.calls[0][2] == (checker,)
         assert dialogs.asked == []
+
+
+class TestPanelDiagnostics:
+    """Пункты «панель не открывается»: отчёты уходят без подтверждения."""
+
+    @pytest.mark.parametrize("handler,backend,cache_key", [
+        ("run_isp_diag", "ispmanager_panel_diag", "isp_diag"),
+        # Логи намеренно БЕЗ cache_key: после только что выполненного лечения
+        # оператор обязан увидеть свежий хвост, а не кеш 60-секундной давности.
+        ("run_isp_logs", "ispmanager_logs_report", None),
+    ])
+    def test_reports_run_without_confirmation(self, monkeypatch, handler,
+                                              backend, cache_key):
+        checker = FakeSSH()
+        host = _Host(checker)
+        dialogs = _Dialogs()
+        monkeypatch.setattr(gui_isp, "messagebox", dialogs)
+        getattr(host, handler)()
+        assert len(host.calls) == 1
+        fn, btn, args, kwargs = host.calls[0]
+        assert fn is getattr(gui_isp, backend), handler
+        assert btn is host.isp_menu_btn
+        assert args == (checker,)
+        assert kwargs == ({"cache_key": cache_key} if cache_key else {})
+        assert dialogs.asked == []
+
+
+class TestUnlockAndLicense:
+    """Разблокировка и лицензия меняют состояние панели — только с вопросом
+    и без кеша (закешенное «до действия» после него врёт)."""
+
+    CONFIRM = [
+        ("run_isp_unlock", "ispmanager_unlock"),
+        ("run_isp_license", "ispmanager_license_refresh"),
+    ]
+
+    @pytest.mark.parametrize("handler,backend", CONFIRM)
+    def test_declined_does_not_run_anything(self, monkeypatch, handler, backend):
+        host = _Host(FakeSSH())
+        monkeypatch.setattr(gui_isp, "messagebox", _Dialogs(askyesno_ret=False))
+        getattr(host, handler)()
+        assert host.calls == []
+
+    @pytest.mark.parametrize("handler,backend", CONFIRM)
+    def test_confirmed_runs_backend_without_cache(self, monkeypatch, handler,
+                                                  backend):
+        checker = FakeSSH()
+        host = _Host(checker)
+        dialogs = _Dialogs(askyesno_ret=True)
+        monkeypatch.setattr(gui_isp, "messagebox", dialogs)
+        getattr(host, handler)()
+        assert len(host.calls) == 1
+        fn, btn, args, kwargs = host.calls[0]
+        assert fn is getattr(gui_isp, backend), handler
+        assert btn is host.isp_menu_btn
+        assert args == (checker,)
+        assert kwargs == {}
+        assert dialogs.asked, "обработчик обязан спросить подтверждение"

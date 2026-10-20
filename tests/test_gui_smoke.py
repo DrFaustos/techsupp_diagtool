@@ -184,6 +184,7 @@ class TestWindowBuilds:
                      'isp_menu_btn', 'isp_menu',
                      'fastpanel_frame', 'fp_menu_btn', 'fp_menu',
                      'bitrix_frame', 'bx_menu_btn', 'bx_menu',
+                     'hosting_frame', 'host_menu_btn', 'host_menu',
                      'ip_var', 'port_var', 'user_var', 'password_var', 'key_var'):
             assert hasattr(app, attr), f'нет виджета/поля {attr}'
 

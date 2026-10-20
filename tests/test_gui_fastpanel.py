@@ -128,3 +128,61 @@ class TestRestartConfirmation:
         assert args == (checker,)
         assert kwargs == {}
         assert dialogs.asked, "перезапуск обязан спрашивать подтверждение"
+
+
+class _Strings:
+    """Двойник simpledialog.askstring: отдаёт ret и считает обращения."""
+
+    def __init__(self, ret=None):
+        self.ret = ret
+        self.asks = 0
+
+    def askstring(self, *a, **k):
+        self.asks += 1
+        return self.ret
+
+
+class TestDiagAndReset:
+    def test_diag_report_cached_without_confirmation(self, monkeypatch):
+        checker = FakeSSH()
+        host = _Host(checker)
+        dialogs = _Dialogs()
+        monkeypatch.setattr(gf, "messagebox", dialogs)
+        host.run_fp_diag()
+        assert len(host.calls) == 1
+        fn, btn, args, kwargs = host.calls[0]
+        assert fn is gf.fastpanel_diag
+        assert btn is host.fp_menu_btn
+        assert args == (checker,)
+        assert kwargs == {"cache_key": "fp_diag"}
+        assert dialogs.asked == []  # отчёт ничего не меняет — спрашивать нечего
+
+    def test_cancelled_password_does_not_run(self, monkeypatch):
+        # Пароль спрашивается ДО ухода в фон: _run_in_thread диалоги не умеет,
+        # а без пароля mogwai chpasswd слать не на чем.
+        host = _Host(FakeSSH())
+        strings = _Strings(None)
+        monkeypatch.setattr(gf, "simpledialog", strings)
+        host.run_fp_reset_password()
+        assert host.calls == []
+        assert strings.asks == 1      # спросить успели, выполнить не должны
+
+    def test_empty_password_does_not_run(self, monkeypatch):
+        host = _Host(FakeSSH())
+        monkeypatch.setattr(gf, "simpledialog", _Strings(''))
+        host.run_fp_reset_password()
+        assert host.calls == []
+
+    def test_password_passed_verbatim_and_not_cached(self, monkeypatch):
+        # Пароль НЕ стригется: пробел — валидный символ пароля, а обрезанный
+        # пароль означал бы «сменили на другой, чем просили».
+        checker = FakeSSH()
+        host = _Host(checker)
+        monkeypatch.setattr(gf, "simpledialog", _Strings(' Str0ng!Pass '))
+        host.run_fp_reset_password()
+        assert len(host.calls) == 1
+        fn, btn, args, kwargs = host.calls[0]
+        assert fn is gf.fastpanel_reset_password
+        assert btn is host.fp_menu_btn
+        assert args == (checker, ' Str0ng!Pass ')
+        assert kwargs == {}   # сброс пароля — действие, кеш состояния невалиден

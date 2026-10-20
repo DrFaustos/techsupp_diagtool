@@ -225,6 +225,7 @@ class Host(RunnerMixin):
         self.panel_menus = []
         self.bitrix_shows = []
         self.bitrix_detects = 0
+        self.hosting_shows = []
 
     def log(self, msg):
         self.logs.append(msg)
@@ -240,6 +241,9 @@ class Host(RunnerMixin):
 
     def _detect_bitrix(self):
         self.bitrix_detects += 1
+
+    def _set_hosting_menu_visible(self, show):
+        self.hosting_shows.append(show)
 
     def text(self):
         return '\n'.join(self.logs)
@@ -333,6 +337,8 @@ class TestConnect:
         assert h.connect_btn.last('command') == h.disconnect
         assert h.panel_menus == ['ispmanager']
         assert h.bitrix_detects == 1           # BitrixVM ищется на каждом подключении
+        # Инвентарь хостинга не зависит от панели — меню включается всегда
+        assert h.hosting_shows == [True]
         assert h.cmd_entry.focus == 1
         assert h.saved == [('10.0.0.1', '22', 'root')]
         assert h.history_combo.items['values'] == ['1.1.1.1:22 (root)']
@@ -599,6 +605,11 @@ class TestDisconnect:
         assert connected.checker.closed == 1
         assert h.panel_menus == [None]
         assert h.bitrix_shows == [False]
+        # [False], а не [True, False]: фикстура connected подставляет checker
+        # напрямую, минуя _on_connect_success (там меню включается). Значит при
+        # закрытии в списке ровно одно гашение — проверяется сам факт, что
+        # дисконнект выключает меню хостинга.
+        assert h.hosting_shows == [False]
         assert h.full_btn.last('state') == tk.DISABLED
         assert h.send_btn.last('state') == tk.DISABLED
         assert h.cancel_btn.last('state') == tk.DISABLED
