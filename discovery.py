@@ -13,6 +13,7 @@ DNS-зоны (панель + BIND/nsd). Плюс проверка доступн
 postfix-карты), — чистые функции: проверяются тестами без SSH.
 """
 import re
+import shlex
 
 from common import q, find_files, read_file_content
 from logs import find_logs
@@ -264,17 +265,26 @@ def parse_zone_serial(text):
 
 
 def site_status_command(domain):
-    """Одна команда: коды ответов http/https и «SSL истечёт < 30 дней?»."""
+    """Одна команда: коды http/https + «SSL < 30 дней?» + точный остаток в днях.
+
+    Один TLS-хендшейк на домен, а не два: -enddate читается один раз, а 'SSL='
+    выводится из него же сравнением с date. Дни считаем НА СЕРВЕРЕ: дата и час
+    машины оператора к выпуску сертификата отношения не имеют.
+    """
     d = q(domain)
     return (
+        f"TLS=$(echo | timeout 8 openssl s_client -servername {d} "
+        f"-connect {d}:443 2>/dev/null "
+        "| openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2-); "
+        'EPOCH=$(date -d "$TLS" +%s 2>/dev/null); '
         "printf 'HTTP=%s\\n' \"$(curl -s -m 8 -o /dev/null -w '%{http_code}' "
         f"http://{d}/ 2>/dev/null)\"; "
         "printf 'HTTPS=%s\\n' \"$(curl -sk -m 8 -o /dev/null -w '%{http_code}' "
         f"https://{d}/ 2>/dev/null)\"; "
-        "printf 'SSL=%s\\n' \"$(echo | timeout 8 openssl s_client -servername "
-        f"{d} -connect {d}:443 2>/dev/null "
-        "| openssl x509 -noout -checkend 2592000 >/dev/null 2>&1 "
-        "&& echo ok || echo bad)\""
+        'if [ -z "$EPOCH" ]; then printf "SSL=none\\nCERT=none\\n"; '
+        'else NOW=$(date +%s); LEFT=$(( (EPOCH - NOW) / 86400 )); '
+        'if [ "$EPOCH" -gt $(( NOW + 2592000 )) ]; then printf "SSL=ok\\n"; '
+        'else printf "SSL=bad\\n"; fi; printf "CERT=%s\\n" "$LEFT"; fi'
     )
 
 
@@ -284,9 +294,16 @@ def parse_site_status(out):
     for line in (out or '').splitlines():
         key, _, value = line.partition('=')
         vals[key.strip().upper()] = value.strip()
+    cert = None
+    if vals.get('CERT', '') not in ('', 'none'):
+        try:
+            cert = int(vals['CERT'])
+        except ValueError:
+            cert = None
     return {'http': vals.get('HTTP') or '000',
             'https': vals.get('HTTPS') or '000',
-            'ssl': vals.get('SSL', '')}
+            'ssl': vals.get('SSL', ''),
+            'cert_days': cert}
 
 
 def http_status_icon(http, https):
@@ -316,6 +333,40 @@ def hosts_le_blockers(text, domain):
             if any(p.lower() == dom for p in parts[1:]):
                 hits.append(line)
     return hits
+
+
+# ==================== SSL: ТОЧНЫЙ ОСТАТОК СЕРТИФИКАТА ====================
+# site_status_command отдаёт по домену и бинарное 'SSL=ok|bad' (порог 30 дней),
+# и точный остаток 'CERT=<дней>'. Дни нужны отдельно: сертификат Let's Encrypt
+# живёт 90 дней, и «истёк позавчера» для оператора не то же, что «осталось 5»,
+# а по одному флагу ok/bad их не разделить. Считает сервер (date -d — GNU,
+# серверы у нас Linux): часы машины оператора к выпуску сертификата отношения
+# не имеют. Отрицательное число — сертификат уже истёк.
+SSL_WARN_DAYS = 30
+
+
+def parse_cert_days(out):
+    """'CERT=87' -> 87; 'CERT=-3' -> -3 (истёк); 'CERT=none'/мусор -> None."""
+    for line in (out or '').splitlines():
+        key, _, value = line.partition('=')
+        if key.strip().upper() != 'CERT':
+            continue
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def cert_days_icon(days):
+    """Иконка по остатку: None — сертификат не получен (порт/нет TLS)."""
+    if days is None:
+        return '❓'
+    if days < 0:
+        return '❌'
+    if days < SSL_WARN_DAYS:
+        return '⚠️'
+    return '✅'
 
 
 # ==================== ЧИТАТЕЛИ ПАНЕЛЕЙ ====================
@@ -534,8 +585,17 @@ def discover_dns_zones(checker, panel_type=None):
 
 
 # ==================== ОТЧЁТЫ ====================
+def cert_days_label(days):
+    """Человеческая подпись остатка: 'осталось 87 дн.', 'истёк 3 дн. назад'."""
+    if days is None:
+        return 'сертификат не получен (порт закрыт/нет TLS)'
+    if days < 0:
+        return f'ИСТЁК {-days} дн. назад'
+    return f'осталось {days} дн.'
+
+
 def site_health_lines(checker, sites, limit=HEALTH_CHECK_LIMIT):
-    """HTTP/HTTPS-коды и SSL-сроки по сайтам (не больше limit внешних проб)."""
+    """HTTP/HTTPS-коды и остаток SSL по сайтам (не больше limit внешних проб)."""
     lines = []
     for site in sites[:limit]:
         status = parse_site_status(
@@ -543,7 +603,8 @@ def site_health_lines(checker, sites, limit=HEALTH_CHECK_LIMIT):
         icon = http_status_icon(status['http'], status['https'])
         ssl = ''
         if status['https'] not in ('000', ''):
-            ssl = '  SSL ok' if status['ssl'] == 'ok' else '  ⚠️ SSL<30д/нет'
+            days = status['cert_days']
+            ssl = f"  {cert_days_icon(days)} SSL {cert_days_label(days)}"
         lines.append(f"  {icon} {site['domain']:45s} "
                      f"http={status['http']:3s} https={status['https']:3s}"
                      f"{ssl}")
@@ -575,6 +636,72 @@ def site_health_report(checker, panel_type=None):
         lines.append("\n".join(parts))
     lines.append("\n--- Проверка доступности ---")
     lines.extend(site_health_lines(checker, sites))
+    return "\n".join(lines)
+
+
+def ssl_expiry_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
+    """Остаток SSL-сертификатов по всем сайтам инвентаря, проблемные — сверху.
+
+    Отличие от «Сайты и доступность»: тут НЕ важны коды ответа — только срок
+    сертификата, отсортированный по остатку. На сервере с сотней доменов
+    оператору нужен ответ «что умереть может первым», а не простыня по алфавиту.
+    Дни берём из той же пробы, что и коды (site_status_command), — один
+    TLS-хендшейк на домен; ограничение limit — как у health-check.
+    """
+    sites = discover_sites(checker, panel_type)
+    lines = ["=== SSL: СРОК ДЕЙСТВИЯ СЕРТИФИКАТОВ ==="]
+    if not sites:
+        lines.append("Сайты не обнаружены — проверять сертификаты не на чём.")
+        return "\n".join(lines)
+
+    probed = sites[:limit]
+    rows = []
+    for site in probed:
+        status = parse_site_status(
+            checker.exec_command(site_status_command(site['domain']))[0])
+        rows.append((site['domain'], status['cert_days'], status['https']))
+
+    # Сортировка: сначала истёкшие (отрицательные), потом по возрастанию
+    # остатка; None (сертификат не получен) — в конец: «нет HTTPS» — это
+    # отдельная проблема, а не «скоро истечёт».
+    rows.sort(key=lambda r: (r[1] is None, r[1] if r[1] is not None else 0))
+
+    expired = [r for r in rows if r[1] is not None and r[1] < 0]
+    warning = [r for r in rows
+               if r[1] is not None and 0 <= r[1] < SSL_WARN_DAYS]
+    lines.append(f"Проверено доменов: {len(rows)} из {len(sites)}. "
+                 f"Истекло: {len(expired)}, истекает < {SSL_WARN_DAYS} дн.: "
+                 f"{len(warning)}")
+    if expired:
+        lines.append("\n❌ СЕРТИФИКАТЫ ИСТЕКЛИ (браузер показывает предупреждение):")
+        for dom, days, _ in expired:
+            lines.append(f"  {dom:45s} {cert_days_label(days)}")
+    if warning:
+        lines.append(f"\n⚠️ ИСТЕКАЮТ МЕНЕЕ ЧЕМ ЗА {SSL_WARN_DAYS} ДНЕЙ:")
+        for dom, days, _ in warning:
+            lines.append(f"  {dom:45s} {cert_days_label(days)}")
+
+    rest = [r for r in rows if r[1] is not None and r[1] >= SSL_WARN_DAYS]
+    if rest:
+        lines.append("\n✅ В порядке (>= %d дн.):" % SSL_WARN_DAYS)
+        for dom, days, _ in rest:
+            lines.append(f"  {dom:45s} {cert_days_label(days)}")
+
+    quiet = [r for r in rows if r[1] is None]
+    if quiet:
+        lines.append("\n❓ СЕРТИФИКАТ НЕ ПОЛУЧЕН (порт 443 молчит или нет TLS):")
+        for dom, _, https_code in quiet:
+            why = ('https отвечает без рабочего TLS'
+                   if https_code not in ('000', '') else 'https не отвечает')
+            lines.append(f"  {dom:45s} {why}")
+
+    if len(sites) > limit:
+        lines.append(f"\n… проверены первые {limit} из {len(sites)} доменов "
+                     f"(HEALTH_CHECK_LIMIT)")
+    if expired or warning:
+        lines.append("\nВыпуск Let's Encrypt: в меню панели — «Выпустить "
+                     "Let's Encrypt SSL» (ISPmanager) или certbot/dehydrated "
+                     "в терминале ниже.")
     return "\n".join(lines)
 
 
@@ -700,3 +827,370 @@ def domain_detail_report(checker, domain, panel_type=None):
                      "Let's Encrypt будет падать (KB FASTPANEL):")
         lines.extend(f"  {line}" for line in blockers)
     return "\n".join(lines)
+
+
+# ==================== ОПЕРАЦИИ С ПОЧТОВЫМИ ЯЩИКАМИ ====================
+# Синтаксис панелей — из официальной документации, а не на память:
+#   ispmanager: knowledge-base/massovoe-sozdanie-pochtovyh-yashhikov —
+#               `mgrctl email.edit domainname= name= plid= aliases= passwd=
+#                confirm= sok=ok` (без elid функция СОЗДАЁТ ящик);
+#               elid ящика — элемент name функции email, т.е. полный адрес
+#               (пример autoresponder: elid=admin@domain.com)
+#   FASTPANEL : kb.fastpanel.direct/ru/cli/email — `mogwai emails boxes
+#               create --domain= --login= --password=` и `boxes delete -b <ID>`,
+#               где ID числовой и берётся из строки `boxes list`
+# Команды собирают чистые функции (проверяются тестами без SSH): операционные
+# функции ниже лишь валидируют ввод, выполняют команду и показывают ответ
+# панели. Пароль нигде не печатается в отчёте; в ps на сервере он виден —
+# предупреждение входит в отчёт (тот же компромисс, что у mogwai chpasswd).
+
+MAILBOX_LOCAL_RE = re.compile(r'^[a-z0-9._%+-]{1,64}$')
+MAILBOX_DOMAIN_RE = re.compile(
+    r'^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+    r'(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$')
+# FASTPANEL отклоняет короткий пароль сам (KB), ISPmanager требует стойкость по
+# умолчанию. Отказать до отправки честнее, чем показать непонятную ошибку панели.
+MAILBOX_MIN_PASSWORD = 8
+
+
+def parse_mailbox_address(address):
+    """'User@Example.COM ' -> (('user', 'example.com'), None) либо (None, текст).
+
+    Адрес приводится к нижнему регистру: почтовые системы регистр домена не
+    различают, а панель хранит ящики строчными — 'Info@Site.RU' создал бы дубль,
+    который потом не находится ни списком, ни удалением. Не-ASCII сознально
+    отклоняем: для кириллического домена оператор обязан ввести punycode,
+    иначе панель заведёт ящик с адресом, который нигде не совпадёт с вводом.
+    """
+    text = (address or '').strip().lower()
+    if text.count('@') != 1:
+        return None, 'Ящик задаётся полным адресом: user@example.com'
+    local, domain = text.split('@', 1)
+    if not MAILBOX_LOCAL_RE.match(local):
+        return None, ('В имени ящика допустимы буквы, цифры и . _ % + - '
+                      f'(получено «{local}»)')
+    if not MAILBOX_DOMAIN_RE.match(domain):
+        return None, (f'Домен «{domain}» не похож на домен (для кириллического '
+                      'нужна punycode-форма вида xn--...)')
+    return (local, domain), None
+
+
+def isp_mailbox_create_command(local, domain, password):
+    """email.edit БЕЗ elid = создание ящика (так же делает скрипт из KB)."""
+    return (f'{MGRCTL} email.edit domainname={q(domain)} name={q(local)} '
+            f'plid={q(domain)} aliases={q("")} passwd={q(password)} '
+            f'confirm={q(password)} sok=ok 2>&1')
+
+
+def isp_mailbox_passwd_command(address, password):
+    """email.edit c elid — смена пароля существующего ящика."""
+    return (f'{MGRCTL} email.edit elid={q(address)} passwd={q(password)} '
+            f'confirm={q(password)} sok=ok 2>&1')
+
+
+def isp_mailbox_delete_command(address):
+    """email.delete: elid — элемент name функции email (полный адрес ящика)."""
+    return f'{MGRCTL} email.delete elid={q(address)} 2>&1'
+
+
+def fp_mailbox_create_command(local, domain, password):
+    """mogwai emails boxes create — параметры дословно из KB FASTPANEL."""
+    return (f'mogwai emails boxes create --domain={q(domain)} '
+            f'--login={q(local)} --password={q(password)} 2>&1')
+
+
+def fp_mailbox_delete_command(box_id):
+    """-b принимает только числовой ID из `mogwai emails boxes list`.
+
+    int() здесь — не украшение: оператор вводит адрес, а ID берётся из вывода
+    панели (find_fp_mailbox_id). Если там мусор, бросок лучше, чем `delete -b
+    <что-то>`; вызывающий код обязан проверить None до вызова.
+    """
+    return f'mogwai emails boxes delete -b {int(box_id)} 2>&1'
+
+
+def find_fp_mailbox_id(rows, address):
+    """ID ящика по адресу в выводе `mogwai emails boxes list` (или None)."""
+    want = (address or '').strip().lower()
+    for row in rows:
+        if (row.get('ADDRESS') or '').strip().lower() == want:
+            ident = (row.get('ID') or '').strip()
+            return int(ident) if ident.isdigit() else None
+    return None
+
+
+def isp_rows(checker, func):
+    """Элементы панели + признак «панель ответила без ошибки»: (rows, ok, текст).
+
+    mgrctl пишет ошибку в stdout (ERROR=...), а код возврата у него не всегда
+    ненулевой, поэтому «успех» решается по содержимому, а не по rc. Ошибочный
+    ответ при этом обязан быть виден оператору — вывод идёт сюда как текст.
+    """
+    out, err, rc = checker.run(f'{MGRCTL} {q(func)} 2>&1')
+    rows = parse_mgrctl_text(out)
+    raw = (out or '').strip() or (err or '').strip()
+    ok = rc == 0 and not _mgrctl_says_error(raw, rows)
+    return rows, ok, raw
+
+
+def _mgrctl_says_error(raw, rows):
+    """Отличает ответ панели «ошибка» от корректного (возможно пустого) списка.
+
+    mgrctl пишет ошибку в двух видах: `ERROR=текст` (разбирается парсером как
+    пара) и `ERROR: текст` (без '=' — парсер строку просто пропускает, и по
+    разобранным ключам такая ошибка НЕ видна). Поэтому смотрим и на разобранные
+    ключи, и на начало сырых строк. Поиск именно с начала строки, а не по
+    подстроке: домен error-log.example.com внутри значения не должен означать
+    «панель ответила ошибкой».
+    """
+    if any('error' in row for row in rows):
+        return True
+    for line in (raw or '').splitlines():
+        if line.strip().lower().startswith('error'):
+            return True
+    return False
+
+
+def known_mailbox_addresses(checker, panel_type=None):
+    """(множество адресов, ok). ok=False — список НЕ получен.
+
+    Пустое множество и ok=False — разные вещи: первое честное «ящиков нет»
+    (создать первый ящик можно), второе означает, что мы ничего не знаем, и по
+    нему нельзя ни разрешать, ни запрещать операцию.
+    """
+    if panel_type is None:
+        panel_type = detect_panel(checker)
+    if panel_type == 'ispmanager':
+        rows, ok, _ = isp_rows(checker, 'email')
+        return ({r['name'].strip().lower() for r in rows if r.get('name')},
+                ok)
+    if panel_type == 'fastpanel':
+        out, rc = mogwai(checker, 'emails boxes list')
+        if rc != 0:
+            return set(), False
+        return ({r['ADDRESS'].strip().lower()
+                 for r in parse_mogwai_table(out) if r.get('ADDRESS')}, True)
+    return set(), False
+
+
+# create: ящика ещё нет; passwd/delete: ящик обязан существовать.
+MAILBOX_MODES = ('create', 'passwd', 'delete')
+
+
+def mailbox_guard(checker, address, panel_type=None, mode='create'):
+    """None, если операцию можно слать панели; иначе — текст причины отказа.
+
+    Проверяется ровно то, на чём панель отвечает невнятно:
+    - домен обязан быть почтовым доменом этого сервера — иначе панель заведёт
+      ящик на домен, почту которого сервер не принимает, и оператор будет
+      ждать письма, которое никогда не придёт;
+    - create: ящика ещё нет (у ISPmanager на существующем elid edit меняет
+      пароль молча — оператор решит, что создал второй ящик);
+    - passwd/delete: ящик есть. Если список ящиков не получен, отказываем:
+      удалить «похожий, но не тот» адрес дороже, чем не удалить ничего.
+    """
+    parsed, err = parse_mailbox_address(address)
+    if parsed is None:
+        return err
+    local, domain = parsed
+    addr = f'{local}@{domain}'
+
+    mail_domains = {d.lower() for d in discover_mail_domains(checker,
+                                                             panel_type)}
+    if domain not in mail_domains:
+        shown = ', '.join(sorted(mail_domains)[:8]) or '—'
+        return (f'Домен {domain} не является почтовым доменом этого сервера '
+                f'(известные: {shown}). Сначала добавьте домен в панель.')
+
+    known, ok = known_mailbox_addresses(checker, panel_type)
+    if mode == 'create':
+        if ok and addr in known:
+            return (f'Ящик {addr} уже существует — для смены пароля есть '
+                    '«Сменить пароль ящика».')
+        return None
+    if not ok:
+        return ('Список ящиков панели не получен — подтвердить существование '
+                f'{addr} нельзя, операция отменена.')
+    if addr not in known:
+        return (f'Ящик {addr} не найден среди {len(known)} ящиков панели — '
+                'адрес обязан совпадать точно.')
+    return None
+
+
+def password_policy(password):
+    """Текст причины отказа либо None. Проверка ДО отправки — панель отказала
+    бы сама, но её сообщение («пароль не соответствует требованиям») оператору
+    ничего не говорит."""
+    if not password:
+        return 'Пароль не задан'
+    if len(password) < MAILBOX_MIN_PASSWORD:
+        return (f'Панель требует пароль не короче '
+                f'{MAILBOX_MIN_PASSWORD} символов')
+    return None
+
+
+_SECRET_KEYS = ('passwd', 'confirm', 'password', 'secret')
+_SECRET_RE = re.compile(
+    r'(?i)\b(' + '|'.join(_SECRET_KEYS) + r')=(\'[^\']*\'|"[^"]*"|\S+)')
+
+
+def redact_secrets(text):
+    """passwd=/confirm=/password= — в отчёте только звёздочки.
+
+    Команду mgrctl мы показываем оператору, чтобы операцию можно было
+    повторить руками; без маскирования пароль уехал бы в окно вывода, а
+    оттуда — в сохранённый отчёт (gui маскирует лог-файл, но не наш ответ).
+
+    Сначала — честный разбор shlex: значение с пробелом живёт в кавычках, и
+    регэксп по пробелам его разрезал бы пополам, оставив хвост пароля в отчёте
+    (regression: 'sup3r secret' маскировался до '*** secret'). Если текст не
+    является командой (вывод панели, многострочный), применяется регэксп,
+    который умеет значения в кавычках целиком.
+    """
+    if not text:
+        return text or ''
+    if '\n' not in text:
+        try:
+            parts = shlex.split(text)
+        except ValueError:
+            parts = None
+        if parts is not None:
+            redacted = False
+            for i, token in enumerate(parts):
+                key, sep, _value = token.partition('=')
+                if sep and key.lower() in _SECRET_KEYS:
+                    parts[i] = f'{key}=***'
+                    redacted = True
+            if redacted:
+                return ' '.join(parts)
+    return _SECRET_RE.sub(lambda m: f'{m.group(1)}=***', text)
+
+
+def panel_unsupported(panel_type, what):
+    """Отчёт «панель это не умеет» — вместо тихого молчания или кривой команды."""
+    return [f"⚠️ {what} недоступно для панели '{panel_type or 'не определена'}'.",
+            "    Поддерживаются ISPmanager (mgrctl email.*) и FASTPANEL "
+            "(mogwai emails boxes ...)."]
+
+
+# ==================== ДЕЙСТВИЯ С ЯЩИКАМИ ====================
+# Порядок в каждой операции одинаковый и он принципиален:
+#   1) guard (адрес/домен/существование) — до любой команды панели;
+#   2) сама команда;
+#   3) ПЕРЕЧИТЫВАНИЕ списка панели. rc=0 у mgrctl не означает «ящик создан»:
+#      панель отвечает sok-подтверждением и при частично применённой операции,
+#      поэтому проверяем факт — адрес появился/исчез из списка.
+def _mailbox_action(checker, address, password, panel_type, mode):
+    """Общее исполнение: поддержка панели -> guard -> команда -> перечитывание."""
+    titles = {'create': 'СОЗДАНИЕ ПОЧТОВОГО ЯЩИКА',
+              'passwd': 'СМЕНА ПАРОЛЯ ПОЧТОВОГО ЯЩИКА',
+              'delete': 'УДАЛЕНИЕ ПОЧТОВОГО ЯЩИКА'}
+    verbs = {'create': 'создан', 'passwd': 'пароль изменён', 'delete': 'удалён'}
+    lines = [f"=== {titles[mode]} ==="]
+
+    # Поддержка панели проверяется ПЕРВОЙ и до любого обращения к серверу.
+    # Иначе на сервере без панели guard отказал бы сообщением «домен не
+    # почтовый» — мы действительно не знаем почтовых доменов без панели, но
+    # оператору нужно честное «эта панель так не умеет», а не ложная причина.
+    if panel_type not in ('ispmanager', 'fastpanel'):
+        lines.extend(panel_unsupported(panel_type, titles[mode].lower()))
+        return "\n".join(lines)
+    if panel_type == 'fastpanel' and mode == 'passwd':
+        # У mogwai нет команды смены пароля ящика — только create/delete
+        # (KB FASTPANEL, CLI/Email). Придумывать флаг --password у
+        # несуществующей команды нельзя, а лезть на сервер за списком ящиков,
+        # чтобы сообщить «не умею», — лишние запросы.
+        lines.append("⚠️ Смена пароля ящика в CLI FASTPANEL не предусмотрена")
+        lines.append("    (mogwai emails boxes умеет только create/delete).")
+        lines.append("    Смените пароль в панели: Почта → Ящики → «Изменить».")
+        return "\n".join(lines)
+
+    parsed, err = parse_mailbox_address(address)
+    if parsed is None:
+        lines.append(f"❌ {err}")
+        return "\n".join(lines)
+    local, domain = parsed
+    addr = f'{local}@{domain}'
+
+    if mode in ('create', 'passwd'):
+        why = password_policy(password)
+        if why:
+            lines.append(f"❌ {why}")
+            return "\n".join(lines)
+
+    reason = mailbox_guard(checker, addr, panel_type, mode)
+    if reason:
+        lines.append(f"⛔ Операция отменена до отправки команды панели:\n   {reason}")
+        return "\n".join(lines)
+
+    if panel_type == 'ispmanager':
+        if mode == 'create':
+            cmd = isp_mailbox_create_command(local, domain, password)
+        elif mode == 'passwd':
+            cmd = isp_mailbox_passwd_command(addr, password)
+        else:
+            cmd = isp_mailbox_delete_command(addr)
+    else:  # fastpanel (passwd отсеян выше)
+        if mode == 'create':
+            cmd = fp_mailbox_create_command(local, domain, password)
+        else:
+            rows, _rc = mogwai(checker, 'emails boxes list')
+            box_id = find_fp_mailbox_id(parse_mogwai_table(rows), addr)
+            if box_id is None:
+                lines.append(f"⛔ mogwai не вернул числовой ID ящика {addr} — "
+                             "удаление отменено (нужен именно ID из boxes list).")
+                return "\n".join(lines)
+            cmd = fp_mailbox_delete_command(box_id)
+
+    lines.append("$ " + redact_secrets(cmd))
+    out, errtxt, rc = checker.run(cmd)
+    report = (out or '').strip() or (errtxt or '').strip()
+    if rc != 0:
+        lines.append(f"❌ Панель ответила ошибкой (rc={rc}): "
+                     f"{redact_secrets(report) or 'без сообщения'}")
+        return "\n".join(lines)
+    if report:
+        lines.append(redact_secrets(report))
+
+    # Подтверждение фактом, а не кодом возврата.
+    known, ok = known_mailbox_addresses(checker, panel_type)
+    if not ok:
+        lines.append("⚠️ Команда выполнена, но список ящиков после неё не "
+                     "получен — проверьте вручную («Почта: домены, ящики»).")
+    elif mode == 'delete':
+        if addr not in known:
+            lines.append(f"✅ Ящик {addr} удалён (в списке панели его нет)")
+        else:
+            lines.append(f"⚠️ Панель не сообщила об ошибке, но {addr} всё ещё "
+                         "в списке — проверьте вручную.")
+    else:
+        if addr in known:
+            verb = verbs[mode]
+            lines.append(f"✅ Ящик {addr}: {verb}" if mode == 'passwd'
+                         else f"✅ Ящик {addr} создан и виден в списке панели")
+        else:
+            lines.append(f"⚠️ Команда прошла без ошибки, но {addr} не появился "
+                         "в списке панели — проверьте вручную.")
+
+    if mode in ('create', 'passwd'):
+        lines.append("⚠️ Пароль передавался аргументом команды и был виден в ps:")
+        lines.append("   при возможности смените его на постоянный через панель.")
+    return "\n".join(lines)
+
+
+def mailbox_create(checker, address, password, panel_type=None):
+    if panel_type is None:
+        panel_type = detect_panel(checker)
+    return _mailbox_action(checker, address, password, panel_type, 'create')
+
+
+def mailbox_passwd(checker, address, password, panel_type=None):
+    if panel_type is None:
+        panel_type = detect_panel(checker)
+    return _mailbox_action(checker, address, password, panel_type, 'passwd')
+
+
+def mailbox_delete(checker, address, panel_type=None):
+    if panel_type is None:
+        panel_type = detect_panel(checker)
+    return _mailbox_action(checker, address, '', panel_type, 'delete')

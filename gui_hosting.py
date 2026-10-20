@@ -13,22 +13,34 @@ Backend-функции живут в discovery.py; здесь — состав �
 """
 
 import tkinter as tk
-from tkinter import simpledialog
+from tkinter import messagebox, simpledialog
 
 from diagnostic import (
-    hosting_inventory_report, site_health_report, mail_overview_report,
-    dns_zones_report, domain_detail_report,
+    hosting_inventory_report, site_health_report, ssl_expiry_report,
+    mail_overview_report, dns_zones_report, domain_detail_report,
+    mailbox_create, mailbox_passwd, mailbox_delete,
 )
 
-# Состав меню: (подпись пункта, имя метода класса). None — разделитель:
-# отделяет сводные отчёты от точечного запроса по конкретному домену.
+# Состав меню: (подпись пункта, имя метода класса), None — разделитель, либо
+# (подпись, [пункты]) — вложенное подменю. Разделитель отделяет сводные отчёты
+# от точечных запросов; операции над ящиками свёрнуты в подменю — шесть
+# пунктов в основном списке означали бы «интерфейс разросся», а здесь это одна
+# строка. Разрушающие операции (смена пароля, удаление) живут в подменю после
+# его разделителя.
 HOSTING_MENU = [
     ("Полный инвентарь сервера", "run_host_inventory"),
     ("Сайты: список и доступность", "run_host_sites"),
+    ("SSL: срок действия сертификатов", "run_host_ssl"),
     ("Почта: домены, ящики, очередь", "run_host_mail"),
     ("DNS-зоны на сервере", "run_host_zones"),
     None,
     ("Досье домена (всё об одном)", "run_host_domain"),
+    ("Почтовые ящики ▸", [
+        ("Создать ящик", "run_host_mb_create"),
+        None,
+        ("Сменить пароль ящика", "run_host_mb_passwd"),
+        ("Удалить ящик", "run_host_mb_delete"),
+    ]),
 ]
 
 
@@ -64,6 +76,15 @@ class HostingMixin:
                             self.checker, self.panel_type,
                             cache_key='host_sites')
 
+    def run_host_ssl(self):
+        # Отчёт только читает сертификаты (один TLS-хендшейк на домен) —
+        # спрашивать нечего; кеш 60 с, как у остальных сводных отчётов.
+        if not self.checker:
+            return
+        self._run_in_thread(ssl_expiry_report, self.host_menu_btn,
+                            self.checker, self.panel_type,
+                            cache_key='host_ssl')
+
     def run_host_mail(self):
         if not self.checker:
             return
@@ -91,3 +112,79 @@ class HostingMixin:
             return
         self._run_in_thread(domain_detail_report, self.host_menu_btn,
                             self.checker, domain.strip(), self.panel_type)
+
+    # ---------- ОПЕРАЦИИ С ПОЧТОВЫМИ ЯЩИКАМИ ----------
+    # Порядок один для всех трёх: сначала диалоги, потом фон. _run_in_thread
+    # показывает только текст задачи — tk-диалог из рабочего потока открыть
+    # нельзя, а без адреса/пароля слать панели нечего. cache_key нет ни у
+    # одного: операция меняет состояние панели, и закешированный «инвентарь до
+    # действия» после неё показывает старое.
+
+    def _ask_mailbox_address(self, title, prompt):
+        """Полный адрес ящика либо None (нет связи / оператор отменил)."""
+        if not self.checker:
+            return None
+        address = simpledialog.askstring(title, prompt, parent=self.root)
+        if not address or not address.strip():
+            return None
+        # Адрес стричь можно и нужно: случайный пробел панель превратила бы в
+        # «не найден среди N ящиков», а создать бы попыталась ящик с пробелом.
+        return address.strip()
+
+    def _ask_mailbox_password(self, address):
+        """Пароль как введён (НЕ strip: пробел — валидный символ пароля)."""
+        password = simpledialog.askstring(
+            "Пароль ящика",
+            f"Пароль для {address}\n(не короче 8 символов, длина "
+            f"проверяется до отправки):",
+            show='*', parent=self.root)
+        if not password:
+            return None
+        return password
+
+    def run_host_mb_create(self):
+        address = self._ask_mailbox_address(
+            "Создать почтовый ящик",
+            "Полный адрес ящика (user@example.com):")
+        if address is None:
+            return
+        password = self._ask_mailbox_password(address)
+        if password is None:
+            return
+        self._run_in_thread(mailbox_create, self.host_menu_btn,
+                            self.checker, address, password, self.panel_type)
+
+    def run_host_mb_passwd(self):
+        address = self._ask_mailbox_address(
+            "Сменить пароль ящика",
+            "Полный адрес ящика (user@example.com):")
+        if address is None:
+            return
+        # Подтверждение ДО запроса пароля: спрашивать секрет, а потом отказаться,
+        # — плохой разговор с оператором.
+        if not messagebox.askyesno(
+                "Подтверждение",
+                f"Сменить пароль ящика {address}?",
+                parent=self.root):
+            return
+        password = self._ask_mailbox_password(address)
+        if password is None:
+            return
+        self._run_in_thread(mailbox_passwd, self.host_menu_btn,
+                            self.checker, address, password, self.panel_type)
+
+    def run_host_mb_delete(self):
+        address = self._ask_mailbox_address(
+            "Удалить почтовый ящик",
+            "Полный адрес ящика (user@example.com):")
+        if address is None:
+            return
+        if not messagebox.askyesno(
+                "Подтверждение",
+                f"Удалить ящик {address}?\n"
+                "⚠️ Письма в его почтовом каталоге будут удалены без "
+                "возможности восстановления через панель.",
+                parent=self.root):
+            return
+        self._run_in_thread(mailbox_delete, self.host_menu_btn,
+                            self.checker, address, self.panel_type)

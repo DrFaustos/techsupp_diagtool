@@ -83,23 +83,34 @@ class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, Checks
     def _build_panel_menu(self, parent, text, bootstyle, items):
         """Меню действий панели: Menubutton + tk.Menu из списка пунктов.
 
-        items — [(подпись, имя метода)] либо None (разделитель). Методы берутся
-        с класса через getattr, поэтому состав списков проверяет
-        tests/test_gui_smoke.py, а не скан command=self.*.
+        items — [(подпись, имя метода)], None (разделитель) либо
+        (подпись, [пункты]) — вложенное подменю. Методы берутся с класса через
+        getattr, поэтому состав списков проверяют тесты, а не скан
+        command=self.*. Подменю — это ответ на требование «интерфейс не
+        разрастается»: однотипные операции (работа с почтовыми ящиками)
+        занимают одну строку, а не шесть пунктов основного списка.
         Возвращает (menubutton, menu) — состоянием рулит _set_panel_menus_visible.
         """
         btn = tb.Menubutton(parent, text=text, state=tk.DISABLED,
                             bootstyle=bootstyle, direction="below")
         btn.pack(side=tk.LEFT)
         menu = tk.Menu(btn, tearoff=0)
+        self._fill_panel_menu(menu, items)
+        btn['menu'] = menu
+        return btn, menu
+
+    def _fill_panel_menu(self, menu, items):
+        """Рекурсивно раскладывает items в tk.Menu (подменю — любой вложенный)."""
         for item in items:
             if item is None:
                 menu.add_separator()
+            elif isinstance(item[1], (list, tuple)):
+                sub = tk.Menu(menu, tearoff=0)
+                self._fill_panel_menu(sub, item[1])
+                menu.add_cascade(label=item[0], menu=sub)
             else:
                 label, method = item
                 menu.add_command(label=label, command=getattr(self, method))
-        btn['menu'] = menu
-        return btn, menu
 
     def _set_panel_menus_visible(self, panel_type):
         """Показывает меню только той панели, которая определена.
