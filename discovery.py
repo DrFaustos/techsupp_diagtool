@@ -783,6 +783,20 @@ AUTH_ICON = {'ok': '✅', 'warn': '⚠️', 'bad': '❌'}
 # проверка, а не средняя арифметическая.
 AUTH_SEVERITY = {'ok': 0, 'warn': 1, 'bad': 2}
 
+# ---------- внешняя сверка (dig из точки зрения интернета) ----------
+# Когда зону обслуживает этот же сервер (или резолвер смотрит в localhost),
+# `dig` показывает ЛОКАЛЬНОЕ содержимое зоны. Предупредить об этом мало:
+# оператор получает «SPF ✅» и останавливается, а публичная зона может быть
+# пустой. Поэтому проект сам повторяет те же запросы к публичному резолверу.
+PUBLIC_RESOLVERS = ('1.1.1.1', '8.8.8.8')
+# Без таймаута недоступный резолвер вешает канал на 5 с × попытки; с ними
+# `dig` отвечает rc=9 примерно за секунду (проверено живым прогоном).
+DNS_TIMEOUT_ARGS = '+timeout=2 +tries=1'
+# rc=0 означает «DNS-сервер ответил» (в т.ч. NXDOMAIN и пустой ответ), rc=9 —
+# «до сервера не достучались». Различать их обязательно: пустой вывод при rc=9
+# был бы прочитан как «записей нет», и сверка сама стала бы источником лжи.
+DIG_RC_ANSWERED = 0
+
 
 # ---------- команды (собираются чистыми функциями — тесты без SSH) ----------
 def a_query_command(domain):
@@ -815,6 +829,65 @@ def dkim_query_command(domain, selectors=MAIL_AUTH_SELECTORS):
 def ptr_query_command(ip):
     """PTR по IP. Вызывается только когда IP известен — иначе нечего спрашивать."""
     return f'dig +short -x {q(ip)} 2>/dev/null'
+
+
+# Внешняя сверка: те же записи, но спросить у публичного резолвера.
+# rtype приходит только из EXTERNAL_QUERY_TYPES — в команду он попадает НЕ
+# через q(), поэтому список проверяется здесь: иначе будущий вызывающий смог бы
+# подсунуть в dig сырое имя и вся защита q() обнулилась бы.
+EXTERNAL_QUERY_TYPES = ('TXT', 'A', '-x')
+# Имя для проверки «резолвер вообще отвечает». Нужен заведомо живой хост:
+# пустой ответ от 1.1.1.1 означает не «интернет есть», а «мы не у дел».
+EXTERNAL_PROBE_NAME = 'a.root-servers.net'
+
+
+def external_query_command(rtype, name, resolver=PUBLIC_RESOLVERS[0]):
+    """Запрос к публичному резолверу; в выводе — ответ и строка «rc=N».
+
+    rc печатается ОБЯЗАТЕЛЬНО. Без него пустой вывод при недоступном резолвере
+    (dig отвечает rc=9) не отличим от честного «записей нет» (rc=0), и сверка,
+    призванная снимать ложь, сама начала бы врать оператору.
+    """
+    if rtype not in EXTERNAL_QUERY_TYPES:
+        raise ValueError(f'разрешены только запросы {EXTERNAL_QUERY_TYPES}')
+    # Резолвер — строго через @server. Живой прогон показал, что positional-форма
+    # (`dig A name 1.1.1.1`) адрес сервером не считает: запрос уходил на местный
+    # резолвер и отвечал за 0.0 с даже при заведомо мёртвом IP. Оставить её —
+    # значит выдать локальную зону с подписью «из интернета», то есть ровно ту
+    # ложь, ради исправления которой сверка и пишется.
+    return (f'dig +short {rtype} {q(name)} @{q(resolver)} {DNS_TIMEOUT_ARGS} '
+            f'2>/dev/null; printf "rc=%s\\n" $?')
+
+
+def external_probe_command(resolver=PUBLIC_RESOLVERS[0]):
+    """Жив ли публичный резолвер: спрашиваем имя, обязанное иметь запись.
+
+    Один запрос на весь прогон, а не на каждый домен. Если резолвер недоступен,
+    сверки не будет вовсе и отчёт скажет «сверить не удалось» — вместо
+    «записей нет», которая была бы ложью о чужом DNS.
+    """
+    return (f'dig +short A {q(EXTERNAL_PROBE_NAME)} @{q(resolver)} '
+            f'{DNS_TIMEOUT_ARGS} 2>/dev/null')
+
+
+def public_resolver(checker, resolvers=PUBLIC_RESOLVERS):
+    """Первый публичный резолвер, который ОТВЕЧАЕТ (или '').
+
+    Один probe на резолвер за прогон, а не на домен: домен с пустой зоной
+    отвечает так же пусто, как недоступный резолвер, и по запросу к самому
+    домену «жив ли DNS» не отличить. Поэтому спрашиваем заведомо живое имя.
+
+    '' — сверять нечем, и отчёт обязан сказать об этом словами «сверить не
+    удалось», а не промолчать: отсутствие сверки, выдаваемое за «наружу всё
+    чисто», было бы второй ложью вместо первой.
+    """
+    for resolver in resolvers:
+        # first_ipv4, а не «непустой вывод»: ответ обязан быть адресом, иначе
+        # любой мусор в stdout сошёл бы за «резолвер жив».
+        if first_ipv4(checker.exec_command(
+                external_probe_command(resolver))[0]):
+            return resolver
+    return ''
 
 
 # ---------- чистые парсеры ----------
@@ -1033,6 +1106,118 @@ def parse_dmarc(txts):
             'detail': f'p={policy}, отчёты rua настроены'}
 
 
+def external_dkim_query_command(domain, selectors=MAIL_AUTH_SELECTORS,
+                                resolver=PUBLIC_RESOLVERS[0]):
+    """Тот же цикл селекторов, что и локальный, но у публичного резолвера.
+
+    rc — ФЛАГ по всему циклу, а не код последней команды: иначе одна
+    таймаутная итерация выглядела бы как «извне записей нет», а сверка,
+    которая врёт про чужой DNS, хуже отсутствия сверки.
+    """
+    names = ' '.join(q(f'{s}._domainkey.{domain}') for s in selectors)
+    return (f'__bad=0; for __dk in {names}; do printf "%s|" "$__dk"; '
+            f'dig +short TXT "$__dk" @{q(resolver)} {DNS_TIMEOUT_ARGS} '
+            f'2>/dev/null || __bad=1; printf "\\n"; done; '
+            f'printf "rc=%s\\n" "$__bad"')
+
+
+def parse_external_answer(out):
+    """Вывод внешней команды -> (строки ответа, rc или None).
+
+    Строки «;; ...» отсекаются не для красоты: при недоступном резолвере dig
+    пишет «;; communications error to ...» в STDOUT (2>/dev/null от этого не
+    спасает — проверено живым прогоном), и без отсечения текст ошибки ушёл бы в
+    парсер TXT как значение записи. В цикле DKIM та же ошибка приклеена к имени
+    после «|» — её отсекаем по той же причине.
+    """
+    lines, rc = [], None
+    for raw in (out or '').splitlines():
+        line = raw.strip()
+        if not line or line.startswith(';;'):
+            continue
+        if line.startswith('rc='):
+            value = line[3:].strip()
+            rc = int(value) if value.lstrip('-').isdigit() else None
+            continue
+        name, sep, value = raw.partition('|')
+        if sep and value.lstrip().startswith(';;'):
+            raw = name + sep
+        lines.append(raw.rstrip())
+    return '\n'.join(lines), rc
+
+
+def external_auth_answers(checker, domain, resolver=PUBLIC_RESOLVERS[0]):
+    """Ответы «из интернета» по домену — те же запросы, что и локальные.
+
+    Пять команд (A, TXT домена, _dmarc, цикл селекторов DKIM, PTR по ВНЕШНЕЙ
+    A). Формат вывода совпадает с локальным, поэтому разбор — тот же код:
+    второй половины правил у программы не появляется.
+    Возвращает {'a','spf','dmarc','dkim','ptr': (текст, rc), 'ip', 'answered'}.
+
+    A спрашиваем сами и PTR берём по внешней A: локальная A тоже может врать
+    (10.x из локальной зоны), а проверять обратную запись по адресу, которого в
+    интернете нет, значит выдумывать вердикт про чужую in-addr зону.
+
+    'answered' — все ли обязательные ответы получены (PTR обязателен только
+    когда есть внешняя A). Если нет, сверку делать нечем: пустой вывод при
+    недоступном резолвере не отличим от честного «записей нет», и заявить
+    «извне SPF нет» означало бы соврать про чужую зону.
+    """
+    answers = {}
+    for kind, cmd in (('a', external_query_command('A', domain, resolver)),
+                      ('spf', external_query_command('TXT', domain, resolver)),
+                      ('dmarc', external_query_command('TXT',
+                                                       '_dmarc.' + domain,
+                                                       resolver)),
+                      ('dkim', external_dkim_query_command(domain,
+                                                           resolver=resolver))):
+        # run(), а не exec_command(): нужен rc — он и различает «зона пуста»
+        # (dig ответил rc=0 и молчит) от «до резолвера не достучались» (rc=9).
+        answers[kind] = parse_external_answer(checker.run(cmd)[0])
+    answers['ip'] = first_ipv4(answers['a'][0])
+    answers['ptr'] = (parse_external_answer(checker.run(
+                          external_query_command('-x', answers['ip'],
+                                                 resolver))[0])
+                      if answers['ip'] else ('', None))
+    answers['answered'] = all(answers[k][1] == DIG_RC_ANSWERED
+                              for k in ('a', 'spf', 'dmarc', 'dkim'))
+    # У PTR собственный признак ответа: он зависит от внешней A и идёт пятым,
+    # поэтому общий 'answered' его не покрывает. Без флага таймаут по -x
+    # выглядел бы «обратной записи нет» (❌) — враньё про чужую in-addr зону.
+    # Когда адреса нет вовсе, запрос не уходил: _ptr_view сам скажет «нечего
+    # спрашивать», и True здесь означает «претензий к PTR нет».
+    answers['ptr_answered'] = (not answers['ip']
+                               or answers['ptr'][1] == DIG_RC_ANSWERED)
+    return answers
+
+
+EXTERNAL_KINDS = (('SPF', 'spf'), ('DKIM', 'dkim'), ('DMARC', 'dmarc'))
+
+
+def external_parseds(domain, answers):
+    """Внешние ответы, разобранные ТЕМИ ЖЕ парсерами, что и локальные.
+
+    Второй набор правил разбора однажды начал бы противоречить первому: «извне
+    SPF нет» и «SPF в порядке» про одну и ту же запись — это не сверка, а спор
+    двух половин программы, который оператор читает как «отчёт врёт».
+    """
+    return {'spf': parse_spf(parse_dns_txt(answers['spf'][0])),
+            'dkim': parse_dkim(answers['dkim'][0], domain),
+            'dmarc': parse_dmarc(parse_dns_txt(answers['dmarc'][0]))}
+
+
+def auth_differs(before, after):
+    """Отличается ли разбор «из интернета» от локального.
+
+    Сравниваем status, reason И detail. Ограничиться первыми двумя было бы
+    подтасовкой: две SPF-записи бывают одновременно `ok` и при этом разными
+    (`ip4:1.1.1.1 -all` против `a ~all`), а оператору важно видеть именно это —
+    публичная зона может быть старше той, что он правит в панели.
+    """
+    return (before['status'], before['reason'], before['detail']) != \
+           (after['status'], after['reason'], after['detail'])
+
+
 # ---------- откуда видно записи (без этого вывод был бы ложью) ----------
 def resolver_view_note(checker):
     """Предупреждение, если сервер резолвит сам себя: видны локальные зоны."""
@@ -1053,12 +1238,13 @@ def _is_private_ip(ip):
             or bool(re.match(r'^172\.(1[6-9]|2\d|3[01])\.', ip)))
 
 
-def zone_view_note(domain, zones, resolver_note=''):
-    """Откуда видны записи домена: локальная зона / локальный резолвер / ''.
+def zone_is_local_view(domain, zones, resolver_note=''):
+    """Мог ли локальный dig наврать про этот домен (источник условия И текста).
 
-    На сервере с собственной зоной dig чаще всего спрашивает localhost и
-    показывает файл зоны. «SPF есть» при пустой ПУБЛИЧНОЙ зоне был бы ложным
-    диагнозом, поэтому источник пишется в отчёте и даётся команда сверки извне.
+    Непустой ответ = «показано локальное содержимое»: зона лежит здесь либо
+    резолвер смотрит в localhost. Это единственное основание лезть в интернет:
+    сверять все домены подряд — платить 5 лишних запросов на каждый там, где
+    ложный ✅ невозможен (записи локально нет — из неё и так не следует «есть»).
     """
     bits = []
     if any(domain == z or domain.endswith('.' + z) for z in zones):
@@ -1066,9 +1252,28 @@ def zone_view_note(domain, zones, resolver_note=''):
                     f'локальное содержимое')
     if resolver_note:
         bits.append(resolver_note)
+    return bits
+
+
+def zone_view_note(domain, zones, resolver_note='', verified=False):
+    """Откуда видны записи домена: локальная зона / локальный резолвер / ''.
+
+    На сервере с собственной зоной dig чаще всего спрашивает localhost и
+    показывает файл зоны. «SPF есть» при пустой ПУБЛИЧНОЙ зоне был бы ложным
+    диагнозом, поэтому источник пишется в отчёте и даётся команда сверки извне.
+
+    verified=True значит «сверку уже выполнил сам отчёт» (см. external_diff):
+    оставлять тогда команду ручной сверки — просить оператора делать работу,
+    которая за него сделана, и он по привычке повторит её вручную.
+    """
+    bits = zone_is_local_view(domain, zones, resolver_note)
     if not bits:
         return ''
-    bits.append(f'сверьте извне: dig +short TXT {domain} @1.1.1.1')
+    # Формулировка нейтральна умышленно: «выполнена» было бы ложью, когда
+    # резолвер жив, но ответить по домену мы не смогли — провал говорит об этом
+    # отдельной строкой «🌐» ниже, а не молчанием.
+    bits.append('сверка с публичным DNS: см. строки «🌐»' if verified
+                else f'сверьте извне: dig +short TXT {domain} @1.1.1.1')
     return '; '.join(bits)
 
 
@@ -1218,59 +1423,153 @@ def mail_auth_fixes(domain, spf, dkim, dmarc, ptr_status, ip=''):
     return fixes
 
 
+def _ptr_view(ip, name, answered=True):
+    """(статус, текст) PTR по уже известному адресу.
+
+    Различаем три случая, а не два: «нечего спрашивать» (адреса нет), «спросили,
+    но ответа не получили» (answered=False) и «получили честный пустой ответ»
+    (записи действительно нет). Свести второй к третьему — значит заявить
+    оператору «обратной записи нет» на основании таймаута: ровно то же враньё,
+    с которым воюет весь модуль, только в обратную сторону.
+    """
+    if not ip:
+        return 'warn', 'PTR не проверен: A-запись не получена'
+    if not answered:
+        return 'warn', (f'PTR для {ip} не получен: резолвер не ответил — '
+                        f'назвать это «записи нет» нельзя')
+    if name:
+        return 'ok', name
+    return 'bad', (f'для {ip} обратной записи нет — Google/Microsoft такую '
+                   f'почту режут')
+
+
 def summarize_mail_auth(domain, spf_out, dmarc_out, dkim_out, ptr_out,
-                        ip='', note='', header=True):
+                        ip='', note='', header=True, ext=None, resolver='',
+                        verify_wanted=False):
     """(вердикт, строки) по СЫРЫМ выводам dig — чистая, все ветки в тестах.
 
     ip='' означает «A-записи нет»: PTR в этом случае НЕ проверен, и это warn, а
     не ❌ — мы не знаем про него ничего, врать оператору нельзя.
-    """
-    spf = parse_spf(parse_dns_txt(spf_out))
-    dmarc = parse_dmarc(parse_dns_txt(dmarc_out))
-    dkim = parse_dkim(dkim_out, domain)
-    ptr = parse_ptr(ptr_out)
-    if not ip:
-        ptr_status, ptr_text = 'warn', 'PTR не проверен: A-запись не получена'
-    elif ptr:
-        ptr_status, ptr_text = 'ok', ptr
-    else:
-        ptr_status = 'bad'
-        ptr_text = f'для {ip} обратной записи нет — Google/Microsoft такую почту режут'
 
-    verdict = max((spf['status'], dkim['status'], dmarc['status'], ptr_status),
+    ext — ответы «из интернета» (external_auth_answers). Если сверка состоялась
+    ('answered'), вердикт, иконки шапки и подсказки считаются по ПУБЛИЧНОЙ
+    картине: письмо судит приёмник, который видит DNS интернета, а не файл
+    локальной зоны. Локальные строки при этом остаются напечатаны — по ним и
+    ищут, где именно зона разошлась; расхождение помечается «🌐».
+
+    verify_wanted — «сверка этому домену была нужна, но резолвера не нашлось»
+    (probe мёртв). Без флага функция не отличила бы «сверять нечего» от
+    «сверять нечем»: в обоих случаях ext — None, а следствия разные: во втором
+    случае локальные ✅ ничем не подтверждены.
+    """
+    local = {'spf': parse_spf(parse_dns_txt(spf_out)),
+             'dkim': parse_dkim(dkim_out, domain),
+             'dmarc': parse_dmarc(parse_dns_txt(dmarc_out))}
+    ptr_status, ptr_text = _ptr_view(ip, parse_ptr(ptr_out))
+
+    verified = bool(ext and ext.get('answered'))
+    if verified:
+        # Разбор внешний — теми же парсерами: второй половины правил у
+        # программы не появляется.
+        shown = external_parseds(domain, ext)
+        # PTR обязан иметь собственный признак ответа: общий 'answered' его не
+        # покрывает (PTR зависит от внешней A и запрос позднее), иначе таймаут
+        # по -x прочитался бы как «обратной записи нет».
+        v_ptr_status, v_ptr_text = _ptr_view(
+            ext.get('ip', ''), parse_ptr(ext['ptr'][0]),
+            bool(ext.get('ptr_answered', True)))
+    else:
+        shown = local
+        v_ptr_status, v_ptr_text = ptr_status, ptr_text
+
+    verdict = max((shown['spf']['status'], shown['dkim']['status'],
+                   shown['dmarc']['status'], v_ptr_status),
                   key=AUTH_SEVERITY.__getitem__)
+    # Непроверенное не имеет права выглядеть как «в порядке». Если сверку
+    # хотели, но сделать не смогли (резолвер жив, а по домену не ответил — или
+    # мёртвы оба публичных), домен был бы напечатан здоровым: «Провалено: 0, с
+    # замечаниями: 0» от программы, которая тут же пишет «сверить не удалось».
+    # Поднимаем ok → warn: bad остаётся bad, warn остаётся warn — понижать
+    # строгость мы не имеем права.
+    unverified = (ext is not None or verify_wanted) and not verified
+    if unverified and verdict == 'ok':
+        verdict = 'warn'
     pad = '    ' if header else '  '
     lines = []
     if header:
-        lines.append(f'{domain:42s} SPF {AUTH_ICON[spf["status"]]}  '
-                     f'DKIM {AUTH_ICON[dkim["status"]]}  '
-                     f'DMARC {AUTH_ICON[dmarc["status"]]}  '
-                     f'PTR {AUTH_ICON[ptr_status]}')
-    lines.append(f'{pad}SPF   {spf["detail"]}')
+        lines.append(f'{domain:42s} SPF {AUTH_ICON[shown["spf"]["status"]]}  '
+                     f'DKIM {AUTH_ICON[shown["dkim"]["status"]]}  '
+                     f'DMARC {AUTH_ICON[shown["dmarc"]["status"]]}  '
+                     f'PTR {AUTH_ICON[v_ptr_status]}'
+                     # Без метки шапка «противоречила» бы строке ниже: SPF ❌
+                     # в шапке и «v=spf1 … -all» в теле оператор прочитал бы
+                     # как ошибку программы, а не как разрыв зоны.
+                     # «[не сверено]» — вторая половина той же честности: иконки
+                     # показаны по ЛОКАЛЬНЫМ данным, и без метки их прочитали бы
+                     # как подтверждённые публичной зоной.
+                     + ('   [извне]' if verified
+                        else '   [не сверено]' if unverified else ''))
+    lines.append(f'{pad}SPF   {local["spf"]["detail"]}')
     dkim_note = ''
-    if dkim['status'] == 'bad' and not dkim['revoked']:
+    if local['dkim']['status'] == 'bad' and not local['dkim']['revoked']:
         dkim_note = (' — если подписывает другой селектор, проверьте '
                      f'<selector>._domainkey (искали: '
                      f'{", ".join(MAIL_AUTH_SELECTORS[:5])}…)')
-    lines.append(f'{pad}DKIM  {dkim["detail"]}{dkim_note}')
-    lines.append(f'{pad}DMARC {dmarc["detail"]}')
+    lines.append(f'{pad}DKIM  {local["dkim"]["detail"]}{dkim_note}')
+    lines.append(f'{pad}DMARC {local["dmarc"]["detail"]}')
     lines.append(f'{pad}PTR   {ptr_text}')
+
+    if verified:
+        # Печатаем только расхождения: три одинаковые строки на каждый домен
+        # оператор пролистнёт, а нужное потеряется.
+        diffs = [f"{pad}🌐 {label:5s} извне {AUTH_ICON[shown[key]['status']]} "
+                 f"{shown[key]['detail']}"
+                 for label, key in EXTERNAL_KINDS
+                 if auth_differs(local[key], shown[key])]
+        if v_ptr_status != ptr_status:
+            diffs.append(f"{pad}🌐 PTR   извне {AUTH_ICON[v_ptr_status]} "
+                         f"{v_ptr_text}")
+        lines.extend(diffs or [
+            f'{pad}🌐 сверка через {resolver}: публичные записи совпадают '
+            f'с локальными'])
+    elif ext is not None:
+        # Probe был жив, а ответить по домену мы не смогли. Смолчать — значит
+        # оставить пометку «см. строки «🌐»» без единой строки «🌐»: оператор
+        # прочитает это как «сверили, расхождений нет». Вердикт при этом
+        # считается по локальным данным и помечен честно — «не сверен».
+        lines.append(f'{pad}🌐 сверить не удалось: {resolver} не ответил по '
+                     f'этому домену — строки выше показаны по ЛОКАЛЬНЫМ '
+                     f'данным, проверьте вручную: '
+                     f'dig +short TXT {domain} @1.1.1.1')
+
     # Подсказки — только там, где чинить есть что: у настроенного домена список
     # пуст, и дописывать «всё хорошо» некуда (вердикт ok это уже сказал).
-    for fix in mail_auth_fixes(domain, spf, dkim, dmarc, ptr_status, ip=ip):
+    # Строим их по ПУБЛИЧНОЙ картине: чинить надо то, что видит приёмник.
+    for fix in mail_auth_fixes(domain, shown['spf'], shown['dkim'],
+                               shown['dmarc'], v_ptr_status,
+                               ip=(ext.get('ip', '') if verified else ip)):
         lines.append(f'{pad}→ {fix}')
     if note:
         lines.append(f'{pad}⚠️ {note}')
     return verdict, lines
 
 
-def mail_auth_lines(checker, domain, note='', header=True):
+def mail_auth_lines(checker, domain, note='', header=True, resolver='',
+                    verify_wanted=False):
     """(вердикт, строки, ip) по ОДНОМУ домену: 5 dig-запросов, не больше.
 
     Вынесено из mail_auth_report, чтобы «Досье домена» показывало ровно те же
     проверки тем же кодом: две реализации однажды разъехались бы формулировками,
     и оператор видел бы в одном месте «DKIM нет», а в другом — «DKIM ❓».
     PTR спрашивается только когда есть IPv4: спрашивать -x у CNAME бессмысленно.
+
+    resolver — непустой означает «повторить те же запросы наружу» (только там,
+    где локальная зона могла наврать; решает вызывающий через
+    zone_is_local_view). Цена — ещё 5 запросов, поэтому «просто всегда» это не
+    включается ни при каких обстоятельствах.
+
+    verify_wanted — «сверка была нужна, но резолвера не нашлось»: без него
+    домен с локально-зелёной зоной выглядел бы проверенным.
     """
     ip = first_ipv4(checker.exec_command(a_query_command(domain))[0])
     return summarize_mail_auth(
@@ -1279,7 +1578,9 @@ def mail_auth_lines(checker, domain, note='', header=True):
         checker.exec_command(dmarc_query_command(domain))[0],
         checker.exec_command(dkim_query_command(domain))[0],
         checker.exec_command(ptr_query_command(ip))[0] if ip else '',
-        ip=ip, note=note, header=header) + (ip,)
+        ip=ip, note=note, header=header,
+        ext=external_auth_answers(checker, domain, resolver) if resolver else None,
+        resolver=resolver, verify_wanted=verify_wanted) + (ip,)
 
 
 MAIL_AUTH_FIX_HINT = (
@@ -1299,6 +1600,10 @@ def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
     блокам здесь нет намеренно: вердикт домена определяется худшей проверкой,
     поэтому «плохие сверху, хорошие снизу» отвечает на вопрос «что чинить
     первым» лучше, чем три списка по статусам.
+
+    Внешняя сверка (ещё 5 запросов) идёт только у доменов, где локальный dig
+    мог наврать, и только если публичный резолвер отвечает; жив ли он —
+    спрашивается ОДИН раз на прогон, а не на домен.
     """
     if panel_type is None:
         panel_type = detect_panel(checker)
@@ -1310,10 +1615,22 @@ def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
 
     zones = {z['domain'] for z in discover_dns_zones(checker, panel_type)}
     resolver_note = resolver_view_note(checker)
+    # Условие и текст пометки берём из одной функции (zone_is_local_view),
+    # иначе «где сверять» и «где написано, что надо сверять» разъехались бы.
+    need = {dom: zone_is_local_view(dom, zones, resolver_note)
+            for dom in domains[:limit]}
+    # Пробуем резолвер только когда сверка нужна хоть кому-то: платить запрос
+    # за probe на сервере с внешним DNS и публичным резолвером не за что.
+    resolver = public_resolver(checker) if any(need.values()) else ''
     checked = []
     for dom in domains[:limit]:
         verdict, detail, _ip = mail_auth_lines(
-            checker, dom, note=zone_view_note(dom, zones, resolver_note))
+            checker, dom, resolver=resolver if need[dom] else '',
+            # Нужна, но не сделана (резолверов не нашлось) — вердикт по
+            # локальным данным, и он не имеет права печататься как проверенный.
+            verify_wanted=bool(need[dom]) and not resolver,
+            note=zone_view_note(dom, zones, resolver_note,
+                                verified=bool(resolver) and bool(need[dom])))
         checked.append((AUTH_SEVERITY[verdict], dom, detail))
 
     # Худшие сверху; порядок внутри одной беды — алфавитный, иначе список
@@ -1415,9 +1732,17 @@ def domain_detail_report(checker, domain, panel_type=None):
         # диагнозом. Две дополнительные команды (resolv.conf и список зон) идут
         # ради честной пометки «dig показывает локальную зону, а не интернет».
         zones = {z['domain'] for z in discover_dns_zones(checker, panel_type)}
+        resolver_note = resolver_view_note(checker)
+        # Условие внешней сверки берём из той же функции, что и текст пометки:
+        # иначе «где сверять» и «где написано, что сверять надо» однажды
+        # разъехались бы, и домен остался бы с локальной правкой без проверки.
+        need = zone_is_local_view(dom, zones, resolver_note)
+        resolver = public_resolver(checker) if need else ''
         _verdict, auth_lines, _ip = mail_auth_lines(
-            checker, dom, header=False,
-            note=zone_view_note(dom, zones, resolver_view_note(checker)))
+            checker, dom, header=False, resolver=resolver,
+            verify_wanted=bool(need) and not resolver,
+            note=zone_view_note(dom, zones, resolver_note,
+                                verified=bool(resolver)))
         lines.append("\nDNS-аутентификация отправки (SPF/DKIM/DMARC/PTR):")
         lines.extend(auth_lines)
     else:
