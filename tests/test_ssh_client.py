@@ -354,3 +354,50 @@ class TestSwallowedErrors:
         client.close = boom
         c.close()                       # не должно бросить
         assert c.client is None
+
+
+# ==================== служебный канал: уборка после «Стоп» ====================
+class TestCleanupChannel:
+    """cleanup() — единственная команда, которой отмена не мешает.
+
+    Нужна ровно одна вещь: rm/chmod над файлом с паролем обязан дойти до
+    сервера и после нажатия «Стоп». Пока уборка ходила через run(), она
+    падала от cancel_event, и секрет оставался на диске.
+    """
+
+    @staticmethod
+    def _connected(out=b'ok\n', err=b''):
+        c = _checker()
+        c.connect()
+        client = FakeSSHClient.instances[-1]
+        client.exec_channel = _Channel()
+        client.exec_result = (out, err)
+        return c
+
+    def test_run_blocked_but_cleanup_passes(self):
+        c = self._connected()
+        c.cancel()
+        with pytest.raises(Exception, match='Операция отменена'):
+            c.run('ls')
+        assert c.cleanup('rm -f /tmp/secret') == ('ok\n', '', 0)
+
+    def test_cleanup_after_cancel_still_reads_real_output(self):
+        # Ответ уборки важен: remove_remote_path смотрит в него (STILL_THERE),
+        # поэтому cleanup не имеет права возвращать заглушку
+        c = self._connected(out=b'STILL_THERE\n')
+        c.cancel()
+        assert 'STILL_THERE' in c.cleanup('rm -f /tmp/secret')[0]
+
+    def test_cleanup_still_needs_a_connection(self):
+        # Обход отмены НЕ означает обход проверки соединения: без клиента
+        # обязан быть всё тот же понятный бросок
+        c = _checker()
+        c.cancel()
+        with pytest.raises(Exception, match='Нет активного соединения'):
+            c.cleanup('rm -f /tmp/secret')
+
+    def test_reset_cancel_restores_run(self):
+        c = self._connected(out=b'x')
+        c.cancel()
+        c.reset_cancel()
+        assert c.run('ls')[0] == 'x'

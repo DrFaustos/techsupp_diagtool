@@ -1091,9 +1091,11 @@ class TestMailboxSecretChannel:
         # в пустой пароль, и панель либо откажет, либо (хуже) поставит его.
         c = isp_env(['name=info@example.com elid=5\n'], sftp=None)
         out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'ispmanager')
-        assert 'Не удалось записать env-файл' in out
+        assert 'Не удалось подготовить env-файл' in out
+        assert 'SFTP' in out
         assert c.find('email.edit') is None
         # каталог, который mktemp всё-таки создал, обязан быть вычищен
+        # (уборка — rm + проверка факта одним вызовом)
         assert c.find('rm -rf ' + SECRET_DIR) is not None
 
     def test_no_mktemp_means_no_panel_call(self):
@@ -1125,17 +1127,25 @@ class TestMailboxSecretChannel:
                      'name=info@example.com elid=5\n'
                      'name=a@example.com elid=7\n'], sftp=sftp)
         dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'ispmanager')
-        # файл создан ДО команды панели (иначе -e раскроется в пустой пароль)
-        assert c.find('chmod 600') is not None
-        assert c.find('chmod 600 ' + SECRET_DIR) is not None
+        # Файл создан ДО команды панели (иначе -e раскроется в пустой пароль)
+        # и права выставлены в ТОМ ЖЕ вызове, что и создание: umask 077 + : >
+        # + chmod 600 одной строкой — между «файл есть» и «файл 0600» нет ни
+        # одного SSH-раунда, а значит нет и окна, в котором пароль читается
+        # всеми (отмена туда не вклинивается даже теоретически).
+        prep = c.find('umask 077')
+        assert prep is not None
+        assert 'chmod 600 ' + SECRET_DIR in prep
+        assert ': > ' + SECRET_DIR + '/secret.env' in prep
+        assert prep.index('umask 077') < prep.index(': >')
+        assert prep.index(': >') < prep.index('chmod 600')
         assert list(sftp.store) == [SECRET_DIR + '/secret.env']
         assert sftp.store[SECRET_DIR + '/secret.env'].startswith(
             'export DIAG_MAILBOX_SECRET=')
         run_idx = [i for i, cmd in enumerate(c.commands)
                    if 'email.edit' in cmd and cmd.startswith('.')]
-        chmod_idx = [i for i, cmd in enumerate(c.commands)
-                     if cmd.startswith('chmod 600')]
-        assert run_idx and chmod_idx and chmod_idx[0] < run_idx[0]
+        prep_idx = [i for i, cmd in enumerate(c.commands)
+                    if 'umask 077' in cmd]
+        assert run_idx and prep_idx and prep_idx[0] < run_idx[0]
 
     def test_password_never_reaches_the_server_command_line(self):
         # Главный гард слайса: ни в одной отправленной команде пароля нет.
@@ -1169,9 +1179,96 @@ class TestMailboxSecretChannel:
         assert '❌ Панель ответила ошибкой (rc=1)' in out
         assert 'weak password' in out
         assert 'Sup3rSecret!' not in out                 # и в ошибке панели не светится
-        assert 'rm -rf ' + SECRET_DIR + ' 2>/dev/null' in c.commands
+        assert c.find('rm -rf ' + SECRET_DIR) is not None
+        # уборка проверяет факт: одного rm мало (rc молчит и когда не вышло)
+        assert c.find('STILL_THERE') is not None
         wrapped = [cmd for cmd in c.commands if cmd.startswith('. ')]
         assert wrapped and 'rm -rf ' + SECRET_DIR in wrapped[0]
+
+    class _CancelDuringPanelCall(FakeSSH):
+        """Отмена СЕРЕДИ команды панели — как ведёт себя транспорт.
+
+        cancel() закрывает канал текущего запроса: run() на этой команде
+        бросает, и все последующие run() тоже отказаны. Проходит только
+        cleanup() — именно поэтому уборка секрета ходит им.
+        """
+
+        def __init__(self, *args, **kwargs):
+            FakeSSH.__init__(self, *args, **kwargs)
+            self.cancelled = False
+            self.cleaned = []
+
+        def run(self, cmd):
+            self.commands.append(cmd)
+            if self.cancelled or 'email.edit' in cmd:
+                self.cancelled = True
+                raise Exception('Операция отменена')
+            return self._answer(cmd)
+
+        def cleanup(self, cmd):
+            self.cleaned.append(cmd)
+            self.commands.append(cmd)
+            return self._answer(cmd)
+
+    def test_wipe_survives_cancellation(self):
+        # Регресс: rm шёл через run() и падал от cancel_event — файл с паролем
+        # переживал отмену (воспроизведено: ПРОВОНИЛСЯ=True). Теперь уборка
+        # идёт служебным каналом и обязана дойти даже после «Стоп».
+        store = FakeSftpClient()
+        c = self._CancelDuringPanelCall(
+            routes=[('mgrctl -m ispmgr maildomain', 'name=example.com elid=3\n'),
+                    ('mktemp -d', SECRET_DIR + '\n'),
+                    (ISP_LIST, 'name=info@example.com elid=5\n')],
+            client=store)
+        with pytest.raises(Exception, match='Операция отменена'):
+            dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'ispmanager')
+        # Среди служебных команд обязана быть именно УБОРКА каталога (rm +
+        # проверка факта [ -e ]), а не только подготовка файла: cleaned[0] —
+        # это prepare_secret_file, поэтому ищем по содержимому, а не по индексу.
+        assert any('[ -e ' + SECRET_DIR in cmd for cmd in c.cleaned), c.cleaned
+        # секрет в env-файле реально создавался — проверять было на что
+        assert 'Sup3rSecret!' in store.store[SECRET_DIR + '/secret.env']
+        assert 'Sup3rSecret!' not in ' '.join(c.commands)
+
+    def test_cancellation_with_failed_wipe_is_reported(self):
+        # Худший исход: отмена И убрать не удалось. Оператор обязан увидеть и
+        # то, и другое, иначе не узнает, что пароль лежит на сервере.
+        store = FakeSftpClient()
+        c = self._CancelDuringPanelCall(
+            routes=[('mgrctl -m ispmgr maildomain', 'name=example.com elid=3\n'),
+                    ('mktemp -d', SECRET_DIR + '\n'),
+                    ('echo STILL_THERE', ('STILL_THERE\n', '', 0))],
+            client=store)
+        with pytest.raises(Exception) as excinfo:
+            dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'ispmanager')
+        text = str(excinfo.value)
+        assert 'Операция отменена' in text
+        assert 'Не удалось удалить временный каталог' in text
+        assert SECRET_DIR in text                 # путь, чтобы удалить руками
+
+    def test_failed_wipe_goes_into_the_report(self):
+        # Обычный прогон (без отмены), но rm не смог: «файл удалён» врать не
+        # имеет права — вместо этого предупреждение с путём.
+        store = FakeSftpClient()
+        c = isp_env(['name=info@example.com elid=5\n',
+                     'name=info@example.com elid=5\n'
+                     'name=a@example.com elid=7\n'], sftp=store)
+        c.routes.append(('echo STILL_THERE', ('STILL_THERE\n', '', 0)))
+        out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'ispmanager')
+        assert '✅ Ящик a@example.com создан' in out
+        assert 'Не удалось удалить временный каталог' in out
+        assert SECRET_DIR in out
+        assert 'Файл удалён' not in out
+
+    def test_successful_wipe_keeps_the_honest_note(self):
+        store = FakeSftpClient()
+        c = isp_env(['name=info@example.com elid=5\n',
+                     'name=info@example.com elid=5\n'
+                     'name=a@example.com elid=7\n'], sftp=store)
+        out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'ispmanager')
+        assert 'в ps на сервере он не светился' in out
+        assert 'Файл удалён сразу после команды панели' in out
+        assert 'Не удалось удалить' not in out
 
     def test_full_wrapped_command_is_valid_shell(self):
         # Команда с `. файла`, &&, rc=$? и rm -rf — составная; её обязан

@@ -14,6 +14,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import pytest
+
 from support import FakeSSH, FakeSftpClient
 import bitrix as bx
 
@@ -1083,3 +1085,92 @@ class TestMailSendUnknownStatus:
         out = bx.bitrix_mail_send_test(c, 'operator@example.com')
         assert 'без знакомого status' in out
         assert 'status=sent' not in out
+
+
+class TestDbSecretSurvivesCancel:
+    """Отмена посреди mysql: файл с паролем БД обязан исчезнуть ( Regression:
+    rm шёл через checker.run и падал от cancel_event — пароль оставался)."""
+
+    class _CancelDuringMysql(FakeSSH):
+        """Отмена СЕРЕДИ команды, как это делает транспорт.
+
+        cancel() закрывает канал текущего запроса, и run() на этой команде
+        бросает. Дальше все обычные run() тоже отказаны — поэтому rm,
+        записанный через checker.run (как было до фикса), до сервера бы не
+        дошёл, и файл с паролем БД остался бы навсегда. Проходит только
+        cleanup().
+        """
+
+        def __init__(self, *args, **kwargs):
+            FakeSSH.__init__(self, *args, **kwargs)
+            self.cancelled = False
+            self.cleaned = []
+
+        def run(self, cmd):
+            self.commands.append(cmd)
+            if self.cancelled or 'mysql' in cmd:
+                self.cancelled = True
+                raise Exception('Операция отменена')
+            return self._answer(cmd)
+
+        def cleanup(self, cmd):
+            self.cleaned.append(cmd)
+            self.commands.append(cmd)
+            return self._answer(cmd)
+
+    def test_wipe_survives_cancellation(self):
+        store = FakeSftpClient()
+        c = self._CancelDuringMysql(routes=[('cat', DBCONN_TEXT)], client=store)
+        with pytest.raises(Exception, match='Операция отменена'):
+            bx.bitrix_db_check(c)
+        # Отмена есть, а уборка всё равно дошла — и именно служебным каналом.
+        # Ищем команду с проверкой факта [ -e ], т.к. 'rm -f <cnf>' встречается
+        # и в подготовке файла (первый cleanup), а не только в уборке.
+        assert any('[ -e ' + bx.DBCHECK_CNF in cmd for cmd in c.cleaned), c.cleaned
+        assert c.find('rm -f ' + bx.DBCHECK_CNF) is not None
+        assert 'sup3r-secret' not in ' '.join(c.commands)
+        # файл с паролем реально создавался (иначе проверять было бы нечего)
+        assert store.store[bx.DBCHECK_CNF].count('sup3r-secret') == 1
+
+    def test_secret_file_is_0600_before_password(self):
+        # Права ставятся в том же вызове, что и создание файла: до того, как
+        # в файле появится пароль (иначе окно world-readable + отмена = секрет
+        # в открытом доступе для всех на сервере)
+        store = FakeSftpClient()
+        c = FakeSSH(routes=[('cat', DBCONN_TEXT)], client=store)
+        bx.bitrix_db_check(c)
+        prep = c.find('umask 077')
+        assert prep is not None and 'chmod 600' in prep
+        assert prep.index('umask 077') < prep.index(': >') < prep.index('chmod 600')
+        assert store.store[bx.DBCHECK_CNF].count('sup3r-secret') == 1
+
+    def test_wipe_failure_is_visible_in_report(self):
+        # rm -f молчит и когда не смог (read-only /tmp, права): факт проверяем
+        # [ -e ], а причина обязана дойти до отчёта. Иначе пароль БД лежит в
+        # /tmp, а оператору нарисован зелёный ✅ — худший вид молчания.
+        store = FakeSftpClient()
+        c = FakeSSH(routes=[('cat', DBCONN_TEXT),
+                            ('echo STILL_THERE', ('STILL_THERE\n', '', 0))],
+                    client=store)
+        out = bx.bitrix_db_check(c)
+        assert '✅' in out                          # запрос-то удался
+        assert c.find('STILL_THERE') is not None    # факт проверен, а не угадан
+        assert 'Не удалось удалить временный файл с паролем БД' in out
+        assert bx.DBCHECK_CNF in out                # путь, чтобы удалить руками
+        assert 'sup3r-secret' not in out            # но сам секрет — нет
+
+    def test_grants_report_carries_wipe_warning_too(self):
+        # warn проброшен во ВСЕ отчёты, что дёргают mysql: у GRANTS свой путь
+        # через _current_grants, и потерять там причину было проще всего.
+        # Отчёт при этом обязан остаться читаемым, а секрет — не показан.
+        store = FakeSftpClient()
+        c = FakeSSH(routes=[
+            ('cat', DBCONN_TEXT),
+            ('SELECT CURRENT_USER', ('ERROR 1045: Access denied', '', 1)),
+            ('echo STILL_THERE', ('STILL_THERE\n', '', 0)),
+        ], client=store)
+        out = bx.bitrix_db_grants_report(c)
+        assert 'Подключение к базе не прошло' in out
+        assert 'Не удалось удалить временный файл с паролем БД' in out
+        assert bx.DBCHECK_CNF in out
+        assert 'sup3r-secret' not in out

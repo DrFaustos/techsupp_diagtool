@@ -9,6 +9,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import shlex
+
 import pytest
 
 from support import FakeSSH, FakeSftpClient
@@ -213,3 +215,122 @@ class TestGetDomainFromConfig:
         common.get_domain_from_config(c, '/etc/nginx/vhosts/we; rm -rf /')
         cmd = c.find('grep -h')
         assert "'/etc/nginx/vhosts/we; rm -rf /'" in cmd
+
+
+# ==================== СЛУЖЕБНЫЙ КАНАЛ: ПРАВА И УБОРКА СЕКРЕТОВ ====================
+class TestServiceRun:
+    def test_prefers_cleanup_channel(self):
+        # У ServerChecker есть cleanup(): обязан использоваться он, иначе rm из
+        # finally не доживает до уборки после нажатия «Стоп»
+        class WithCleanup(FakeSSH):
+            def cleanup(self, cmd):
+                self.commands.append('CLEANUP:' + cmd)
+                return ('', '', 0)
+
+        c = WithCleanup()
+        assert common.service_run(c, 'rm -f /tmp/x') == ('', '', 0)
+        assert c.commands == ['CLEANUP:rm -f /tmp/x']
+
+    def test_falls_back_to_run_for_plain_checkers(self):
+        # Заглушки и хост-классы без cleanup() не должны ломаться
+        class Plain:
+            def __init__(self):
+                self.seen = []
+
+            def run(self, cmd):
+                self.seen.append(cmd)
+                return ('', '', 0)
+
+        host = Plain()
+        common.service_run(host, 'chmod 600 /tmp/x')
+        assert host.seen == ['chmod 600 /tmp/x']
+
+
+class TestPrepareSecretFile:
+    SECRET = '[client]\npassword=sup3r\n'
+
+    def test_file_is_0600_before_password_lands(self):
+        store = FakeSftpClient()
+        c = FakeSSH(client=store)
+        ok, why = common.prepare_secret_file(c, '/tmp/.x.cnf', self.SECRET)
+        assert ok is True and why is None
+        prep = c.commands[0]
+        # Права ставятся в ТОМ ЖЕ вызове, что и создание: между «файл есть» и
+        # «файл 0600» нет ни одного SSH-раунда — ни окна чтения всеми, ни места
+        # для отмены (проверено локально: umask 077 -> 600, umask 022 -> 644)
+        assert 'umask 077' in prep and 'chmod 600' in prep
+        assert prep.index('umask 077') < prep.index(': >') < prep.index('chmod 600')
+        assert prep.index('chmod 600') < prep.index('NOWRITE')
+        # пароль прилетает позже и другим каналом (SFTP), а не командой
+        assert store.store['/tmp/.x.cnf'] == self.SECRET
+        assert 'sup3r' not in ' '.join(c.commands)
+
+    def test_stale_file_removed_before_creation(self):
+        # По фиксированному пути мог лежать чужой файл или symlink: SFTP-запись
+        # по symlink затёрла бы его цель, поэтому первым делом rm -f
+        store = FakeSftpClient()
+        c = FakeSSH(client=store)
+        common.prepare_secret_file(c, '/tmp/.x.cnf', self.SECRET)
+        prep = c.commands[0]
+        assert prep.index('rm -f') < prep.index(': >')
+
+    def test_nowrite_is_reported_and_nothing_is_written(self):
+        store = FakeSftpClient()
+        c = FakeSSH(routes=[(': >', ('NOWRITE\n', 'Read-only file system', 0))],
+                    client=store)
+        ok, why = common.prepare_secret_file(c, '/tmp/.x.cnf', self.SECRET)
+        assert ok is False and 'нельзя писать' in why and 'Read-only' in why
+        assert store.store == {}                     # секрет не записан
+
+    def test_write_failure_wipes_the_empty_file(self):
+        # SFTP упал ПОСЛЕ создания файла: оставленный 0600-файл по фиксированному
+        # пути — мусор, который следующий запуск унаследовал бы
+        c = FakeSSH(client=None)                     # open_sftp недоступен
+        ok, why = common.prepare_secret_file(c, '/tmp/.x.cnf', self.SECRET)
+        assert ok is False and 'не удалось записать' in why
+        assert any(cmd.startswith('rm -f') for cmd in c.commands), c.commands
+
+    def test_transport_exception_becomes_reason(self):
+        class Dead(FakeSSH):
+            def cleanup(self, cmd):
+                raise OSError('connection reset')
+
+        ok, why = common.prepare_secret_file(Dead(), '/tmp/.x.cnf', self.SECRET)
+        assert ok is False and 'connection reset' in why
+
+
+class TestRemoveRemotePath:
+    def test_success_is_silent(self):
+        c = FakeSSH()
+        assert common.remove_remote_path(c, '/tmp/d') == (True, None)
+
+    def test_checks_fact_not_exit_code(self):
+        # rm -rf молчит и когда не смог (read-only /tmp, права): факт проверяем
+        # [ -e ], иначе «файл удалён» было бы неправдой
+        c = FakeSSH(routes=[('echo STILL_THERE', ('STILL_THERE\n', '', 0))])
+        ok, why = common.remove_remote_path(c, '/tmp/d')
+        assert ok is False and 'путь остался' in why and '/tmp/d' in why
+
+    def test_non_recursive_flag_for_files(self):
+        c = FakeSSH()
+        common.remove_remote_path(c, '/tmp/x.cnf', recursive=False)
+        assert c.commands[0].startswith('rm -f ')
+
+    def test_path_with_quote_stays_one_argument(self):
+        # Одинарная кавычка в пути обязана быть экранирована: иначе путь
+        # распадается на два аргумента, и rm получает лишнее (а проверка [ -e ]
+        # смотрит не в тот файл).
+        c = FakeSSH()
+        common.remove_remote_path(c, "/tmp/we're", recursive=False)
+        first = c.commands[0].split(';')[0].strip()
+        parts = shlex.split(first)
+        assert parts == ['rm', '-f', "/tmp/we're", '2>/dev/null'], parts
+
+
+    def test_transport_exception_becomes_reason(self):
+        class Dead(FakeSSH):
+            def cleanup(self, cmd):
+                raise OSError('connection reset')
+
+        ok, why = common.remove_remote_path(Dead(), '/tmp/d')
+        assert ok is False and 'connection reset' in why

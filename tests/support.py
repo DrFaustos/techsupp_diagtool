@@ -78,6 +78,10 @@ class FakeSSH:
         out, err, _ = self.run(cmd)
         return out, err
 
+    def cleanup(self, cmd):
+        """Как ServerChecker.cleanup: уборка вне отмены, но в self.commands."""
+        return self.run(cmd)
+
     def find(self, needle):
         """Первая команда, содержащая needle (или None)."""
         for c in self.commands:
