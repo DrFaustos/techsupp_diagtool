@@ -264,10 +264,245 @@ def parse_delivery_entry(line):
         if reason.endswith(')'):
             reason = reason[:-1].rstrip()
     return {'status': status.group(1).lower(),
+            'qid': parse_queue_id(line),
             'to': to.group(1).strip() if to else '',
             'relay': relay.group(1).strip() if relay else '',
             'dsn': dsn.group(1) if dsn else '',
             'reason': reason}
+
+
+# ==================== ОТПРАВИТЕЛЬ ПО QUEUE-ID ====================
+# Отказ в логе подписан получателем (`to=`), а оператор мыслит отправителем:
+# «какой МОЙ домен тонет». В строке `postfix/smtp ... to=<...> status=` поля
+# отправителя НЕТ — там только `to=, relay=, delay=, dsn=, status=`. Отправитель
+# живёт в ДРУГОЙ записи того же письма:
+#   postfix/qmgr[21603]: 14B40C65A1: from=<user@domain.com>, size=1372, nrcpt=1 (queue active)
+#   postfix/pickup[6843]: BE78A40083: uid=1001 from=<user@domain.com>
+#   postfix/submission/smtpd[..]: 9A1F2B3C4D: client=.., sasl_method=LOGIN, sasl_username=user@x.ru
+# (cleanup пишет только message-id, конверт — нет: cleanup(8) «Insert missing
+# message headers», адрес конверта в лог не печатает).
+#
+# Поэтому здесь честный join по queue-id, а не попытка угадать отправителя по
+# тексту отказа. И из этого следуют два состояния, которые ОБЯЗАНЫ различаться:
+#   - записи о входе письма в очередь нет в окне лога  → «не определено»
+#     (qmgr пишет `from=` в момент активации очереди, smtp — позже; для письма,
+#     простоявшего в deferred час, qmgr-строка уже старше окна);
+#   - `from=<>` пустой → это НЕ «не нашли», это автоответ/bounce (MAILER-DAEMON).
+# Свести второе к первому (или наоборот) — значит наврать оператору про чужое
+# письмо. Приписать отказ домену, которого в конверте нет, — тот же грех, что
+# «не проверено» → «в порядке».
+# Идентификатор очереди postfix — шестнадцатеричная строка ВЕРХНЕГО регистра;
+# длина зависит от версии и сборки (наблюдаем 4 у старых и 10–11 у новых:
+# `AAA2`, `14B40C65A1`, `BCB39380B63`). Поэтому границу длины пришлось опустить
+# до 4: при жёсткой нижней границе на сервере с короткими id привязка молча
+# деградировала бы в «отправитель не определён», а оператор прочитал бы это как
+# «эти письма — не от наших доменов». Тихая потеря данных, притворившаяся
+# выводом, — ровно тот грех, который проект запрещает.
+#
+# Но короткая граница открывает другую дыру, и опаснее: на позицию
+# `daemon[pid]: <токен>:` попадают СЛУЖЕБНЫЕ слова — `postfix/smtpd[9]:
+# warning: queue is full`, `postfix/qmgr[9]: statistics: max connection rate`.
+# Принять `warning` за идентификатор — значит склеить все warning-строки сервера
+# в одно «письмо» и приписать его отказ тому домену, который случайно попался
+# рядом. Ложный идентификатор хуже пропущенного: пропущенный честно печатается
+# как «не определён», а ложный врёт оператору. Отсекаем алфавитом — hex
+# верхнего регистра, как его печатает postfix; служебные слова в него не входят.
+# Фикстуры проекта (AAA2, AAA1, AAB0, 9A1F2B3C4D) hex-совместимы.
+QUEUE_ID_RE = re.compile(r'[A-Za-z0-9_.-]+(?:\[\d+\])?:\s+([0-9A-F]{4,20}):\s')
+# Отказ smtpd пишет «NOQUEUE: reject:»: письма нет, оно не было принято. В hex
+# это слово не входит, но список ниже оставлен намеренно: он объясняет смысл и
+# переживёт любое расширение алфавита.
+NOT_A_QUEUE_ID = {'NOQUEUE'}
+SENDER_RE = re.compile(r'\bfrom=<([^>]*)>')
+SASL_RE = re.compile(r'\bsasl_username=(\S+)')
+
+
+def parse_queue_id(line):
+    """Queue-id записи или ''.
+
+    Берётся из префикса (`daemon[pid]: QID:`), а не из текста причины: в
+    `status=sent (250 Ok: queued as 8BDCA22DA71)` второй идентификатор — чужая
+    очередь (postfix перенял письмо), и склеить с ним отказ означало бы искать
+    потом причину в чужом логе.
+    """
+    m = QUEUE_ID_RE.search(line or '')
+    if not m or m.group(1) in NOT_A_QUEUE_ID:
+        return ''
+    return m.group(1)
+
+
+def parse_sender_entry(line):
+    """{'qid', 'from', 'via'} из записи о входе письма в очередь, иначе None.
+
+    Источник — qmgr (конверт при активации), pickup (локальная отправка) или
+    smtpd с SASL-авторизацией (там есть логин ящика). None означает «эта строка
+    отправителя не описывает» (запуск демона, `removed`, connect/disconnect).
+    Пустой `from` при НЕ-none результате — осмысленный ответ: конверт пуст.
+    """
+    line = (line or '').strip()
+    qid = parse_queue_id(line)
+    if not qid:
+        return None
+    m = SENDER_RE.search(line)
+    if m:
+        # pickup даёт 'uid=1001 from=<a@b>', qmgr — 'from=<a@b>, size=...'.
+        # Отличаем их, чтобы в отчёте сказать, откуда взялся адрес.
+        return {'qid': qid, 'from': m.group(1).strip(),
+                'via': 'pickup' if 'uid=' in line else 'qmgr'}
+    m = SASL_RE.search(line)
+    if m:
+        return {'qid': qid, 'from': m.group(1).strip().rstrip(','),
+                'via': 'sasl'}
+    return None
+
+
+def index_senders_by_queue_id(lines):
+    """{queue-id: {'from', 'via'}} по всему фрагменту лога.
+
+    Первое вхождение выигрывает (setdefault): qmgr печатает `from=` при каждой
+    активации очереди, адрес от этого не меняется, а `removed` и `retry`
+    покрываются условием парсера (там `from=` нет).
+    """
+    index = {}
+    for line in lines or ():
+        entry = parse_sender_entry(line)
+        if entry:
+            index.setdefault(entry['qid'], entry)
+    return index
+
+
+def sender_of_delivery(entry, senders):
+    """(адрес, как_узнали) отправителя записи доставки.
+
+    Варианты второго поля — не декорация, а честная градация: 'qmgr', 'pickup',
+    'sasl' (отправитель известен) и '' (в окне лога нет записи о входе письма в
+    очередь). Последнее обязан видеть оператор: иначе он решит, что писем не
+    было, а не то, что лог их не показывает.
+    """
+    qid = entry.get('qid') or ''
+    if not qid:
+        return '', ''
+    rec = senders.get(qid)
+    if not rec:
+        return '', ''
+    return rec['from'], rec['via']
+
+
+def sender_domain_of(addr):
+    """Домен из адреса отправителя ('' — адреса нет или он без домена)."""
+    addr = (addr or '').strip()
+    return addr.split('@')[-1].strip().lower() if '@' in addr else ''
+
+
+def summarize_failure_senders(failures, senders, our_domains=()):
+    """{'known': [(домен, число, наш_ли)], 'empty': N, 'unknown': N}.
+
+    our_domains берётся из инвентаря панели (discover_mail_domains), а не из
+    догадки по тексту: назвать чужой домен «нашим» было бы враньём ровно того
+    же сорта, что и поднятие «не проверено» до «в порядке». Поэтому домен,
+    которого нет в списке почтовых доменов сервера, печатается без пометки и не
+    попадает в строку «по вашим доменам».
+    """
+    ours = {str(d).strip().lower() for d in (our_domains or ())}
+    counts = Counter()
+    empty = unknown = 0
+    for e in failures:
+        addr, via = sender_of_delivery(e, senders)
+        if not via:
+            unknown += 1
+            continue
+        if not addr:
+            # Пустой конверт: автоответ и bounce-уведомления (MAILER-DAEMON).
+            empty += 1
+            continue
+        counts[sender_domain_of(addr)] += 1
+    known = sorted(((dom, n, dom in ours) for dom, n in counts.items()),
+                   key=lambda item: (-item[1], item[0]))
+    return {'known': known, 'empty': empty, 'unknown': unknown}
+
+
+def failure_sender_lines(failures, log_text, our_domains=None, compact=False):
+    """Строки «кто отправлял эти отказы» (compact=True — ровно одна строка).
+
+    Индекс строится из УЖЕ ПРОЧИТАННОГО фрагмента: читать лог вторичный раз
+    означало бы удвоить цену отчёта, а привязка к отправителю ради этого и
+    затевалась.
+
+    Здесь нет ни одной догадки и ни одного «похоже на наш». «Наш» домен —
+    только тот, что назван инвентарём почтовых доменов (our_domains); если его
+    не передавали (None), пометка «ваши» не ставится и это пишется отдельно:
+    «не проверяли» и «не нашли» — разные ответы, и оператору нужен именно тот,
+    который был.
+    """
+    if not failures:
+        return []
+    senders = index_senders_by_queue_id((log_text or '').splitlines())
+    summ = summarize_failure_senders(failures, senders, our_domains or ())
+    known = summ['known']
+    ours = [(dom, n) for dom, n, is_ours in known if is_ours]
+    others = [(dom, n) for dom, n, is_ours in known if not is_ours]
+    our_names = {str(d).strip().lower() for d in (our_domains or ())}
+
+    if compact:
+        parts = []
+        if ours:
+            parts.append('по вашим доменам: ' +
+                         ', '.join(f'{d} — {n}' for d, n in ours[:4]))
+        if others:
+            parts.append('иных отправителей: ' +
+                         ', '.join(f'{d} — {n}' for d, n in others[:3]))
+        if summ['unknown']:
+            # Двоеточие, а не тире: вся строка открывается словами
+            # «отправители отказов — », и второе тире в той же фразе читается
+            # как обрыв вывода («отправители отказов — отправитель не определён
+            # — 1»). Одиночная часть обязана читаться так же чисто, как список.
+            parts.append(f"отправитель не определён: {summ['unknown']}")
+        if summ['empty']:
+            parts.append(f"писем без отправителя: {summ['empty']}")
+        if not parts:
+            return []
+        # Заголовок подстраивается под содержимое. Когда ни один отказ не
+        # привязан к домену, фраза «отправители отказов — отправитель не
+        # определён: 1» читается как тавтология и как сломанный вывод, хотя
+        # данные в ней настоящие. Про домены в этом случае молчим честно: их
+        # просто не удалось установить.
+        head = ('отправители отказов' if (ours or others)
+                else 'отказы без привязки к домену')
+        return [f'   {head} — ' + '; '.join(parts)]
+
+    lines = []
+    if ours:
+        lines.append('   По вашим почтовым доменам: ' +
+                     ', '.join(f'{d} — {n}' for d, n in ours))
+        lines.append('      адрес подтверждён записью qmgr/pickup/sasl того же '
+                     'queue-id, а не угадан по тексту отказа.')
+    if others:
+        listed = ', '.join(f'{d} — {n}' for d, n in others)
+        if our_names:
+            lines.append(f'   Отправители вне ваших почтовых доменов: {listed} '
+                         '— домен не значится в инвентаре почты этого сервера '
+                         '(письмо могло уйти через сторонний сервис или от '
+                         'чужого локального пользователя).')
+        else:
+            lines.append(f'   Отправители отказов: {listed} — какие домены '
+                         'считать вашими, не проверялось: инвентарь почтовых '
+                         'доменов для этого отчёта не запрашивался.')
+    # Форма «сущность — число», как в остальных счётчиках проекта
+    # («Очередь postfix: писем — 5»): при 1 вывод читается так же чисто, как
+    # при 12, и второму помощнику склонения здесь не место — две схемы счёта в
+    # одном отчёте оператор прочитал бы как невнимательность.
+    if summ['unknown']:
+        # Без объяснения ПРИЧИНЫ: «письмо из deferred» — лишь один из вариантов
+        # (ещё — ротация лога и просто короткий window). Факт один: записи нет в
+        # прочитанном фрагменте, и называть это «не ваш домен» нельзя.
+        lines.append(f"   Отправитель не определён — {summ['unknown']}: записи "
+                     'qmgr с from=<…> об этих письмах в прочитанное окно лога '
+                     'не попала. Это «не видно», а не «не ваш домен».')
+    if summ['empty']:
+        lines.append(f"   Писем без отправителя (from=<>) — {summ['empty']}: "
+                     'автоответы и уведомления о недоставке. Их нельзя приписать '
+                     'ни одному домену — конверт пуст.')
+    return lines
 
 
 def mail_failure_hint(text):
@@ -325,7 +560,7 @@ def classify_delivery(entry):
 
 
 def mail_log_snapshot_lines(checker, tail=MAIL_LOG_SNAPSHOT_TAIL,
-                           limit=MAIL_FAILURE_LIMIT):
+                           limit=MAIL_FAILURE_LIMIT, our_domains=None):
     """Снимок почтовой доставки: очередь не объясняет причин, объясняет лог.
 
     mailq отвечает «сколько писем стоит», но не отвечает «почему». Именно здесь
@@ -376,12 +611,18 @@ def mail_log_snapshot_lines(checker, tail=MAIL_LOG_SNAPSHOT_TAIL,
                          'дословно из лога, смотреть нужно его.')
         shown += 1
     if len(failures) > shown:
-        lines.append(f'   … и ещё {len(failures) - shown} отказов (показаны '
+        # Та же форма счётчика, что в строках об отправителях ниже: «и ещё 1
+        # отказов» при одном отказе читается как ошибка, а две схемы счёта в
+        # одном снимке — как невнимательность.
+        lines.append(f'   … скрыто отказов — {len(failures) - shown} (показаны '
                      f'первые {limit})')
     domains = sorted({d for d in (delivery_domain_of(e) for e in failures) if d})
     if domains:
         lines.append('   Домены получателей с отказами: ' + ', '.join(domains[:10])
                      + (' …' if len(domains) > 10 else ''))
+    # «Кому бьёт» без «кто слал» оператору бесполезно: чинит он свой домен, а не
+    # gmail. Индекс строится из ЭТОГО ЖЕ фрагмента лога — вторичного чтения нет.
+    lines.extend(failure_sender_lines(failures, text, our_domains))
     lines.append('   Если отказы «спам/блокировка» — следующий шаг: пункт '
                  '«Почта: SPF/DKIM/DMARC/PTR» (причина в DNS, а не в postfix).')
     return lines
@@ -416,7 +657,8 @@ def delivery_failure_groups(entries):
     return groups
 
 
-def mail_delivery_digest_lines(checker, tail=MAIL_DIGEST_TAIL):
+def mail_delivery_digest_lines(checker, tail=MAIL_DIGEST_TAIL,
+                               our_domains=None):
     """3–4 строки: подтверждает (или честно не подтверждает) связку с DNS.
 
     Цена — ОДИН чтение лога на прогон: в SPF-отчёте до HEALTH_CHECK_LIMIT
@@ -463,6 +705,15 @@ def mail_delivery_digest_lines(checker, tail=MAIL_DIGEST_TAIL):
                     for label, n in groups.most_common(3))
     lines.append(f'   причины отказов: {top}'
                  + (f' (всего отказов: {refused})' if refused > 3 else ''))
+    # Одна строка вместо полного списка: дайджест — подтверждение диагноза, а не
+    # предмет проверки. Отправитель берётся join'ом по queue-id из того же
+    # фрагмента, который уже прочитан, поэтому «+1 строка в отчёте» не стоит
+    # «+1 чтение лога».
+    refused_entries = [e for e in entries
+                       if e['status'] in DELIVERY_STATUSES
+                       and e['status'] != 'sent']
+    lines.extend(failure_sender_lines(refused_entries, text, our_domains,
+                                      compact=True))
     spam = groups.get(SPAM_GROUP_LABEL, 0)
     if spam:
         lines.append(f'   ↳ {spam} из них — спам-фильтр/блокировка: DNS-беда уже '

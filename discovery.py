@@ -740,8 +740,14 @@ def mail_overview_report(checker, panel_type=None):
     # живёт в логе: `status=bounced ... 550 ...` — это и есть ответ на тикет
     # «письма уходят в спам». Снимок идёт внутрь этой сводки, а не отдельным
     # пунктом меню: тикет закрывается одним прогоном, а меню не разрастается.
+    #
+    # Здесь снимок получает ЕЩЁ и список почтовых доменов сервера. Без него
+    # отчёт показал бы «отправители: lie.ru — 3» без ответа на вопрос «а lie.ru
+    # вообще наш?»: называть домен нашим по догадке — то же враньё, что и
+    # поднимать «не проверено» до «в порядке». Инвентарь уже запрошен строкой
+    # выше, поэтому вторая цена — ноль.
     lines.append('')
-    lines.extend(mail_log_snapshot_lines(checker))
+    lines.extend(mail_log_snapshot_lines(checker, our_domains=domains))
 
     statuses = parse_service_statuses(
         checker.exec_command(services_status_cmd(list(MAIL_SERVICES)))[0])
@@ -1668,7 +1674,10 @@ def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
     # подтверждать — второе не читается как «чинить нечего» (текст ниже это
     # опровергает).
     lines.append('')
-    lines.extend(mail_delivery_digest_lines(checker))
+    # our_domains = инвентарь почтовых доменов этого сервера (он уже собран в
+    # начале отчёта). Пометка «ваши домены» ставится только по нему: назвать
+    # домен нашим по виду адреса — врать оператору, который понесёт это клиенту.
+    lines.extend(mail_delivery_digest_lines(checker, our_domains=domains))
     return "\n".join(lines)
 
 
