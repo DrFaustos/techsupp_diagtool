@@ -507,7 +507,7 @@ class TestMailLogSnapshot:
         out = logs_mod.mail_log_snapshot_lines(FakeSSH(routes=lines), limit=8)
         shown = [l for l in out if '↳' in l]
         assert len(shown) == 8
-        assert 'и ещё 12 отказов' in '\n'.join(out)
+        assert 'скрыто отказов — 12' in '\n'.join(out)
 
     def test_cost_is_one_read_of_the_log(self):
         c = FakeSSH(routes=_log_routes(SENT))
@@ -551,3 +551,337 @@ class TestMailDeliveryDigest:
         c = FakeSSH(routes=_log_routes(SENT))
         logs_mod.mail_delivery_digest_lines(c)
         assert c.count('for __p in') == 1
+
+
+# ==================== привязка отказа к домену отправления ====================
+# Строка доставки (`postfix/smtp ... to=<...> status=`) отправителя НЕ содержит:
+# там только to=/relay=/delay=/dsn=/status=. Конверт живёт в ДРУГОЙ записи того
+# же queue-id (qmgr при активации очереди, pickup при локальной отправке,
+# `sasl_username=` у smtpd при авторизации; cleanup — только message-id, man
+# cleanup(8)). Поэтому ниже проверяется именно связка по queue-id, а не
+# удачность формулировок: приписать отказ домену, которого в конверте нет, —
+# тот же грех, что и поднять «не проверено» до «в порядке».
+PICKUP_LIE = ('Oct 10 12:00:00 host postfix/pickup[6843]: BE78A40083: '
+              'uid=1001 from=<web@lie.ru>')
+CLEANUP_LIE = ('Oct 10 12:00:00 host postfix/cleanup[6850]: BE78A40083: '
+               'message-id=<20261010.be@host>')
+QMGR_LIE = ('Oct 10 12:00:01 host postfix/qmgr[21603]: BE78A40083: '
+            'from=<web@lie.ru>, size=1372, nrcpt=1 (queue active)')
+SMTPD_SASL = ('Oct 10 12:00:06 host postfix/submission/smtpd[7001]: '
+              '9A1F2B3C4D: client=unknown[203.0.113.7], sasl_method=LOGIN, '
+              'sasl_username=shop@shop.ru')
+QMGR_SASL = ('Oct 10 12:00:07 host postfix/qmgr[21603]: 9A1F2B3C4D: '
+             'from=<shop@shop.ru>, size=900, nrcpt=1 (queue active)')
+QMGR_BOUNCE = ('Oct 10 12:00:10 host postfix/qmgr[21603]: DEADBEEF01: '
+               'from=<>, size=2400, nrcpt=1 (queue active)')
+REMOVED_LIE = 'Oct 10 12:00:13 host postfix/qmgr[21603]: BE78A40083: removed'
+# Отказ письма, записей о входе которого в очередь в окне лога нет: «не видно»
+# обязано отличаться от «не ваш домен» — иначе оператор спишет отказ чужому.
+ORPHAN_FAIL = ('Oct 10 12:00:09 host postfix/smtp[131]: CAFE000111: '
+               'to=<q@p.ru>, relay=none, dsn=5.1.1, status=bounced '
+               '(User unknown)')
+FAIL_LIE = ('Oct 10 12:00:05 host postfix/smtp[124]: BE78A40083: '
+            'to=<c@gmail.com>, relay=gmail-smtp-in.l.google.com'
+            '[142.251.8.27]:25, dsn=5.7.26, status=bounced (gmail-smtp-in'
+            '.l.google.com said: 550-5.7.26 unauthenticated mail was rejected, '
+            'please learn about SPF)')
+FAIL_SHOP = ('Oct 10 12:00:08 host postfix/smtp[130]: 9A1F2B3C4D: '
+             'to=<z@yandex.ru>, relay=none, dsn=4.4.1, status=deferred '
+             '(connect to mx.yandex.ru[213.180.204.25]:25: Connection timed '
+             'out)')
+FAIL_BOUNCE = ('Oct 10 12:00:11 host postfix/smtp[132]: DEADBEEF01: '
+               'to=<nowhere@dead.ru>, relay=none, dsn=5.1.1, status=bounced '
+               '(User unknown)')
+# journald/rsyslog пишут время в RFC3339 и без [pid] — форма префикса другая,
+# а связка по queue-id обязана работать и там. Идентификаторы здесь — hex, как
+# их печатает postfix: выдумывать «читаемые» id вроде LOCALID для строк, которые
+# обязаны парситься, нельзя — парсер бы про них молчал, а тест бы «проходил».
+ISO_QMGR = ('2026-09-25T09:41:12.318201+00:00 mail postfix/qmgr: 150E000001: '
+            'from=<iso@x.ru>, size=100, nrcpt=1 (queue active)')
+ISO_FAIL = ('2026-09-25T09:41:13.400000+00:00 mail postfix/smtp: 150E000001: '
+            'to=<t@recv.ru>, relay=none, dsn=5.7.1, status=bounced '
+            '(blocked using Spamhaus)')
+# «queued as 8BDCA22DA71» — чужая очередь (письмо перенял другой MTA). Взять её
+# вместо нашей означало бы искать потом причину отказа в чужом логе.
+QUEUED_AS = ('Oct 10 12:00:14 host postfix/smtp[140]: F0DE000001: '
+             'to=<m@b.ru>, relay=smtp.b.ru[9.9.9.9]:25, dsn=2.0.0, status=sent '
+             '(250 Ok: queued as 8BDCA22DA71)')
+
+# Полный лог для отчётных тестов: наш домен, «не наш», письмо без qmgr-строки и
+# письмо с пустым конвертом — по одному, чтобы счётчики не перепутались.
+SENDER_LOG = [PICKUP_LIE, CLEANUP_LIE, QMGR_LIE, FAIL_LIE,
+              SMTPD_SASL, QMGR_SASL, FAIL_SHOP,
+              ORPHAN_FAIL, QMGR_BOUNCE, FAIL_BOUNCE]
+
+
+def _failures_of(*lines):
+    """Отказы так же, как их отбирает снимок: известные статусы, кроме sent."""
+    return [e for e in (logs_mod.parse_delivery_entry(l) for l in lines)
+            if e and e['status'] in logs_mod.DELIVERY_STATUSES
+            and e['status'] != 'sent']
+
+
+class TestQueueIdParsing:
+    def test_queue_id_taken_from_prefix(self):
+        assert logs_mod.parse_queue_id(QMGR_LIE) == 'BE78A40083'
+        assert logs_mod.parse_queue_id(FAIL_LIE) == 'BE78A40083'
+
+    def test_iso_prefix_without_pid_supported(self):
+        assert logs_mod.parse_queue_id(ISO_QMGR) == '150E000001'
+
+    @pytest.mark.parametrize('line', (
+        'Oct 10 12:00:00 host postfix/smtpd[9]: warning: queue is full',
+        'Oct 10 12:00:00 host postfix/anvil[9]: statistics: max connection '
+        'rate 2.00 for (a:1.2.3.4) at Oct 10 12:00:00',
+        'Oct 10 12:00:00 host postfix/master[1]: fatal: open /etc/postfix/'
+        'main.cf: No such file or directory',
+        'Oct 10 12:00:00 host postfix/smtpd[1]: connect to unknown[1.2.3.4] '
+        'failed: Connection timed out',
+    ))
+    def test_syslog_service_words_are_not_queue_ids(self, line):
+        # Граница длины {4,…} открыла бы сюда дорогу: `warning` — семь букв.
+        # Принять служебное слово за идентификатор — склеить все warning-строки
+        # сервера в одно «письмо» и приписать ему чужой отказ.
+        assert logs_mod.parse_queue_id(line) == ''
+
+    def test_short_queue_id_of_old_postfix_is_accepted(self):
+        # Старые версии печатают 4 символа (фикстуры проекта — AAA2, AAB0).
+        # При жёсткой нижней границе привязка на таком сервере молча деградировала
+        # бы в «не определён», а это читается как «письма не от наших доменов».
+        line = ('Oct 10 12:00:01 host postfix/qmgr[9]: AAA2: '
+                'from=<web@lie.ru>, size=100, nrcpt=1 (queue active)')
+        assert logs_mod.parse_queue_id(line) == 'AAA2'
+        assert logs_mod.parse_sender_entry(line)['from'] == 'web@lie.ru'
+
+    @pytest.mark.parametrize('line', (
+        'Oct 10 12:00:02 host postfix/smtpd[9]: connect from '
+        'unknown[203.0.113.5]',
+        'Oct 10 12:00:00 host postfix/master[1]: daemon started -- '
+        'version 3.5.6',
+    ))
+    def test_noise_has_no_queue_id(self, line):
+        # `connect from unknown[...]` формально похоже на «daemon[pid]:», но
+        # идентификатора письма там нет: выдать за него «unknown» — склеить все
+        # отказы приёма в одно «письмо».
+        assert logs_mod.parse_queue_id(line) == ''
+
+    def test_noqueue_is_not_a_queue_id(self):
+        # smtpd пишет «NOQUEUE: reject:» — письма нет, оно не было принято.
+        # Алфавит hex отсекает его уже сейчас (N, O, Q, U не шестнадцатеричные),
+        # но NOT_A_QUEUE_ID остаётся явной защитой: если алфавит когда-нибудь
+        # расширят, этот тест обязан остаться красным, а не тихо позеленеть.
+        line = ('Oct 10 12:00:12 host postfix/smtpd[9]: NOQUEUE: reject: RCPT '
+                'from unknown[203.0.113.5]: 550 Access denied')
+        assert logs_mod.parse_queue_id(line) == ''
+
+    def test_foreign_queue_id_in_reason_not_used(self):
+        e = logs_mod.parse_delivery_entry(QUEUED_AS)
+        assert e['qid'] == 'F0DE000001'
+        assert '8BDCA22DA71' not in e['qid']
+
+
+class TestSenderByQueueId:
+    def test_pickup_qmgr_sasl_are_sources(self):
+        idx = logs_mod.index_senders_by_queue_id(
+            [PICKUP_LIE, CLEANUP_LIE, QMGR_LIE, SMTPD_SASL, ISO_QMGR])
+        assert idx['BE78A40083']['from'] == 'web@lie.ru'
+        assert idx['9A1F2B3C4D']['via'] == 'sasl'
+        assert idx['150E000001'] == {'qid': '150E000001', 'from': 'iso@x.ru',
+                                     'via': 'qmgr'}
+
+    def test_first_record_wins(self):
+        # qmgr печатает from= при каждой активации очереди, pickup — раньше.
+        # Первый ответ и есть момент входа письма в очередь.
+        idx = logs_mod.index_senders_by_queue_id([PICKUP_LIE, QMGR_LIE])
+        assert idx['BE78A40083']['via'] == 'pickup'
+
+    def test_cleanup_does_not_claim_sender(self):
+        # cleanup(8) вставляет заголовки (message-id), а адрес конверта в лог не
+        # печатает: искать его в этой строке негде.
+        assert logs_mod.parse_sender_entry(CLEANUP_LIE) is None
+
+    def test_removed_line_is_not_sender(self):
+        assert logs_mod.parse_sender_entry(REMOVED_LIE) is None
+
+    def test_empty_envelope_is_an_answer_not_a_miss(self):
+        # from=<> — автоответ или уведомление о недоставке. Свести это к «не
+        # нашли» нельзя: у такого письма отправителя действительно нет.
+        rec = logs_mod.parse_sender_entry(QMGR_BOUNCE)
+        assert rec is not None and rec['from'] == '' and rec['via'] == 'qmgr'
+
+    def test_sasl_login_strips_trailing_comma(self):
+        line = ('Oct 10 12:00:06 host postfix/smtpd[7]: 1111222233: '
+                'client=h[1.2.3.4], sasl_method=LOGIN, sasl_username=a@b.ru, '
+                'sasl_sender=')
+        assert logs_mod.parse_sender_entry(line)['from'] == 'a@b.ru'
+
+    def test_delivery_entry_carries_queue_id(self):
+        # Без qid в разборе доставки связка невозможна в принципе.
+        assert logs_mod.parse_delivery_entry(FAIL_LIE)['qid'] == 'BE78A40083'
+
+    def test_three_states_of_sender_lookup(self):
+        idx = logs_mod.index_senders_by_queue_id(
+            [QMGR_LIE, QMGR_BOUNCE, ISO_QMGR])
+        known = logs_mod.parse_delivery_entry(FAIL_LIE)
+        assert logs_mod.sender_of_delivery(known, idx) == ('web@lie.ru', 'qmgr')
+        bounce = logs_mod.parse_delivery_entry(FAIL_BOUNCE)
+        assert logs_mod.sender_of_delivery(bounce, idx) == ('', 'qmgr')
+        orphan = logs_mod.parse_delivery_entry(ORPHAN_FAIL)
+        assert logs_mod.sender_of_delivery(orphan, idx) == ('', '')
+
+    def test_sender_domain_of(self):
+        assert logs_mod.sender_domain_of('Web@Lie.RU') == 'lie.ru'
+        assert logs_mod.sender_domain_of('') == ''
+        assert logs_mod.sender_domain_of('nosign') == ''
+
+
+class TestFailureSenderSummary:
+    def test_our_domains_come_from_inventory_only(self):
+        idx = logs_mod.index_senders_by_queue_id(SENDER_LOG)
+        summ = logs_mod.summarize_failure_senders(
+            _failures_of(*SENDER_LOG), idx, ['lie.ru'])
+        assert ('lie.ru', 1, True) in summ['known']
+        # shop.ru — реальный отправитель, но в инвентаре почты его нет: назвать
+        # его «нашим» было бы враньём, поэтому пометка False.
+        assert ('shop.ru', 1, False) in summ['known']
+
+    def test_empty_inventory_marks_nobody_ours(self):
+        idx = logs_mod.index_senders_by_queue_id(SENDER_LOG)
+        summ = logs_mod.summarize_failure_senders(
+            _failures_of(*SENDER_LOG), idx)
+        assert summ['known'] and not any(ours for _d, _n, ours in summ['known'])
+
+    def test_unknown_and_empty_envelope_counted_separately(self):
+        idx = logs_mod.index_senders_by_queue_id(SENDER_LOG)
+        summ = logs_mod.summarize_failure_senders(
+            _failures_of(*SENDER_LOG), idx, ['lie.ru'])
+        # «нет qmgr-строки в окне» и «конверт пуст» — разные ответы: первое
+        # лечится расширением окна лога, второе — ничем.
+        assert summ['unknown'] == 1 and summ['empty'] == 1
+
+    def test_sorted_by_count_then_name(self):
+        idx = logs_mod.index_senders_by_queue_id(SENDER_LOG)
+        summ = logs_mod.summarize_failure_senders(
+            _failures_of(*SENDER_LOG, FAIL_LIE), idx, ['lie.ru'])
+        assert summ['known'][0] == ('lie.ru', 2, True)
+
+
+class TestFailureSenderLines:
+    def _text(self, our_domains, compact=False):
+        return '\n'.join(logs_mod.failure_sender_lines(
+            _failures_of(*SENDER_LOG), '\n'.join(SENDER_LOG), our_domains,
+            compact=compact))
+
+    def test_our_domain_named_and_substantiated(self):
+        text = self._text(['lie.ru'])
+        assert 'По вашим почтовым доменам: lie.ru — 1' in text
+        # Чем подтверждён адрес, сказано прямо: без этого строка выглядит как
+        # догадка по тексту отказа.
+        assert 'не угадан' in text
+
+    def test_outsider_named_outsider(self):
+        text = self._text(['lie.ru'])
+        assert 'вне ваших почтовых доменов: shop.ru — 1' in text
+        assert 'не значится в инвентаре' in text
+
+    def test_no_inventory_says_it_was_not_checked(self):
+        text = self._text(None)
+        assert 'По вашим' not in text
+        assert 'не проверялось' in text
+        # Имя домена при этом остаётся: «не проверяли, чей он» ≠ «отправителей
+        # нет».
+        assert 'lie.ru' in text
+
+    def test_unknown_phrased_as_not_visible(self):
+        text = self._text(['lie.ru'])
+        assert 'Отправитель не определён — 1' in text
+        assert 'не видно' in text
+        # Форма счётчика «сущность — число»: при одном отказе вывод обязан
+        # читаться так же чисто, как при двенадцати.
+        assert '1 отказов' not in text
+
+    def test_empty_envelope_line(self):
+        text = self._text(['lie.ru'])
+        assert 'Писем без отправителя (from=<>) — 1' in text
+        assert 'конверт пуст' in text
+
+    def test_compact_is_one_line(self):
+        out = logs_mod.failure_sender_lines(_failures_of(*SENDER_LOG),
+                                            '\n'.join(SENDER_LOG), ['lie.ru'],
+                                            compact=True)
+        assert len(out) == 1
+        assert 'по вашим доменам: lie.ru — 1' in out[0]
+        assert 'иных отправителей: shop.ru — 1' in out[0]
+        assert 'отправитель не определён: 1' in out[0]
+        assert 'писем без отправителя: 1' in out[0]
+        # Тире внутри этой строки стоит ровно один раз — после «отправители
+        # отказов». Второе читалось бы как обрыв вывода.
+        assert out[0].count(' — ') == 3  # по доменам: lie.ru — 1, иных: ... — 1
+
+    def test_no_failures_no_lines(self):
+        assert logs_mod.failure_sender_lines([], '\n'.join(SENDER_LOG),
+                                            ['lie.ru']) == []
+
+    def test_compact_head_says_no_link_when_nothing_resolved(self):
+        # Ни один отказ не привязан к домену (qmgr-строк в окне нет). Бывший
+        # заголовок давал тавтологию «отправители отказов — отправитель не
+        # определён: 2», которая выглядит как сломанный вывод, хотя данные в
+        # ней настоящие.
+        lines = (ORPHAN_FAIL,
+                 'Oct 10 12:00:14 host postfix/smtp[141]: DEADBEEF02: '
+                 'to=<r@p.ru>, relay=none, dsn=5.1.1, status=bounced '
+                 '(User unknown)')
+        out = logs_mod.failure_sender_lines(_failures_of(*lines),
+                                            '\n'.join(lines), ['lie.ru'],
+                                            compact=True)
+        assert len(out) == 1
+        assert 'отказы без привязки к домену — отправитель не определён: 2' \
+            in out[0]
+        assert 'отправители отказов — отправитель' not in out[0]
+
+    def test_compact_head_for_empty_envelope_only(self):
+        # Пустой конверт — тоже «без привязки», но сказать надо именно про
+        # конверт: «отправитель не определён» тут был бы неправдой (он известен
+        # — его нет).
+        out = logs_mod.failure_sender_lines(
+            _failures_of(QMGR_BOUNCE, FAIL_BOUNCE),
+            '\n'.join((QMGR_BOUNCE, FAIL_BOUNCE)), ['lie.ru'], compact=True)
+        assert 'отказы без привязки к домену — писем без отправителя: 1' \
+            in out[0]
+
+
+class TestSenderInReports:
+    def test_snapshot_shows_our_domain(self):
+        out = '\n'.join(logs_mod.mail_log_snapshot_lines(
+            FakeSSH(routes=_log_routes(*SENDER_LOG)), our_domains=['lie.ru']))
+        assert 'По вашим почтовым доменам: lie.ru — 1' in out
+
+    def test_snapshot_without_inventory_makes_no_claim(self):
+        out = '\n'.join(logs_mod.mail_log_snapshot_lines(
+            FakeSSH(routes=_log_routes(*SENDER_LOG))))
+        assert 'По вашим' not in out and 'не проверялось' in out
+
+    def test_snapshot_still_costs_one_read(self):
+        # Индекс отправителей строится из УЖЕ прочитанного фрагмента: привязка
+        # не имеет права удвоить цену отчёта.
+        c = FakeSSH(routes=_log_routes(*SENDER_LOG))
+        logs_mod.mail_log_snapshot_lines(c, our_domains=['lie.ru'])
+        assert c.count('for __p in') == 1
+
+    def test_digest_gets_exactly_one_sender_line(self):
+        out = '\n'.join(logs_mod.mail_delivery_digest_lines(
+            FakeSSH(routes=_log_routes(*SENDER_LOG)), our_domains=['lie.ru']))
+        assert 'отправители отказов —' in out
+        assert out.count('отправители отказов') == 1
+
+    def test_digest_costs_one_read(self):
+        c = FakeSSH(routes=_log_routes(*SENDER_LOG))
+        logs_mod.mail_delivery_digest_lines(c, our_domains=['lie.ru'])
+        assert c.count('for __p in') == 1
+
+    def test_no_failures_means_no_sender_lines(self):
+        # «Отказов нет» + пометка «по вашим доменам» — это уже выдуманный
+        # отправитель: строк об отправителях при нулевом счёте быть не должно.
+        out = '\n'.join(logs_mod.mail_log_snapshot_lines(
+            FakeSSH(routes=_log_routes(SENT)), our_domains=['lie.ru']))
+        assert 'По вашим' not in out and 'Отказов нет' in out

@@ -606,6 +606,13 @@ GMAIL_SPAM_BOUNCE = (
     'status=bounced (gmail-smtp-in.l.google.com[142.251.8.27] said: '
     '550-5.7.26 [203.0.113.9] unauthenticated mail was rejected, please '
     'learn about SPF)')
+# Запись о входе того же письма в очередь. Строка доставки (`smtp`) отправителя
+# не содержит — конверт печатает `qmgr` по тому же queue-id. Queue-id здесь
+# короткий (AAA2), как у старых версий postfix: при жёсткой нижней границе длины
+# привязка на таком сервере молча не срабатывала бы, и оператор прочитал бы это
+# как «письма не от наших доменов».
+QMGR_LIE = ('Oct 10 12:00:01 host postfix/qmgr[21603]: AAA2: '
+            'from=<info@lie.ru>, size=1000, nrcpt=1 (queue active)')
 
 
 def _log_routes(*lines):
@@ -688,6 +695,88 @@ class TestDeliveryDigestInMailAuth:
         out = dc.mail_auth_report(c, 'ispmanager')
         assert 'не найден' in out and 'не проверено' in out
         assert 'DNS-беда уже ломает доставку' not in out
+
+
+class TestSenderAttributionInReports:
+    """Отказ обязан быть подписан ДОМЕНОМ ОТПРАВЛЕНИЯ, а не только получателем.
+
+    Оператор чинит свой домен, а не gmail: «письма отбивает Gmail» для него
+    бесполезно, нужно «у домена lie.ru письма отбивают за SPF». Отправителя в
+    строке доставки нет — он берётся join'ом по queue-id, и пометка «ваши»
+    ставится только по инвентарю почтовых доменов панели.
+    """
+
+    def test_spf_report_names_the_sending_domain(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=lie.ru elid=1\n')] + AUTH_ROUTES
+                   + _log_routes(QMGR_LIE, GMAIL_SPAM_BOUNCE))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        # Ключевая фраза слайса: тикет закрывается именем домена.
+        assert 'по вашим доменам: lie.ru — 1' in out
+
+    def test_spf_report_still_costs_one_log_read(self):
+        # Индекс отправителей строится из УЖЕ прочитанного фрагмента. Гард не
+        # даст «починить» привязку вторым чтением лога: при 25 доменах это
+        # означало бы висящее окно GUI.
+        rows = 'name=a.ru elid=1\nname=lie.ru elid=2\n'
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain', rows)] + AUTH_ROUTES
+                   + _log_routes(QMGR_LIE, GMAIL_SPAM_BOUNCE))
+        dc.mail_auth_report(c, 'ispmanager')
+        assert c.count('for __p in') == 1
+
+    def test_overview_substantiates_the_sending_domain(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=lie.ru elid=1\n'),
+                            ('mailq', '-- 1 Messages'),
+                            ('__svc_status', 'postfix=active\n')] + AUTH_ROUTES
+                   + _log_routes(QMGR_LIE, GMAIL_SPAM_BOUNCE))
+        out = dc.mail_overview_report(c, 'ispmanager')
+        assert 'По вашим почтовым доменам: lie.ru — 1' in out
+        # Адрес подтверждён записью очереди, а не угадан по тексту отказа — это
+        # обязано быть сказано, иначе строка выглядит догадкой.
+        assert 'не угадан' in out
+
+    def test_overview_without_panel_inventory_makes_no_claim(self):
+        # panel_type='none': инвентаря почтовых доменов нет, и называть домен
+        # «вашим» нечем. Поднять «не проверяли» до «ваши» — тот же грех, что и
+        # «не проверено» → «в порядке».
+        c = FakeSSH(routes=[('mailq', '-- 1 Messages'),
+                            ('__svc_status', 'postfix=active\n')]
+                   + _log_routes(QMGR_LIE, GMAIL_SPAM_BOUNCE))
+        out = dc.mail_overview_report(c, 'none')
+        assert 'По вашим' not in out
+        assert 'не проверялось' in out
+        # При этом сам отправитель не теряется: «не проверяли, чей он» ≠
+        # «отправителей нет».
+        assert 'lie.ru' in out
+
+    def test_failure_of_foreign_sender_is_named_foreign(self):
+        # lie.ru в инвентаре, письмо шлёт chuj.ru: назвать его «вашим» нельзя,
+        # но и молчать нельзя — отказ реальный.
+        foreign = ('Oct 10 12:00:01 host postfix/qmgr[21603]: AAA2: '
+                   'from=<spam@chuj.ru>, size=1000, nrcpt=1 (queue active)')
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=lie.ru elid=1\n'),
+                            ('mailq', '-- 1 Messages'),
+                            ('__svc_status', 'postfix=active\n')] + AUTH_ROUTES
+                   + _log_routes(foreign, GMAIL_SPAM_BOUNCE))
+        out = dc.mail_overview_report(c, 'ispmanager')
+        assert 'По вашим' not in out
+        assert 'вне ваших почтовых доменов: chuj.ru — 1' in out
+        assert 'не значится в инвентаре' in out
+
+    def test_sender_missing_from_window_is_not_called_foreign(self):
+        # Если qmgr-строки в окне лога нет, отказ обязан быть подписан «не
+        # видно», а не «не ваш домен»: второе — ложное оправдание домена.
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=lie.ru elid=1\n'),
+                            ('mailq', '-- 1 Messages'),
+                            ('__svc_status', 'postfix=active\n')] + AUTH_ROUTES
+                   + _log_routes(GMAIL_SPAM_BOUNCE))
+        out = dc.mail_overview_report(c, 'ispmanager')
+        assert 'Отправитель не определён — 1' in out
+        assert 'не видно' in out
+        assert 'вне ваших' not in out
 
 
 class TestInventoryAndDomain:
