@@ -469,6 +469,126 @@ def ispmanager_license_report(checker):
     return "\n".join(lines)
 
 
+# ==================== ISPmanager: АКТИВАЦИЯ ЛИЦЕНЗИИ ПО КЛЮЧУ =============
+# Синтаксис — официальный док ISPsystem «Activating a license with a key»:
+#     /usr/local/mgr5/sbin/licctl fetch mgrName key
+# Именно fetch с ключом. Формы «licctl activate ispmgr <ключ>» в официальной
+# документации НЕТ (она встречается только в сторонних KB), поэтому в код она
+# не бралась. Ключ одноразовый: повторно активировать им нельзя — нужен новый
+# ключ в Client area (то же говорит док).
+#
+# Ключ — секрет, но официального способа передать его мимо argv у licctl НЕТ
+# (в отличие от mgrctl, где есть -e 'param=$ENV', см. discovery.py). Мы убираем
+# ключ из ОТЧЁТА (оператор видит «fetch ispmgr ***») и честно говорим, что на
+# время работы процесса licctl он был виден в ps. Врать про «безопасный канал»
+# там, где его нет, нельзя: одно выдуманное предупреждение обесценивает все
+# остальные.
+LICENSE_KEY_MASK = '***'
+
+
+def license_key_policy(key):
+    """Текст причины отказа либо None. Проверка ДО отправки — своя, а не панели.
+
+    Пустой ключ отсекается обязательно: `licctl fetch ispmgr` БЕЗ ключа — это
+    ДРУГАЯ операция (перетянуть лицензию на текущий IP). Отправить её вместо
+    активации значит молча тронуть лицензию не тем действием.
+
+    Переносы строк и управляющие символы означают, что в поле попал не ключ
+    (обычно так вставляют кусок письма или пару команд). Команда у нас
+    экранируется q(), поэтому инъекции здесь не было бы и без проверки, но
+    licctl принял бы мусор как ключ и сжёг одноразовый ключ зря.
+    """
+    if key is None or not key.strip():
+        return ('Ключ активации не задан. Без ключа licctl fetch перетягивает '
+                'лицензию на текущий IP — для этого есть отдельный пункт '
+                '«Обновить под IP (licctl fetch)».')
+    cleaned = key.strip()
+    if cleaned != key:
+        key = cleaned          # поля ввода часто тянут пробелы по краям
+    if any(ch.isspace() or ord(ch) < 32 for ch in key):
+        return ('Ключ активации не должен содержать пробелов и переносов — '
+                'похоже, вставлено не значение ключа. Скопируйте ключ целиком '
+                'из письма или из Client area.')
+    return None
+
+
+def mask_license_key(text, key):
+    """Убирает ключ из текста ответа: licctl может повторить его в сообщении."""
+    text = text or ''
+    return text.replace(key, LICENSE_KEY_MASK) if key else text
+
+
+def ispmanager_license_activate(checker, key):
+    """licctl fetch ispmgr <ключ> и ПЕРЕЧИТЫВАНИЕ licctl info.
+
+    Код возврата licctl нам не доказательство: активация могла не состояться,
+    а утилиты иногда выходят с нулём. Факт — только состояние лицензии после
+    запроса, поэтому licctl info перечитывается всегда, и вердикт пишем по нему
+    (тот же принцип, что с перечитыванием списка ящиков после операций).
+    """
+    lines = ["=== АКТИВАЦИЯ ЛИЦЕНЗИИ ISPmanager ПО КЛЮЧУ ==="]
+    why = license_key_policy(key)
+    if why:
+        lines.append(f"⛔ {why}")
+        lines.append("   Ни одна команда на сервер не отправлялась.")
+        return "\n".join(lines)
+    key = key.strip()
+
+    cmd = f'{LICCTL} fetch ispmgr {q(key)} 2>&1'
+    # Показываем команду с маской: её смысл (какая именно команда была) виден,
+    # а ключ — нет, поэтому отчёт можно сохранить или переслать.
+    lines.append(f"$ {LICCTL} fetch ispmgr {LICENSE_KEY_MASK} 2>&1")
+    out, err, rc = checker.run(cmd)
+    report = mask_license_key((out or '').strip() or (err or '').strip(), key)
+    if rc != 0:
+        lines.append(f"❌ Ошибка (rc={rc}): {report or 'без сообщения'}")
+    elif report:
+        lines.append(f"licctl: {report}")
+    else:
+        lines.append("✅ Запрос на сервер лицензий выполнен (licctl без вывода)")
+    lines.append("")
+
+    # ---------- подтверждение фактом: состояние лицензии после запроса ----------
+    lines.append("Проверка после запроса (licctl info):")
+    info_out, info_err, _ = checker.run(LICENSE_CHECK_CMD)
+    info = parse_license_info(info_out)
+    raw = info['raw'] or (info_err or '').strip()
+    if not raw:
+        lines.append("⚠️ licctl info после активации не вернул ничего — срок не")
+        lines.append("   подтвердить. Проверьте сеть на сервере и «Проверить».")
+        return "\n".join(lines)
+    lines.append(license_status_line(info['days']))
+    if info['expire']:
+        lines.append(f"   Окончание лицензии: {info['expire']}")
+    if raw:
+        lines.append("")
+        lines.append(mask_license_key(raw, key))
+
+    # Вердикт — по ПЕРЕЧИТАННОМУ состоянию, и тут три разных случая, которые
+    # нельзя сводить к двум: «срок есть и он в будущем», «срок есть и он в
+    # прошлом» и «сервер не дал понятной даты». Третья ветка не имеет права
+    # выглядеть как успех: licctl мог принять ключ и не изменить лицензию, а
+    # непонятный формат вывода — не доказательство активации.
+    if rc == 0:
+        if info['days'] is None:
+            lines.append("\n⚠️ Запрос прошёл без ошибки, но срок действия")
+            lines.append("   лицензии после него не определить — активацию")
+            lines.append("   подтвердить нельзя. Выполните «Проверить» и")
+            lines.append("   смотрите вывод licctl выше.")
+        elif info['days'] >= 0:
+            lines.append("\n✅ Лицензия активна после запроса по ключу.")
+        else:
+            lines.append("\n⚠️ Запрос прошёл без ошибки, но лицензия НЕ активна")
+            lines.append("   — ключ уже использован или IP не совпадает.")
+            lines.append("   Перевыпустите ключ в Client area и повторите.")
+    lines.append("")
+    lines.append("ℹ️ Ключ активации одноразовый: для повторной активации")
+    lines.append("   понадобится новый ключ (Client area → Generate a new key).")
+    lines.append("⚠️ На время выполнения licctl ключ был виден в ps: у licctl нет")
+    lines.append("   способа принять ключ из окружения (в отличие от mgrctl -e).")
+    return "\n".join(lines)
+
+
 # ==================== FASTPANEL: ДИАГНОСТИКА И СБРОС ПАРОЛЯ ==============
 # По KB FASTPANEL (kb.fastpanel.direct/ru/troubleshoot/): 404 на :8888 чаще
 # всего означает снятый менеджером пакетов пакет fastpanel2. Пароль fastuser

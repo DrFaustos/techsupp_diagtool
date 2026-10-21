@@ -909,12 +909,49 @@ def secret_dir_command():
     return f'mktemp -d {MAILBOX_SECRET_TMP} 2>/dev/null'
 
 
+def isp_mail_parent(checker, domain):
+    """Каноническое имя почтового домена из панели: (имя, None) | (None, причина).
+
+    ISPsystem, «Service parameters»: plid — parent list unique identifier, то
+    есть name элемента функции maildomain (в KB-скрипте массового создания там
+    стоит plid="$domain"). Значит родителя берём ИЗ СПИСКА ПАНЕЛИ, а не из
+    строки, которую ввёл оператор: панель хранит домен своим написанием
+    (регистр, punycode), и только оно принимается email.edit. Молча подставить
+    «похожее» нельзя — панель заведёт ящик не там либо ответит невнятно.
+
+    Список читается через isp_rows, а не isp_maildomains: только isp_rows
+    отличает «почтовых доменов нет» от «панель ответила ошибкой». По ошибке
+    резолв запрещён — plid уехал бы наугад.
+    """
+    rows, ok, raw = isp_rows(checker, 'maildomain')
+    if not ok:
+        raw = (raw or '').strip()
+        detail = raw.splitlines()[0] if raw else ''
+        return None, ('Панель не вернула список почтовых доменов (maildomain)'
+                      + (f': {detail}' if detail else '')
+                      + ' — подтвердить родителя нельзя, операция отменена.')
+    wanted = (domain or '').strip().lower()
+    for row in rows:
+        name = (row.get('name') or '').strip()
+        if name.lower() == wanted:
+            return name, None
+    names = sorted({(r.get('name') or '').strip()
+                    for r in rows if r.get('name')})
+    shown = ', '.join(names[:8]) or '—'
+    return None, (f'Домен {domain} не найден среди почтовых доменов панели '
+                  f'(maildomain: {shown}). Родителем ящика может быть только '
+                  'элемент этого списка — сначала добавьте домен в панель.')
+
+
 def isp_mailbox_create_args(local, domain):
     """email.edit БЕЗ elid = создание ящика (так же делает скрипт из KB).
 
     Пароля здесь нет намеренно: он придёт через -e (см. isp_mailbox_env_command).
     sok=ok — параметр функции, поэтому стоит до -e, как в синтаксисе у ISPsystem
     (funcname [param=value ...] [-e '<param>=$ENV']).
+
+    domain сюда передаётся уже каноническим (см. isp_mail_parent): domainname и
+    plid обязаны быть одним и тем же именем элемента maildomain.
     """
     return ['email.edit', f'domainname={q(domain)}', f'name={q(local)}',
             f'plid={q(domain)}', f'aliases={q("")}', 'sok=ok']
@@ -1256,6 +1293,22 @@ def _mailbox_action(checker, address, password, panel_type, mode):
     shown = None                       # что показать оператору (без обвязки)
     if panel_type == 'ispmanager':
         if mode == 'create':
+            # plid — parent list unique identifier (name элемент maildomain),
+            # поэтому родителя берём у панели, а не из ввода оператора. Резолв
+            # идёт ПОСЛЕ guard (лишний секрет на диске не нужен) и ДО подготовки
+            # секрета: без подтверждённого родителя команда не уходит, и писать
+            # env-файл туда незачем.
+            parent, why = isp_mail_parent(checker, domain)
+            if parent is None:
+                lines.append(f"⛔ {why}")
+                return "\n".join(lines)
+            if parent != domain:
+                # Разница написания обязана быть видна: иначе оператор решит,
+                # что панель завела ящик «на другой домен».
+                lines.append(f"ℹ️ Родитель-домен взят из панели: {parent} "
+                             f"(в запросе было {domain}) — панель хранит домен "
+                             "своим написанием, plid обязан совпадать с ним.")
+                domain = parent
             args = isp_mailbox_create_args(local, domain)
         elif mode == 'passwd':
             args = isp_mailbox_passwd_args(addr)

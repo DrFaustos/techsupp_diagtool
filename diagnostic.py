@@ -58,6 +58,7 @@ from panels import (  # noqa: F401
     fastpanel_status, fastpanel_restart_web,
     ispmanager_panel_diag, ispmanager_logs_report, ispmanager_unlock,
     ispmanager_license_refresh, ispmanager_license_report,
+    ispmanager_license_activate,
     fastpanel_diag, fastpanel_package_status, fastpanel_reset_password,
 )
 
@@ -118,6 +119,7 @@ __all__ = [
     'ispmanager_check_cron_path', 'ispmanager_fix_cron_path',
     'ispmanager_panel_diag', 'ispmanager_logs_report', 'ispmanager_unlock',
     'ispmanager_license_refresh', 'ispmanager_license_report',
+    'ispmanager_license_activate',
     'fastpanel_unit', 'find_fastpanel_logs', 'fastpanel_restart',
     'fastpanel_logs', 'fastpanel_status', 'fastpanel_restart_web',
     'fastpanel_diag', 'fastpanel_package_status', 'fastpanel_reset_password',
