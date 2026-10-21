@@ -11,6 +11,11 @@ from datetime import datetime, timezone
 
 from common import (q, save_crontab_backup, write_remote_file,
                     prepare_secret_file, remove_remote_path)
+# Почтовый лог читает ОДНА функция на весь проект (logs.read_mail_log): у нас
+# уже были парные реализации, которые разъехались бы «в одном отчёте лог есть,
+# в другом — логов нет». Здесь же закрывается и Debian: раньше читался только
+# /var/log/maillog, а /var/log/mail.log — нет.
+from logs import read_mail_log, MAIL_LOG_PATHS
 
 # ==================== ПУТИ BITRIXVM ====================
 # Раскладку не «исправляем»: в реальном BitrixVM каталог vhost'ов пишется с
@@ -1069,15 +1074,15 @@ def bitrix_mail_report(checker):
         lines.append(f'⚠️ В очереди {count} писем — частые причины: спам-фильтр '
                      'получателя, blacklist IP, неверный PTR')
 
-    out, _, _ = checker.run('tail -n 15 /var/log/maillog 2>/dev/null')
-    if out.strip():
-        lines.append('--- /var/log/maillog (последние 15 строк) ---')
-        lines.append(out.strip())
+    text, source = read_mail_log(checker, tail=15)
+    if text:
+        lines.append(f'--- {source} (последние 15 строк) ---')
+        lines.append(text)
     else:
-        out, _, _ = checker.run('journalctl -u postfix -n 15 --no-pager 2>/dev/null')
-        if out.strip():
-            lines.append('--- journalctl -u postfix (15 строк) ---')
-            lines.append(out.strip())
+        # Молчание лога — это «не проверено», а не «писем не было».
+        lines.append('⚠️ Почтовый лог не найден: ' + ', '.join(MAIL_LOG_PATHS) +
+                     ' пусты, journalctl -u postfix молчит — причины отказов '
+                     'установить нельзя; проверить вручную: ls -l /var/log/mail*')
     return '\n'.join(lines)
 
 
@@ -1097,9 +1102,10 @@ def valid_email(addr):
 def bitrix_mail_send_test(checker, to_addr):
     """Отправить тестовое письмо и разобрать запись postfix о нём.
 
-    Передаёт письмо в sendmail postfix, затем читает лог (CentOS — maillog,
-    Debian — journalctl) и mailq. rc=0 у sendmail означает лишь «postfix
-    принял», а не «дошло»: поэтому ответ всегда по записи лога, с status.
+    Передаёт письмо в sendmail postfix, затем читает лог (общая read_mail_log:
+    maillog → mail.log → journalctl) и mailq. rc=0 у sendmail означает лишь
+    «postfix принял», а не «дошло»: поэтому ответ всегда по записи лога, с
+    status.
     """
     lines = ['=== ПОЧТА: ТЕСТ ОТПРАВКИ ===']
     addr = (to_addr or '').strip()
@@ -1126,23 +1132,20 @@ def bitrix_mail_send_test(checker, to_addr):
                  'смотрим, что было дальше...')
 
     # Запись теста ищем по точному получателю: в плотном потоке чужих писем
-    # общий tail по логу бесполезен.
+    # общий tail по логу бесполезен. Читает та же функция, что и остальной
+    # проект: раньше поиск шёл только по /var/log/maillog, и на Debian тест
+    # «не находил запись» при целом /var/log/mail.log — то есть врал про
+    # postfix, у которого письмо успешно ушло.
     needle = f'to=<{addr}>'
-    out, _, _ = checker.run(
-        f'tail -n 50 /var/log/maillog 2>/dev/null '
-        f'| grep -F {q(needle)} | tail -3')
-    entry = out.strip()
-    if not entry:
-        out, _, _ = checker.run(
-            f'journalctl -u postfix -n 50 --no-pager 2>/dev/null '
-            f'| grep -F {q(needle)} | tail -3')
-        entry = out.strip()
+    entry, log_source = read_mail_log(checker, tail=50, grep=needle, keep=3)
 
     out, _, _ = checker.run('mailq 2>&1')
     count = parse_mailq_count(out)
 
     if entry:
-        lines.append('--- запись лога о тестовом письме ---')
+        # Источник печатается: «запись найдена в journalctl» и «в mail.log» —
+        # разная информация для оператора, который пойдёт править rsyslog.
+        lines.append(f'--- запись лога о тестовом письме ({log_source}) ---')
         lines.append(entry)
         if 'status=sent' in entry:
             lines.append('✅ Письмо ушло с сервера (status=sent). Если адресат '
@@ -1158,9 +1161,15 @@ def bitrix_mail_send_test(checker, to_addr):
         lines.append(f'⚠️ В очереди {count} писем, теста в логе не видно: '
                      'postfix ещё не добрался — вернётесь к отчёту через минуту.')
     elif count == 0:
-        lines.append('⚠️ Очередь пуста, но записи теста ни в maillog, ни в '
-                     'journalctl нет — лог может писаться в /var/log/mail.log; '
-                     'проверьте ls -l /var/log/mail*')
+        # Прежний текст обещал «лог может писаться в /var/log/mail.log» — теперь
+        # мы его читаем, поэтому обещание стало бы ложью. Причина «записи нет»
+        # теперь другая: postfix ещё не добрался до письма (очередь обрабатывается
+        # асинхронно) либо пишет в незнакомый нам файл.
+        lines.append(f'⚠️ Очередь пуста, но записи теста нет ни в '
+                     f'{" и ".join(MAIL_LOG_PATHS)}, ни в journalctl — за '
+                     f'последние 50 строк. postfix принимает письмо асинхронно: '
+                     f'повторите через минуту; если записи нет и там — он пишет '
+                     f'в другой файл, проверьте: ls -l /var/log/mail*')
     else:
         lines.append('⚠️ Ни лог, ни mailq не отвечают — проверьте вручную: '
                      'mailq; ls -l /var/log/mail*')

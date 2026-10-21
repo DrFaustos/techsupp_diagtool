@@ -17,7 +17,8 @@ import shlex
 
 from common import (q, find_files, read_file_content, write_remote_file,
                     prepare_secret_file, remove_remote_path)
-from logs import find_logs
+from logs import (find_logs, mail_log_snapshot_lines,
+                  mail_delivery_digest_lines)
 from metrics import detect_panel, services_status_cmd, parse_service_statuses
 from bitrix import parse_mailq_count
 
@@ -734,6 +735,13 @@ def mail_overview_report(checker, panel_type=None):
     else:
         icon = '⚠️' if queued > 10 else 'ℹ️'
         lines.append(f"\n{icon} Очередь postfix: писем — {queued}")
+
+    # mailq отвечает «сколько писем стоит», но не отвечает «почему». Причина
+    # живёт в логе: `status=bounced ... 550 ...` — это и есть ответ на тикет
+    # «письма уходят в спам». Снимок идёт внутрь этой сводки, а не отдельным
+    # пунктом меню: тикет закрывается одним прогоном, а меню не разрастается.
+    lines.append('')
+    lines.extend(mail_log_snapshot_lines(checker))
 
     statuses = parse_service_statuses(
         checker.exec_command(services_status_cmd(list(MAIL_SERVICES)))[0])
@@ -1653,6 +1661,14 @@ def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
     lines.append("ℹ️ Домен, который только принимает почту, можно не "
                  "подписывать — но уходящее с него письмо без SPF/DKIM почти "
                  "всегда попадёт в спам.")
+    # Подтверждение диагноза фактами доставки. Вызывается ПОСЛЕ цикла, а не
+    # внутри: лог читается ОДИН раз на прогон (иначе 25 доменов = 25 чтений
+    # лога, и GUI висел бы минутами). Дайджест может как подтвердить связку
+    # («письма реально отбивают за спам»), так и честно отказаться её
+    # подтверждать — второе не читается как «чинить нечего» (текст ниже это
+    # опровергает).
+    lines.append('')
+    lines.extend(mail_delivery_digest_lines(checker))
     return "\n".join(lines)
 
 
