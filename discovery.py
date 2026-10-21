@@ -15,7 +15,8 @@ postfix-карты), — чистые функции: проверяются т�
 import re
 import shlex
 
-from common import q, find_files, read_file_content, write_remote_file
+from common import (q, find_files, read_file_content, write_remote_file,
+                    prepare_secret_file, remove_remote_path)
 from logs import find_logs
 from metrics import detect_panel, services_status_cmd, parse_service_statuses
 from bitrix import parse_mailq_count
@@ -952,8 +953,8 @@ def isp_secret_run_command(secret_dir, args, env_name=MAILBOX_SECRET_ENV):
 def prepare_mailbox_secret(checker, password):
     """Готовит каталог с env-файлом секрета: (путь, None) либо (None, причина).
 
-    Порядок: mktemp -d (0700, имя уникальное и создаётся атомарно) -> запись
-    через SFTP -> chmod 600 на сам файл.
+    Порядок: mktemp -d (0700, имя уникальное и создаётся атомарно) ->
+    prepare_secret_file (файл 0600 появляется ДО пароля) -> SFTP-запись.
 
     SFTP, а не `cat > file <<'EOF'`: наш транспорт — exec_command, то есть
     `bash -c '<вся строка>'`, и пароль в heredoc был бы виден в ps ровно так
@@ -971,12 +972,36 @@ def prepare_mailbox_secret(checker, password):
                       + (f': {detail}' if detail else '')
                       + '. Передать пароль безопасно нельзя, операция отменена.')
     path = f'{secret_dir}/{MAILBOX_SECRET_FILE}'
-    ok, why = write_remote_file(checker, path, mailbox_secret_content(password))
+    # prepare_secret_file: файл получает 0600 ДО появления пароля (umask 077 +
+    # chmod в одной команде, служебным каналом). Прежний порядок
+    # «write_remote_file, потом chmod» оставлял окно world-readable файла, а
+    # отмена между этими шагами запирала его там навсегда.
+    ok, why = prepare_secret_file(checker, path, mailbox_secret_content(password))
     if not ok:
-        checker.run(f'rm -rf {q(secret_dir)} 2>/dev/null')
-        return None, f'Не удалось записать env-файл с паролем: {why}'
-    checker.run(f'chmod 600 {q(path)} 2>/dev/null')
+        # Пароль в файл не лёг, но каталог убрать всё равно надо; если не
+        # вышло — говорим путь: молчать про оставленный мусор нельзя.
+        gone, _ = remove_remote_path(checker, secret_dir)
+        extra = '' if gone else f' (каталог {secret_dir} остался — удалите вручную)'
+        return None, f'Не удалось подготовить env-файл с паролем: {why}{extra}'
     return secret_dir, None
+
+
+def wipe_mailbox_secret(checker, secret_dir):
+    """Убирает каталог с env-файлом: None либо текст беды для оператора.
+
+    Идёт служебным каналом (remove_remote_path -> cleanup), поэтому справляется
+    и ПОСЛЕ cancel(): «оператор нажал Стоп» не означает «оставь пароль на
+    диске» — раньше rm шёл через обычный run, падал от cancel_event и файл с
+    паролем переживал операцию (воспроизведено на заглушке транспорта).
+
+    Молчать при неудаче нельзя: без строки в отчёте оператор не узнает, что
+    секрет лежит на сервере, и не удалит его руками.
+    """
+    ok, why = remove_remote_path(checker, secret_dir)
+    if ok:
+        return None
+    return ('Не удалось удалить временный каталог с паролем: ' + str(why) +
+            f'. Удалите вручную: rm -rf {q(secret_dir)}')
 
 
 def isp_mailbox_delete_command(address):
@@ -1261,14 +1286,25 @@ def _mailbox_action(checker, address, password, panel_type, mode):
             cmd = fp_mailbox_delete_command(box_id)
 
     lines.append("$ " + redact_secrets(shown or cmd))
+    secret_note = None
     try:
-        out, errtxt, rc = checker.run(cmd)
-    finally:
-        # rm -rf есть и внутри команды, но она может не дойти до него (отмена
-        # задачи закрывает канал). Эта страховка обязана быть: файл с паролем
-        # не должен пережить операцию ни при каком исходе.
-        if secret_dir:
-            checker.run(f'rm -rf {q(secret_dir)} 2>/dev/null')
+        try:
+            out, errtxt, rc = checker.run(cmd)
+        finally:
+            # Уборка — в finally и служебным каналом (cleanup). Прежний
+            # checker.run падал от cancel_event ещё до rm, и файл с паролем
+            # переживал отмену (воспроизведено на заглушке транспорта):
+            # «оператор нажал Стоп» не значит «оставь пароль на диске».
+            if secret_dir:
+                secret_note = wipe_mailbox_secret(checker, secret_dir)
+    except Exception as exc:
+        # Отмена/обрыв канала: отчёт оператору не покажут (gui показывает
+        # только текст исключения), поэтому беда с уборкой вешается на него.
+        if secret_note:
+            raise Exception(f"{exc}\n⚠️ {secret_note}") from exc
+        raise
+    if secret_note:
+        lines.append(f"⚠️ {secret_note}")
     report = (out or '').strip() or (errtxt or '').strip()
     if rc != 0:
         lines.append(f"❌ Панель ответила ошибкой (rc={rc}): "
@@ -1303,8 +1339,9 @@ def _mailbox_action(checker, address, password, panel_type, mode):
         # фикс (оператор перестанет верить отчёту целиком).
         if panel_type == 'ispmanager':
             lines.append("ℹ️ Пароль передан через временный файл 0600 и окружение")
-            lines.append("   процесса — в ps на сервере он не светился; файл")
-            lines.append("   удалён сразу после команды панели.")
+            lines.append("   процесса — в ps на сервере он не светился.")
+            if secret_note is None:
+                lines.append("   Файл удалён сразу после команды панели.")
         else:
             # FASTPANEL: mogwai не умеет принимать пароль из окружения или со
             # stdin — только --password=аргумент. Это ограничение CLI панели,

@@ -9,7 +9,8 @@ Access denied для пользователя БД из dbconn.php, молчащ
 import re
 from datetime import datetime, timezone
 
-from common import q, save_crontab_backup, write_remote_file
+from common import (q, save_crontab_backup, write_remote_file,
+                    prepare_secret_file, remove_remote_path)
 
 # ==================== ПУТИ BITRIXVM ====================
 # Раскладку не «исправляем»: в реальном BitrixVM каталог vhost'ов пишется с
@@ -512,11 +513,15 @@ def _db_credentials(checker):
     return vals, None
 
 
-def _db_query(checker, sql):
+def _db_query(checker, sql, warn=None):
     """Запрос от имени Битрикс-пользователя: (True, stdout) либо (False, вывод).
 
     Пароль не уходит в аргументы mysql (его видно в ps): он во временном
     файле 0600, который удаляется в finally — даже если mysql упал.
+
+    warn — список строк ОТЧЁТА вызывающего: если убрать файл не удалось,
+    причина пишется туда, а не в stdout. В stdout её класть нельзя: её_read
+    парсеры (CURRENT_USER, SHOW GRANTS, топ таблиц) приняли бы за данные.
     """
     vals, errors = _db_credentials(checker)
     if vals is None:
@@ -524,16 +529,24 @@ def _db_query(checker, sql):
     content = ('[client]\n'
                f"host={vals['DBHost']}\nuser={vals['DBLogin']}\n"
                f"password={vals.get('DBPassword', '')}\ndatabase={vals['DBName']}\n")
-    ok, err = write_remote_file(checker, DBCHECK_CNF, content)
+    ok, why = prepare_secret_file(checker, DBCHECK_CNF, content)
     if not ok:
-        return False, f'❌ Не удалось подготовить файл проверки: {err}'
-    checker.run(f'chmod 600 {q(DBCHECK_CNF)} 2>/dev/null')
+        return False, f'❌ Не удалось подготовить файл проверки: {why}'
     try:
         out, _, rc = checker.run(
             f'mysql --defaults-extra-file={q(DBCHECK_CNF)} -N -e {q(sql)} 2>&1')
         return rc == 0, out.strip()
     finally:
-        checker.run(f'rm -f {q(DBCHECK_CNF)}')
+        # remove_remote_path идёт служебным каналом и не слушает cancel():
+        # «оператор нажал Стоп» не означает «оставь файл с паролем БД на
+        # сервере». Прежний checker.run в finally падал от отмены, и файл с
+        # паролем переживал операцию (воспроизведено на заглушке транспорта).
+        gone, why = remove_remote_path(checker, DBCHECK_CNF, recursive=False)
+        if not gone and warn is not None:
+            # Молчать нельзя: без строки в отчёте оператор не узнает, что
+            # пароль БД лежит в /tmp, и не удалит его руками.
+            warn.append(f'⚠️ Не удалось удалить временный файл с паролем БД '
+                        f'({why}). Удалите вручную: rm -f {DBCHECK_CNF}')
 
 
 def bitrix_db_check(checker):
@@ -548,7 +561,7 @@ def bitrix_db_check(checker):
                  f"DBName={vals['DBName']} "
                  f"DBPassword={'задан' if vals.get('DBPassword') else 'ПУСТОЙ'}")
 
-    ok, out = _db_query(checker, 'SELECT 1')
+    ok, out = _db_query(checker, 'SELECT 1', warn=lines)
     if ok:
         lines.append('✅ Битрикс-пользователь подключается к базе (SELECT 1 прошёл)')
         return '\n'.join(lines)
@@ -570,7 +583,7 @@ def bitrix_db_check(checker):
 
 
 # ==================== ПРАВА НА БАЗУ (GRANTS) ====================
-def _current_grants(checker, db_name):
+def _current_grants(checker, db_name, warn=None):
     """(info, None) либо (None, строка-ошибка); info = {user, host, parsed}.
 
     Привилегии читаем через CURRENT_USER(): это ровно та учётка, под которой
@@ -578,14 +591,14 @@ def _current_grants(checker, db_name):
     mysql.user записан хост-паттерн ('%', '%.site.ru'), и GRANT на другую
     строку учётки создал бы вторую, ничего не починив.
     """
-    ok, out = _db_query(checker, 'SELECT CURRENT_USER()')
+    ok, out = _db_query(checker, 'SELECT CURRENT_USER()', warn=warn)
     if not ok:
         return None, ('❌ Подключение к базе не прошло: '
                       + (out or 'mysql: нет вывода').strip())
     user, host = parse_current_user(out)
     if not user:
         return None, f'❌ Не удалось разобрать CURRENT_USER(): {out!r}'
-    ok, out = _db_query(checker, 'SHOW GRANTS FOR CURRENT_USER()')
+    ok, out = _db_query(checker, 'SHOW GRANTS FOR CURRENT_USER()', warn=warn)
     if not ok:
         return None, ('❌ SHOW GRANTS не прошёл:\n'
                       + (out or 'mysql: нет вывода').strip())
@@ -600,7 +613,7 @@ def bitrix_db_grants_report(checker):
         lines.extend(errors or [])
         return '\n'.join(lines)
 
-    info, error = _current_grants(checker, vals['DBName'])
+    info, error = _current_grants(checker, vals['DBName'], warn=lines)
     if info is None:
         lines.append(error or 'не удалось прочитать права')
         return '\n'.join(lines)
@@ -648,7 +661,7 @@ def bitrix_db_grants_fix(checker):
         lines.extend(errors or [])
         return '\n'.join(lines)
 
-    info, error = _current_grants(checker, vals['DBName'])
+    info, error = _current_grants(checker, vals['DBName'], warn=lines)
     if info is None:
         lines.append(error or 'не удалось прочитать права')
         return '\n'.join(lines)
@@ -676,7 +689,9 @@ def bitrix_db_grants_fix(checker):
         return '\n'.join(lines)
 
     # Вера на слово недопустима: перечитываем права той же учётки.
-    info2, error2 = _current_grants(checker, db)
+    # warn=lines сюда тоже обязателен: это ещё один запуск mysql с файлом
+    # пароля, и если его не убрали — оператор обязан увидеть путь.
+    info2, error2 = _current_grants(checker, db, warn=lines)
     if info2 is None:
         lines.append('⚠️ GRANT выполнен, но перечитать права не вышло: '
                      + str(error2))
@@ -753,7 +768,7 @@ def garbage_hints(rows, warn_mb=GARBAGE_WARN_MB):
 
 def bitrix_db_tables_report(checker):
     lines = ['=== ТОП-20 ТАБЛИЦ БАЗЫ БИТРИКС ===']
-    ok, out = _db_query(checker, TOP_TABLES_SQL)
+    ok, out = _db_query(checker, TOP_TABLES_SQL, warn=lines)
     if not ok:
         lines.append('❌ Запрос к information_schema не прошёл:')
         lines.extend((out or 'mysql: нет вывода').splitlines())

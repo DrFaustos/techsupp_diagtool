@@ -81,11 +81,16 @@ class ServerChecker:
         except Exception:
             return False
 
-    def _exec(self, command):
-        """Низкоуровневый запуск: возвращает (stdout, stderr, exit_status)."""
+    def _exec(self, command, ignore_cancel=False):
+        """Низкоуровневый запуск: возвращает (stdout, stderr, exit_status).
+
+        ignore_cancel=True — только для служебных команд (см. cleanup):
+        «оператор нажал Стоп» означает «прекрати работу», а не «оставь файл с
+        паролем на диске».
+        """
         if not self.client:
             raise Exception("Нет активного соединения")
-        if self.cancel_event.is_set():
+        if not ignore_cancel and self.cancel_event.is_set():
             raise Exception("Операция отменена")
 
         stdin, stdout, stderr = self.client.exec_command(command)
@@ -125,6 +130,15 @@ class ServerChecker:
     def run(self, command):
         """Возвращает (stdout, stderr, exit_status)."""
         return self._exec(command)
+
+    def cleanup(self, command):
+        """Служебная команда (chmod/rm над секретами): проходит после cancel().
+
+        «Оператор нажал Стоп» означает «прекрати работу», а не «оставь файл с
+        паролем на диске». Исключение (обрванное соединение) не глотаем:
+        вызывающий обязан сообщить, что секрет мог остаться.
+        """
+        return self._exec(command, ignore_cancel=True)
 
     def close(self):
         if self.client:

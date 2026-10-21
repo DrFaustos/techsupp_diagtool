@@ -135,6 +135,81 @@ def write_remote_file(checker, filepath, content):
         sftp.close()
 
 
+# ==================== СЛУЖЕБНЫЙ КАНАЛ: УБОРКА СЕКРЕТОВ ====================
+def service_run(checker, command):
+    """Команда, которую отмена обязана пропустить: chmod/rm над секретом.
+
+    Отмена означает «прекрати работу», а не «оставь файл с паролем на диске».
+    У ServerChecker для этого есть cleanup(); у тестовых заглушек его может не
+    быть — тогда обычный run, иначе тесты перестали бы видеть уборку.
+    """
+    cleanup = getattr(checker, 'cleanup', None)
+    if cleanup is not None:
+        return cleanup(command)
+    return checker.run(command)
+
+
+def prepare_secret_file(checker, filepath, content):
+    """Создаёт файл с паролем сразу безопасным: (True, None) либо (False, причина).
+
+    Порядок принципиален и в нём весь смысл:
+
+    1. `rm -f` — по фиксированному пути мог лежать чужой файл или symlink
+       (атака на /tmp/.techsupp_*.cnf): SFTP-запись пошла бы по symlink и
+       затёрла бы его цель.
+    2. создание при `umask 077` + `chmod 600` — файл получает 0600 ДО того,
+       как в нём появится пароль. Прежний порядок «записали, потом chmod»
+       давал окно world-readable файла, а отмена между этими шагами оставляла
+       его навсегда (chmod шёл через cancel-гейт).
+    3. SFTP пишет в УЖЕ созданный файл: truncate прав не меняет (проверено:
+       umask 022 -> 644, umask 077 -> 600, после перезаписи снова 600).
+
+    Все команды идут через service_run — уборка и права не должны зависеть от
+    того, нажал ли оператор «Стоп».
+    """
+    target = q(filepath)
+    cmd = (f'rm -f {target} 2>/dev/null; umask 077; : > {target} 2>/dev/null; '
+           f'chmod 600 {target} 2>/dev/null; '
+           f'if [ ! -w {target} ]; then echo NOWRITE; fi')
+    try:
+        out, err, _rc = service_run(checker, cmd)
+    except Exception as e:
+        return False, f'не удалось создать файл {filepath}: {e}'
+    if 'NOWRITE' in (out or ''):
+        detail = (err or '').strip()
+        return False, (f'в {filepath} нельзя писать (файл чужой или /tmp только '
+                       f'для чтения)' + (f': {detail}' if detail else ''))
+    ok, why = write_remote_file(checker, filepath, content)
+    if not ok:
+        remove_remote_path(checker, filepath, recursive=False)
+        return False, f'не удалось записать {filepath}: {why}'
+    return True, None
+
+
+def remove_remote_path(checker, path, recursive=True):
+    """Удаляет удалённый путь и ПРОВЕРЯЕТ факт: возвращает (ok, причина).
+
+    Код возврата rm ни о чём не говорит (`rm -rf` не ругается даже на несуществующее),
+    поэтому факт проверяем тем же вызовом — `[ -e путь ]`. Остаться должен либо
+    подтверждённый успех (тогда в отчёте честно пишется «файл удалён»), либо
+    причина, которую оператор обязан увидеть.
+
+    Идёт через service_run: cancel() не должен превращать уборку в «секрет
+    пережил операцию» (именно так и было, пока rm шёл через обычный run).
+    """
+    flag = '-rf' if recursive else '-f'
+    target = q(path)
+    command = (f'rm {flag} {target} 2>/dev/null; '
+               f'if [ -e {target} ]; then echo STILL_THERE; fi')
+    try:
+        out, _err, _rc = service_run(checker, command)
+    except Exception as e:
+        return False, f'команда удаления не прошла: {e}'
+    if 'STILL_THERE' in (out or ''):
+        return False, f'путь остался на сервере: {path}'
+    return True, None
+
+
 def find_files(checker, pattern, limit=20):
     """Находит файлы по паттерну и возвращает список с предупреждением об ограничении.
 
