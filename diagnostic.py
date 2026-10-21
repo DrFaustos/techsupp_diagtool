@@ -66,8 +66,8 @@ from panels import (  # noqa: F401
 from discovery import (  # noqa: F401
     discover_sites, discover_mail_domains, discover_mailboxes,
     discover_dns_zones, site_health_report, ssl_expiry_report,
-    mail_overview_report, dns_zones_report, hosting_inventory_report,
-    domain_detail_report,
+    mail_overview_report, mail_auth_report, dns_zones_report,
+    hosting_inventory_report, domain_detail_report,
     mailbox_create, mailbox_passwd, mailbox_delete,
 )
 
@@ -125,8 +125,8 @@ __all__ = [
     'fastpanel_diag', 'fastpanel_package_status', 'fastpanel_reset_password',
     'discover_sites', 'discover_mail_domains', 'discover_mailboxes',
     'discover_dns_zones', 'site_health_report', 'ssl_expiry_report',
-    'mail_overview_report', 'dns_zones_report', 'hosting_inventory_report',
-    'domain_detail_report',
+    'mail_overview_report', 'mail_auth_report', 'dns_zones_report',
+    'hosting_inventory_report', 'domain_detail_report',
     'mailbox_create', 'mailbox_passwd', 'mailbox_delete',
     'detect_bitrix_env', 'bitrix_sites', 'bitrix_sites_report',
     'bitrix_ssl_report', 'bitrix_ssl_renew',

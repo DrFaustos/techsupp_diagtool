@@ -747,6 +747,419 @@ def mail_overview_report(checker, panel_type=None):
     return "\n".join(lines)
 
 
+# ======== ПИСЬМА В СПАМ: SPF / DKIM / DMARC / PTR (DNS, не синтаксис панели) ==
+# Причина №1 в тикетах «почта работает, а письма уходят в спам» — не postfix и
+# не панель, а DNS: нет SPF, нет DKIM, нет DMARC, нет PTR. Проверка стоит
+# несколько dig-запросов на домен и НЕ требует синтаксиса панелей — тот же dig,
+# что уже работает в «Досье домена» и в dns.py.
+#
+# Селектор DKIM обязан быть СПИСКОМ, а не одним именем: запись живёт в
+# <selector>._domainkey.<domain>, а получатель ищет её по тегу s= из заголовка
+# DKIM-Signature. Сказать «DKIM нет» честно можно только перечислив селекторы,
+# которые реально ставят панель и MTA:
+#   dkim                — FASTPANEL (kb.fastpanel.direct: «Name: dkim._domainkey»)
+#   default             — ISPmanager / opendkim по умолчанию
+#   mail, s1, s2, k1-k3 — rspamd; google — Workspace
+# Молчание по всем ним = «нет подписи ни по одному из известных селекторов», а
+# не «подписи нет вообще». Эта оговорка входит в отчёт: без неё проверка врёт.
+#
+# TXT длиннее 255 символов DNS хранит несколькими строками, и dig выдаёт их
+# кусками в кавычках: швы склеиваются (_join_txt_chunks), иначе DKIM-ключ
+# выглядел бы оборванным, а «-all» в хвосте SPF — отсутствующим.
+MAIL_AUTH_SELECTORS = ('dkim', 'default', 'mail', 's1', 's2', 'k1', 'k2', 'k3',
+                       'google')
+# RFC 7208 §4.6.4: разбор SPF ограничен 10 DNS-запросами. Больше — PermError, и
+# приёмщик письмо ОТКЛОНЯЕТ, хотя синтаксически запись правильная.
+MAX_SPF_LOOKUPS = 10
+# Оценка длины RSA-ключа по base64-строке записи. Точный размер по base64 не
+# вычислить (внутри ASN.1-обёртка), поэтому порог — ОЦЕНКА, и в отчёте мы пишем
+# «короче 1024 бит», а не «это 512-битный ключ». SubjectPublicKeyInfo для
+# RSA-1024 ≈ 162 байта ≈ 216 символов base64, для RSA-512 ≈ 106 символов.
+# Берём 200: штатные 1024-битные ключи панелей не задевает, 512-битные ловит
+# (часть приёмников, в том числе строгие правила Microsoft, их не принимает).
+DKIM_MIN_KEY_B64 = 200
+AUTH_ICON = {'ok': '✅', 'warn': '⚠️', 'bad': '❌'}
+# Вердикт домена = ХУДШАЯ из проверок: в спам письмо кладёт одна проваленная
+# проверка, а не средняя арифметическая.
+AUTH_SEVERITY = {'ok': 0, 'warn': 1, 'bad': 2}
+
+
+# ---------- команды (собираются чистыми функциями — тесты без SSH) ----------
+def a_query_command(domain):
+    """A-запись домена: из неё берём IP, по которому спрашиваем PTR."""
+    return f'dig +short A {q(domain)} 2>/dev/null'
+
+
+def spf_query_command(domain):
+    """SPF — TXT на самом домене (RFC 7208)."""
+    return f'dig +short TXT {q(domain)} 2>/dev/null'
+
+
+def dmarc_query_command(domain):
+    """DMARC — TXT на _dmarc.<domain> (RFC 7489)."""
+    return f'dig +short TXT {q('_dmarc.' + domain)} 2>/dev/null'
+
+
+def dkim_query_command(domain, selectors=MAIL_AUTH_SELECTORS):
+    """TXT по всем селекторам ОДНОЙ командой; вывод — 'имя|значение'.
+
+    Имя печатается целиком, без shell-срезки ${var%...}: парсер срезает суффикс
+    сам, зато в отчёте видно, какой именно селектор дал запись, и цикл не
+    ломается на именах с подчёркиваниями.
+    """
+    names = ' '.join(q(f'{s}._domainkey.{domain}') for s in selectors)
+    return (f'for __dk in {names}; do printf "%s|" "$__dk"; '
+            f'dig +short TXT "$__dk" 2>/dev/null; printf "\\n"; done')
+
+
+def ptr_query_command(ip):
+    """PTR по IP. Вызывается только когда IP известен — иначе нечего спрашивать."""
+    return f'dig +short -x {q(ip)} 2>/dev/null'
+
+
+# ---------- чистые парсеры ----------
+def _join_txt_chunks(text):
+    """'AAA' 'BBB' -> AAABBB: склейка частей длинной TXT, разбитых dig."""
+    return (text or '').replace('" "', '').replace('"', '').strip()
+
+
+def parse_dns_txt(out):
+    """Вывод `dig +short TXT` -> список значений (швы склеены, пустые выброшены)."""
+    return [v for v in (_join_txt_chunks(line) for line in (out or '').splitlines())
+            if v]
+
+
+def parse_ptr(out):
+    """'mail.example.com.' -> 'mail.example.com'; пусто -> '' (записи нет)."""
+    for line in (out or '').splitlines():
+        name = line.strip().rstrip('.').lower()
+        if name:
+            return name
+    return ''
+
+
+def first_ipv4(out):
+    """Первый IPv4 из `dig +short A` ('' для CNAME и для пустого ответа).
+
+    CNAME на cdn — не редкость, а PTR спрашивается по адресу, не по имени:
+    вернуть здесь CNAME означало бы спросить `-x some-cdn.net` и получить
+    неправдоподобный «PTR нет».
+    """
+    for token in (out or '').split():
+        token = token.rstrip('.')
+        if (re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', token)
+                and all(int(octet) <= 255 for octet in token.split('.'))):
+            return token
+    return ''
+
+
+def parse_spf(txts):
+    """TXT домена -> {'status','detail','lookups','includes'}.
+
+    bad — SPF нет или он такой, что приёмник его не применит; warn — SPF есть,
+    но с ловушкой; ok. «TXT нет вообще» и «TXT есть, но не SPF» различаются в
+    detail: во втором случае оператору стоит искать запись в другой зоне.
+    """
+    spf = [t for t in txts if t.lower().startswith('v=spf1')]
+    if not spf:
+        broken = [t for t in txts if t.lower().startswith('v=spf')]
+        if broken:
+            # Типичная опечатка: 'v=spf ' без единицы — приёмщик запись не видит
+            return {'status': 'bad', 'lookups': 1, 'includes': [],
+                    'detail': 'запись начинается с „v=spf“ без 1 — SPF не '
+                              'распознаётся: ' + broken[0][:80]}
+        return {'status': 'bad', 'lookups': 1, 'includes': [],
+                'detail': (('TXT-записей у домена нет вообще' if not txts
+                            else f'SPF (v=spf1) нет среди {len(txts)} TXT-записей')
+                           + ' — письмо без SPF приёмники кладут в спам')}
+    includes = [token.lower().split(':', 1)[1]
+                for record in spf for token in record.split()
+                if token.lower().startswith('include:')]
+    lookups = 1 + len(includes)
+    low = spf[0].lower()
+    shown = spf[0] if len(spf[0]) <= 88 else spf[0][:85] + '…'
+    if len(spf) > 1:
+        # RFC 7208 §3.6: две SPF-записи — это не SPF, приёмник отвечает PermError
+        return {'status': 'bad', 'lookups': lookups, 'includes': includes,
+                'detail': f'{len(spf)} SPF-записи — по RFC 7208 это PermError, '
+                          f'письма отклоняются; оставьте одну'}
+    if lookups > MAX_SPF_LOOKUPS:
+        return {'status': 'bad', 'lookups': lookups, 'includes': includes,
+                'detail': f'{lookups} DNS-запросов (include: {len(includes)}) > '
+                          f'{MAX_SPF_LOOKUPS} — по RFC 7208 PermError, часть '
+                          f'приёмников письмо отклонит'}
+    if ' redirect=' in low:
+        return {'status': 'ok', 'lookups': lookups, 'includes': includes,
+                'detail': shown + '  (redirect=)'}
+    if '+all' in low:
+        return {'status': 'bad', 'lookups': lookups, 'includes': includes,
+                'detail': shown + ' — „+all“ разрешает отправлять с ЛЮБОГО IP, '
+                                  'фильтры такую запись не учитывают'}
+    if not re.search(r'(^|\s)[-?~]all(\s|$)', low):
+        return {'status': 'warn', 'lookups': lookups, 'includes': includes,
+                'detail': shown + ' — нет механизма all: формально разрешены '
+                                  'чужие серверы'}
+    return {'status': 'ok', 'lookups': lookups, 'includes': includes,
+            'detail': shown}
+
+
+def parse_dkim(out, domain):
+    """Строки 'имя|значение' -> {'status','selectors','revoked','detail'}.
+
+    Пустой p= — отдельный случай, а не «запись есть»: так отзывают ключ, и
+    подпись с такой записью получатель проверить не сможет (частая грабля после
+    «чистили DNS»). Строк без v=DKIM1 (CNAME на чужую зону, мусор) не считаем.
+    """
+    suffix = '._domainkey.' + domain.lower()
+    found, short, revoked = [], [], []
+    current = ''
+    for line in (out or '').splitlines():
+        name, sep, raw = line.partition('|')
+        if sep:
+            low = name.strip().lower()
+            if not low.endswith(suffix):
+                current = ''          # строка чужого домена — сбрасываем якорь
+                continue
+            current = low[:-len(suffix)] or '?'
+            raw_value = raw
+        else:
+            # Ротация ключа: у селектора бывает несколько TXT, и dig печатает их
+            # отдельными строками БЕЗ имени. Якорь — последний селектор: иначе
+            # второй (боевой) ключ терялся бы, а первый с пустым p= выглядел бы
+            # как «ключ отозван».
+            if not current:
+                continue
+            raw_value = line
+        selector = current
+        value = _join_txt_chunks(raw_value)
+        if not value.lower().startswith('v=dkim1'):
+            continue
+        key = ''
+        for token in value.replace(';', ' ').split():
+            if token.lower().startswith('p='):
+                key = token[2:].strip()
+        if not key:
+            revoked.append(selector)
+        else:
+            found.append(selector)
+            if len(key) < DKIM_MIN_KEY_B64:
+                short.append(selector)
+    if not found and not revoked:
+        return {'status': 'bad', 'selectors': [], 'revoked': [],
+                'detail': f'записи нет ни по одному из '
+                          f'{len(MAIL_AUTH_SELECTORS)} проверенных селекторов'}
+    if not found:
+        return {'status': 'bad', 'selectors': [], 'revoked': revoked,
+                'detail': f'запись есть, но p= пустой ({", ".join(revoked)}): '
+                          f'ключ отозван — подпись проверить нельзя'}
+    detail = 'подпись по селектору: ' + ', '.join(found[:4])
+    if revoked:
+        detail += f' (+{len(revoked)} с пустым p=)'
+    if short:
+        return {'status': 'warn', 'selectors': found, 'revoked': revoked,
+                'detail': f'ключ короче 1024 бит: {", ".join(short[:4])} — '
+                          f'строгие приёмники такую подпись не примут'}
+    return {'status': 'ok', 'selectors': found, 'revoked': revoked,
+            'detail': detail}
+
+
+def parse_dmarc(txts):
+    """TXT _dmarc -> {'status','policy','rua','detail'}.
+
+    Отсутствие DMARC — warn, а не bad: по RFC 7489 это рекомендация, и письма
+    без него продолжают доходить. Рисовать за это ❌ нельзя.
+    """
+    rec = next((t for t in txts if t.lower().startswith('v=dmarc1')), None)
+    if not rec:
+        return {'status': 'warn', 'policy': '', 'rua': '',
+                'detail': 'записи _dmarc нет: без DMARC SPF и DKIM к заголовку '
+                          'From не применяются — поддомен могут слать от вашего '
+                          'имени'}
+    fields = {}
+    for token in rec.split(';'):
+        key, sep, value = token.partition('=')
+        if sep:
+            fields[key.strip().lower()] = value.strip()
+    policy = (fields.get('p') or '').lower()
+    rua = fields.get('rua') or ''
+    if 'p' not in fields:
+        # RFC 7489 делает тег p обязательным: без него приёмник запись не
+        # применяет. Назвать это «p=none» было бы враньём — режим наблюдения
+        # хотя бы собирает сводки, а здесь DMARC не работает вовсе.
+        return {'status': 'warn', 'policy': '', 'rua': rua,
+                'detail': 'нет обязательного тега p: по RFC 7489 приёмник такую '
+                          'запись не применяет, DMARC не работает'}
+    if policy not in ('none', 'quarantine', 'reject'):
+        return {'status': 'warn', 'policy': policy, 'rua': rua,
+                'detail': f'режим p={policy or "—"} не распознан — приёмник '
+                          f'применит NONE'}
+    if policy == 'none':
+        return {'status': 'warn', 'policy': policy, 'rua': rua,
+                'detail': 'p=none — только наблюдение, письма не отклоняются'
+                          + ('' if rua else '; rua нет — сводок не будет')}
+    if not rua:
+        return {'status': 'warn', 'policy': policy, 'rua': rua,
+                'detail': f'p={policy}, но rua нет: сводки о чужой рассылке с '
+                          f'домена приходить не будут'}
+    return {'status': 'ok', 'policy': policy, 'rua': rua,
+            'detail': f'p={policy}, отчёты rua настроены'}
+
+
+# ---------- откуда видно записи (без этого вывод был бы ложью) ----------
+def resolver_view_note(checker):
+    """Предупреждение, если сервер резолвит сам себя: видны локальные зоны."""
+    content = read_file_content(checker, '/etc/resolv.conf') or ''
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == 'nameserver':
+            ns = parts[1]
+            if ns.startswith('127.') or ns == '::1' or _is_private_ip(ns):
+                return (f'резолвер сервера — {ns}, видны записи локальных зон, '
+                        f'а не интернета')
+            return ''
+    return ''
+
+
+def _is_private_ip(ip):
+    return (ip.startswith('10.') or ip.startswith('192.168.')
+            or bool(re.match(r'^172\.(1[6-9]|2\d|3[01])\.', ip)))
+
+
+def zone_view_note(domain, zones, resolver_note=''):
+    """Откуда видны записи домена: локальная зона / локальный резолвер / ''.
+
+    На сервере с собственной зоной dig чаще всего спрашивает localhost и
+    показывает файл зоны. «SPF есть» при пустой ПУБЛИЧНОЙ зоне был бы ложным
+    диагнозом, поэтому источник пишется в отчёте и даётся команда сверки извне.
+    """
+    bits = []
+    if any(domain == z or domain.endswith('.' + z) for z in zones):
+        bits.append(f'зона {domain} обслуживается этим сервером — видно её '
+                    f'локальное содержимое')
+    if resolver_note:
+        bits.append(resolver_note)
+    if not bits:
+        return ''
+    bits.append(f'сверьте извне: dig +short TXT {domain} @1.1.1.1')
+    return '; '.join(bits)
+
+
+def summarize_mail_auth(domain, spf_out, dmarc_out, dkim_out, ptr_out,
+                        ip='', note='', header=True):
+    """(вердикт, строки) по СЫРЫМ выводам dig — чистая, все ветки в тестах.
+
+    ip='' означает «A-записи нет»: PTR в этом случае НЕ проверен, и это warn, а
+    не ❌ — мы не знаем про него ничего, врать оператору нельзя.
+    """
+    spf = parse_spf(parse_dns_txt(spf_out))
+    dmarc = parse_dmarc(parse_dns_txt(dmarc_out))
+    dkim = parse_dkim(dkim_out, domain)
+    ptr = parse_ptr(ptr_out)
+    if not ip:
+        ptr_status, ptr_text = 'warn', 'PTR не проверен: A-запись не получена'
+    elif ptr:
+        ptr_status, ptr_text = 'ok', ptr
+    else:
+        ptr_status = 'bad'
+        ptr_text = f'для {ip} обратной записи нет — Google/Microsoft такую почту режут'
+
+    verdict = max((spf['status'], dkim['status'], dmarc['status'], ptr_status),
+                  key=AUTH_SEVERITY.__getitem__)
+    pad = '    ' if header else '  '
+    lines = []
+    if header:
+        lines.append(f'{domain:42s} SPF {AUTH_ICON[spf["status"]]}  '
+                     f'DKIM {AUTH_ICON[dkim["status"]]}  '
+                     f'DMARC {AUTH_ICON[dmarc["status"]]}  '
+                     f'PTR {AUTH_ICON[ptr_status]}')
+    lines.append(f'{pad}SPF   {spf["detail"]}')
+    dkim_note = ''
+    if dkim['status'] == 'bad' and not dkim['revoked']:
+        dkim_note = (' — если подписывает другой селектор, проверьте '
+                     f'<selector>._domainkey (искали: '
+                     f'{", ".join(MAIL_AUTH_SELECTORS[:5])}…)')
+    lines.append(f'{pad}DKIM  {dkim["detail"]}{dkim_note}')
+    lines.append(f'{pad}DMARC {dmarc["detail"]}')
+    lines.append(f'{pad}PTR   {ptr_text}')
+    if note:
+        lines.append(f'{pad}⚠️ {note}')
+    return verdict, lines
+
+
+def mail_auth_lines(checker, domain, note='', header=True):
+    """(вердикт, строки, ip) по ОДНОМУ домену: 5 dig-запросов, не больше.
+
+    Вынесено из mail_auth_report, чтобы «Досье домена» показывало ровно те же
+    проверки тем же кодом: две реализации однажды разъехались бы формулировками,
+    и оператор видел бы в одном месте «DKIM нет», а в другом — «DKIM ❓».
+    PTR спрашивается только когда есть IPv4: спрашивать -x у CNAME бессмысленно.
+    """
+    ip = first_ipv4(checker.exec_command(a_query_command(domain))[0])
+    return summarize_mail_auth(
+        domain,
+        checker.exec_command(spf_query_command(domain))[0],
+        checker.exec_command(dmarc_query_command(domain))[0],
+        checker.exec_command(dkim_query_command(domain))[0],
+        checker.exec_command(ptr_query_command(ip))[0] if ip else '',
+        ip=ip, note=note, header=header) + (ip,)
+
+
+MAIL_AUTH_FIX_HINT = (
+    "\nКак чинить: SPF, DKIM и DMARC — DNS-записи домена, их правят там, где у "
+    "домена зона (панель → DNS либо регистратор/облако). DKIM в FASTPANEL "
+    "включается в разделе «Почта» кнопкой DKIM у домена, в ISPmanager — при "
+    "добавлении почтового домена. PTR настраивает владелец IP-адреса (хостер), "
+    "а не панель.")
+
+
+def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
+    """SPF/DKIM/DMARC/PTR по почтовым доменам сервера: худшие — сверху.
+
+    Цена — 5 DNS-запросов на домен (A, TXT, _dmarc, цикл по селекторам DKIM,
+    PTR) и тот же limit, что у проверки доступности сайтов. Группировки по
+    блокам здесь нет намеренно: вердикт домена определяется худшей проверкой,
+    поэтому «плохие сверху, хорошие снизу» отвечает на вопрос «что чинить
+    первым» лучше, чем три списка по статусам.
+    """
+    if panel_type is None:
+        panel_type = detect_panel(checker)
+    lines = ["=== ПОЧТА: SPF / DKIM / DMARC / PTR ==="]
+    domains = sorted(discover_mail_domains(checker, panel_type))
+    if not domains:
+        lines.append("Почтовые домены не найдены — проверять нечего.")
+        return "\n".join(lines)
+
+    zones = {z['domain'] for z in discover_dns_zones(checker, panel_type)}
+    resolver_note = resolver_view_note(checker)
+    checked = []
+    for dom in domains[:limit]:
+        verdict, detail, _ip = mail_auth_lines(
+            checker, dom, note=zone_view_note(dom, zones, resolver_note))
+        checked.append((AUTH_SEVERITY[verdict], dom, detail))
+
+    # Худшие сверху; порядок внутри одной беды — алфавитный, иначе список
+    # менялся бы от прогона к прогону и оператор не узнал бы свой домен.
+    checked.sort(key=lambda item: (-item[0], item[1]))
+    bad = sum(1 for sev, _d, _l in checked if sev == AUTH_SEVERITY['bad'])
+    warn = sum(1 for sev, _d, _l in checked if sev == AUTH_SEVERITY['warn'])
+    lines.append(f"Проверено доменов: {len(checked)} из {len(domains)}. "
+                 f"Провалено: {bad}, с замечаниями: {warn}.")
+    lines.append("Худшие сверху: в спам письмо кладёт одна проваленная "
+                 "проверка, а не средняя.")
+    for _sev, _dom, detail in checked:
+        lines.append('')
+        lines.extend(detail)
+
+    if len(domains) > limit:
+        lines.append(f"\n… проверены первые {limit} из {len(domains)} доменов "
+                     f"(HEALTH_CHECK_LIMIT)")
+    lines.append(MAIL_AUTH_FIX_HINT)
+    lines.append("ℹ️ Домен, который только принимает почту, можно не "
+                 "подписывать — но уходящее с него письмо без SPF/DKIM почти "
+                 "всегда попадёт в спам.")
+    return "\n".join(lines)
+
+
 def dns_zones_report(checker, panel_type=None):
     zones = discover_dns_zones(checker, panel_type)
     lines = ["=== DNS-ЗОНЫ НА СЕРВЕРЕ ==="]
@@ -818,6 +1231,16 @@ def domain_detail_report(checker, domain, panel_type=None):
                      f"ящиков: {len(boxes)}")
         for addr, source in boxes[:20]:
             lines.append(f"  {addr}  [{source}]")
+        # Аутентификация спрашивается ТОЛЬКО у почтового домена: у чисто веб-
+        # домена SPF может не быть намеренно, и ❌ напротив него был бы ложным
+        # диагнозом. Две дополнительные команды (resolv.conf и список зон) идут
+        # ради честной пометки «dig показывает локальную зону, а не интернет».
+        zones = {z['domain'] for z in discover_dns_zones(checker, panel_type)}
+        _verdict, auth_lines, _ip = mail_auth_lines(
+            checker, dom, header=False,
+            note=zone_view_note(dom, zones, resolver_view_note(checker)))
+        lines.append("\nDNS-аутентификация отправки (SPF/DKIM/DMARC/PTR):")
+        lines.extend(auth_lines)
     else:
         lines.append("\nДомен не заявлен как почтовый на этом сервере.")
 

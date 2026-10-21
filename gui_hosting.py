@@ -17,8 +17,8 @@ from tkinter import messagebox, simpledialog
 
 from diagnostic import (
     hosting_inventory_report, site_health_report, ssl_expiry_report,
-    mail_overview_report, dns_zones_report, domain_detail_report,
-    mailbox_create, mailbox_passwd, mailbox_delete,
+    mail_overview_report, mail_auth_report, dns_zones_report,
+    domain_detail_report, mailbox_create, mailbox_passwd, mailbox_delete,
 )
 
 # Состав меню: (подпись пункта, имя метода класса), None — разделитель, либо
@@ -32,6 +32,7 @@ HOSTING_MENU = [
     ("Сайты: список и доступность", "run_host_sites"),
     ("SSL: срок действия сертификатов", "run_host_ssl"),
     ("Почта: домены, ящики, очередь", "run_host_mail"),
+    ("Почта: SPF/DKIM/DMARC/PTR", "run_host_mail_auth"),
     ("DNS-зоны на сервере", "run_host_zones"),
     None,
     ("Досье домена (всё об одном)", "run_host_domain"),
@@ -91,6 +92,16 @@ class HostingMixin:
         self._run_in_thread(mail_overview_report, self.host_menu_btn,
                             self.checker, self.panel_type,
                             cache_key='host_mail')
+
+    def run_host_mail_auth(self):
+        # Отчёт только читает DNS (5 dig-запросов на домен) — спрашивать
+        # нечего; кеш 60 с, как у остальных сводных отчётов: прогон по сотне
+        # доменов идёт минутами, второй клик подряд должен стоить ноль.
+        if not self.checker:
+            return
+        self._run_in_thread(mail_auth_report, self.host_menu_btn,
+                            self.checker, self.panel_type,
+                            cache_key='host_mail_auth')
 
     def run_host_zones(self):
         if not self.checker:
