@@ -643,6 +643,412 @@ class TestInventoryAndDomain:
         assert 'Лог доступа: /var/www/biz/site1.ru/logs/access.log' in out
 
 
+# ============ ПИСЬМА В СПАМ: SPF / DKIM / DMARC / PTR =====================
+# Причина №1 в тикетах «почта работает, а письма уходят в спам» — DNS, а не
+# postfix. Вся тяжесть логики в чистых парсерах, они проверяются напрямую;
+# отчёты идут через FakeSSH. Две грабли, из-за которых блок написан именно так:
+#  - «DKIM нет» честно только при переборе селекторов: у FASTPANEL это
+#    dkim._domainkey (kb.fastpanel.direct), у ISPmanager/opendkim — default, у
+#    rspamd свои. Проверка одного имени наврёт оператору;
+#  - dig с сервера показывает ЛОКАЛЬНУЮ зону, если зону обслуживает он сам или
+#    резолвер смотрит в localhost. «SPF есть» при пустой публичной зоне — ложный
+#    диагноз, поэтому источник записей печатается в отчёте.
+
+DKIM_1024 = 'v=DKIM1; k=rsa; p=' + 'A' * 216     # штатный RSA-1024 в base64
+DKIM_512 = 'v=DKIM1; k=rsa; p=' + 'A' * 106      # RSA-512: строгие приёмники не примут
+DKIM_REVOKED = 'v=DKIM1; k=rsa; p='              # именно так отзывают ключ
+
+MAIL_AUTH_COMMANDS = ('a_query_command', 'spf_query_command',
+                      'dmarc_query_command', 'dkim_query_command')
+
+
+class TestSpfParsing:
+    def test_normal_record_is_ok(self):
+        r = dc.parse_spf(['v=spf1 ip4:93.184.216.34 include:_spf.google.com ~all'])
+        assert r['status'] == 'ok'
+        assert r['includes'] == ['_spf.google.com']
+        assert r['lookups'] == 2          # своя зона + один include
+
+    def test_no_txt_at_all(self):
+        r = dc.parse_spf([])
+        assert r['status'] == 'bad' and 'TXT-записей у домена нет' in r['detail']
+
+    def test_txt_present_but_not_spf(self):
+        #_verdyt тот же, а подсказка другая: оператору стоит искать запись в
+        # другой зоне, а не ставить новую
+        r = dc.parse_spf(['google-site-verification=abc123'])
+        assert r['status'] == 'bad' and 'среди 1 TXT' in r['detail']
+
+    def test_typo_without_one_is_bad(self):
+        # Типичная опечатка: 'v=spf ' без единицы — приёмщик запись не видит
+        r = dc.parse_spf(['v=spf ip4:1.1.1.1 -all'])
+        assert r['status'] == 'bad' and 'без 1' in r['detail']
+
+    def test_two_records_is_permerror(self):
+        # RFC 7208 §3.6: две SPF-записи — это не SPF, приёмник ОТКЛОНЯЕТ письма
+        r = dc.parse_spf(['v=spf1 ip4:1.1.1.1 -all', 'v=spf1 include:x.ru ~all'])
+        assert r['status'] == 'bad' and 'PermError' in r['detail']
+
+    def test_too_many_includes_breaks_the_rfc_limit(self):
+        rec = 'v=spf1 ' + ' '.join(f'include:d{i}.ru' for i in range(12)) + ' -all'
+        r = dc.parse_spf([rec])
+        assert r['status'] == 'bad' and r['lookups'] == 13
+
+    def test_exactly_ten_lookups_is_still_ok(self):
+        # Граница: 10 DNS-запросов по RFC 7208 ещё легальны, 11 — уже PermError
+        rec = 'v=spf1 ' + ' '.join(f'include:d{i}.ru' for i in range(9)) + ' -all'
+        assert dc.parse_spf([rec])['status'] == 'ok'
+
+    def test_plus_all_opens_the_domain(self):
+        r = dc.parse_spf(['v=spf1 +all'])
+        assert r['status'] == 'bad' and 'ЛЮБОГО' in r['detail']
+
+    def test_missing_all_mechanism_is_warn_not_bad(self):
+        # Запись применяется, но формально не запрещает чужие серверы: это
+        # замечание, а не провал — письма-то доходят
+        r = dc.parse_spf(['v=spf1 ip4:1.1.1.1'])
+        assert r['status'] == 'warn' and 'all' in r['detail']
+
+    def test_redirect_is_ok_without_mechanism(self):
+        # redirect= сам отвечает за исход, требовать в нём all — ложный упрёк
+        r = dc.parse_spf(['v=spf1 redirect=_spf.example.com'])
+        assert r['status'] == 'ok'
+
+    def test_long_record_is_truncated_in_detail(self):
+        # Отчёт читают с экрана: полная запись на 300 символов разор бы вёрстку
+        r = dc.parse_spf(['v=spf1 ' + ' '.join(f'ip4:10.0.{i}.1' for i in range(40)) + ' -all'])
+        assert len(r['detail']) < 120 and r['detail'].endswith('…')
+
+
+class TestDkimParsing:
+    def test_normal_key_is_ok(self):
+        r = dc.parse_dkim(f'dkim._domainkey.ex.com|{DKIM_1024}', 'ex.com')
+        assert r['status'] == 'ok' and r['selectors'] == ['dkim']
+
+    @pytest.mark.parametrize('selector', ['dkim', 'default', 'mail', 's1'])
+    def test_panel_and_mta_selectors_are_found(self, selector):
+        # Смысл списка селекторов: «DKIM нет» можно сказать только перебором.
+        # У FASTPANEL dkim, у ISPmanager/opendkim default, у rspamd свои.
+        r = dc.parse_dkim(f'{selector}._domainkey.ex.com|{DKIM_1024}', 'ex.com')
+        assert r['status'] == 'ok' and r['selectors'] == [selector]
+
+    def test_silence_lists_how_many_selectors_were_looked_up(self):
+        # Оператор обязан видеть, что проверяли не одно имя: иначе он решит,
+        # что программа «просто не нашла» его селектор
+        r = dc.parse_dkim('', 'ex.com')
+        assert r['status'] == 'bad'
+        assert f'{len(dc.MAIL_AUTH_SELECTORS)}' in r['detail']
+
+    def test_empty_p_is_a_revoked_key_not_a_record(self):
+        r = dc.parse_dkim(f'dkim._domainkey.ex.com|{DKIM_REVOKED}', 'ex.com')
+        assert r['status'] == 'bad' and 'отозван' in r['detail']
+
+    def test_key_rotation_keeps_the_live_key(self):
+        # Ротация: отозванный ключ — первая TXT, боевой — вторая строка БЕЗ
+        # имени селектора. Без «якоря» домен выглядел бы «ключ отозван».
+        out = f'dkim._domainkey.ex.com|{DKIM_REVOKED}\n' + DKIM_1024
+        r = dc.parse_dkim(out, 'ex.com')
+        assert r['status'] == 'ok' and r['selectors'] == ['dkim']
+
+    def test_foreign_record_resets_the_anchor(self):
+        # Чужой домен в том же выводе не имеет права приписать свой ключ нашим
+        out = (f'old._domainkey.other.com|{DKIM_REVOKED}\n'
+               f'dkim._domainkey.ex.com|{DKIM_1024}')
+        r = dc.parse_dkim(out, 'ex.com')
+        assert r['selectors'] == ['dkim'] and r['revoked'] == []
+
+    def test_short_key_is_warn(self):
+        r = dc.parse_dkim(f'mail._domainkey.ex.com|{DKIM_512}', 'ex.com')
+        assert r['status'] == 'warn' and '1024' in r['detail']
+
+    def test_chunked_key_is_joined_into_one(self):
+        # TXT длиннее 255 символов dig печатает кусками в кавычках: без склейки
+        # ключ выглядел бы оборванным, а хвост записи — отсутствующим
+        rec = '"v=DKIM1; k=rsa; p=' + 'A' * 150 + '" "B' * 1 + 'B' * 99 + '"'
+        r = dc.parse_dkim('dkim._domainkey.ex.com|' + rec, 'ex.com')
+        assert r['status'] == 'ok'
+
+    def test_cname_and_foreign_domain_are_ignored(self):
+        assert dc.parse_dkim('dkim._domainkey.ex.com|dkim.example.net.',
+                             'ex.com')['status'] == 'bad'
+        assert dc.parse_dkim(f'dkim._domainkey.OTHER.com|{DKIM_1024}',
+                             'ex.com')['status'] == 'bad'
+
+    def test_selector_case_is_normalised(self):
+        r = dc.parse_dkim(f'DKIM._DOMAINKEY.EX.COM|{DKIM_1024}', 'EX.com')
+        assert r['selectors'] == ['dkim']
+
+
+class TestDmarcParsing:
+    def test_missing_dmarc_is_warn_not_bad(self):
+        # RFC 7489 — рекомендация: без DMARC письма ходят. ❌ за это рисовать
+        # нельзя, иначе оператор побеждает несуществующую проблему.
+        assert dc.parse_dmarc([])['status'] == 'warn'
+
+    def test_reject_with_reports_is_ok(self):
+        r = dc.parse_dmarc(['v=DMARC1; p=reject; rua=mailto:dmarc@ex.com'])
+        assert r['status'] == 'ok' and r['policy'] == 'reject'
+
+    def test_none_policy_is_monitoring_only(self):
+        r = dc.parse_dmarc(['v=DMARC1; p=none'])
+        assert r['status'] == 'warn' and 'наблюдение' in r['detail']
+
+    def test_strict_policy_without_rua_warns(self):
+        # Письма уже отклоняются, а сводок о чужой рассылке оператор не увидит:
+        # самая дорогая комбинация — сломанная доставка без диагностики
+        r = dc.parse_dmarc(['v=DMARC1; p=quarantine'])
+        assert r['status'] == 'warn' and 'rua' in r['detail']
+
+    def test_unknown_policy_is_warn(self):
+        r = dc.parse_dmarc(['v=DMARC1; p=quarintine'])      # опечатка оператора
+        assert r['status'] == 'warn' and 'не распознан' in r['detail']
+
+    def test_record_without_policy_is_not_applied(self):
+        #RFC 7489: тег p обязателен. Выдумать вместо него «p=none» означало бы
+        # сказать оператору, что DMARC работает в режиме наблюдения, хотя он не
+        # работает вовсе.
+        r = dc.parse_dmarc(['v=DMARC1; rua=mailto:x@ex.com'])
+        assert r['status'] == 'warn' and r['policy'] == ''
+        assert 'обязательного тега p' in r['detail']
+
+
+class TestMailAuthHelpers:
+    def test_ptr_is_normalised(self):
+        assert dc.parse_ptr('mail.ex.com.') == 'mail.ex.com'
+        assert dc.parse_ptr('  \n  MAIL.Ex.COM.') == 'mail.ex.com'
+        assert dc.parse_ptr('') == ''
+
+    def test_first_ipv4_skips_cname(self):
+        # PTR спрашивается по адресу. Вернуть CNAME значило бы спросить
+        # `dig -x some-cdn.net` и получить неправдоподобное «PTR нет».
+        assert dc.first_ipv4('ex.com. 93.184.216.34') == '93.184.216.34'
+        assert dc.first_ipv4('cdn.net.') == ''
+        assert dc.first_ipv4('999.1.1.1') == ''        # не адрес вовсе
+        assert dc.first_ipv4('') == ''
+
+    def test_dns_txt_joins_chunks_and_drops_empty_lines(self):
+        assert dc.parse_dns_txt('"v=spf1 ip4:1.2.3.4 " "-all"') == \
+            ['v=spf1 ip4:1.2.3.4 -all']
+        assert dc.parse_dns_txt('a\n\n  \nb\n') == ['a', 'b']
+        assert dc.parse_dns_txt('') == []
+
+
+class TestWhereTheRecordsAreSeen:
+    def test_loopback_resolver_is_disclosed(self):
+        c = FakeSSH(routes=[('cat /etc/resolv.conf', 'nameserver 127.0.0.53\n')])
+        assert '127.0.0.53' in dc.resolver_view_note(c)
+
+    def test_private_resolver_is_disclosed(self):
+        c = FakeSSH(routes=[('cat /etc/resolv.conf', 'nameserver 192.168.1.10\n')])
+        assert '192.168.1.10' in dc.resolver_view_note(c)
+
+    def test_public_resolver_is_silent(self):
+        # Публичный резолвер видит интернет — пугать оператора локальными зонами
+        # не за что
+        c = FakeSSH(routes=[('cat /etc/resolv.conf', 'nameserver 1.1.1.1\n')])
+        assert dc.resolver_view_note(c) == ''
+
+    def test_unreadable_resolv_conf_is_silent(self):
+        # Не знаем — не выдумываем: пустая строка значит «никакой пометки»
+        assert dc.resolver_view_note(FakeSSH()) == ''
+
+    def test_own_zone_adds_the_outside_check_command(self):
+        note = dc.zone_view_note('ex.com', {'ex.com'})
+        assert 'локальное содержимое' in note
+        assert 'dig +short TXT ex.com @1.1.1.1' in note
+
+    def test_subdomain_of_own_zone_is_caught(self):
+        assert dc.zone_view_note('mail.ex.com', {'ex.com'}) != ''
+
+    def test_foreign_zone_is_silent(self):
+        assert dc.zone_view_note('ex.com', {'other.tld'}) == ''
+
+
+class TestMailAuthCommands:
+    @pytest.mark.parametrize('name', MAIL_AUTH_COMMANDS)
+    def test_command_is_valid_shell(self, name):
+        cmd = getattr(dc, name)('ex.com')
+        shlex.split(cmd)
+        proc = subprocess.run(['bash', '-n', '-c', cmd],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, f'{name}: {proc.stderr}'
+
+    @pytest.mark.parametrize('name', MAIL_AUTH_COMMANDS)
+    def test_evil_domain_stays_one_argument(self, name):
+        # Домен приходит из панели и из ввода оператора: кавычка не имеет права
+        # рождать вторую команду — q() обязан оставить её частью одного аргумента
+        evil = "ex.com'; touch /tmp/PWNED; echo '"
+        parts = shlex.split(getattr(dc, name)(evil))
+        assert 'touch' not in parts and ';' not in parts
+
+    def test_ptr_command_names_the_address_only(self):
+        assert dc.ptr_query_command('1.2.3.4') == 'dig +short -x 1.2.3.4 2>/dev/null'
+
+    def test_dkim_loops_over_every_known_selector(self):
+        # Одна команда обязана покрыть все селекторы панелей и MTA: иначе
+        # «DKIM нет» останется правдой только для одного из них
+        cmd = dc.dkim_query_command('ex.com')
+        for sel in dc.MAIL_AUTH_SELECTORS:
+            assert f'{sel}._domainkey.ex.com' in cmd
+
+    def test_record_names_are_the_rfc_positions(self):
+        # SPF — на самом домене, DMARC — на _dmarc (RFC 7489), DKIM — на
+        # <selector>._domainkey: спросить не там значит соврать про «записи нет»
+        assert dc.spf_query_command('ex.com').startswith('dig +short TXT ex.com')
+        assert '_dmarc.ex.com' in dc.dmarc_query_command('ex.com')
+        assert '._domainkey.ex.com' in dc.dkim_query_command('ex.com')
+
+
+class TestMailAuthReport:
+    def test_two_domains_worst_first(self):
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr maildomain',
+             'name=good.ru elid=1\nname=bad.ru elid=2\n'),
+            ('cat /etc/resolv.conf', 'nameserver 1.1.1.1\n'),
+            ('dig +short A', '93.184.216.34'),
+            ('dig +short -x', 'mail.good.ru.'),
+            ('dig +short TXT good.ru', '"v=spf1 ip4:93.184.216.34 -all"'),
+            ('dig +short TXT bad.ru', ''),
+            ('dig +short TXT _dmarc.good.ru',
+             '"v=DMARC1; p=reject; rua=mailto:p@good.ru"'),
+            ('dig +short TXT _dmarc.bad.ru', ''),
+            ('for __dk in dkim._domainkey.good.ru',
+             'dkim._domainkey.good.ru|' + DKIM_1024 + '\n'),
+            ('for __dk in dkim._domainkey.bad.ru', ''),
+        ])
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert '=== ПОЧТА: SPF / DKIM / DMARC / PTR ===' in out
+        assert 'Провалено: 1, с замечаниями: 0' in out
+        # Оператору нужно «что чинить первым», а не алфавитный список
+        assert out.index('bad.ru') < out.index('good.ru')
+        assert 'подпись по селектору: dkim' in out
+        assert 'Как чинить' in out
+        # у чистого приёмника подписи нет намеренно — не выдумываем беду good.ru
+        assert 'DMARC ✅' in out
+
+    def test_verdict_is_the_worst_check_not_the_average(self):
+        # Три ok и один провал: домен обязан попасть в проваленные, потому что
+        # в спам письмо кладёт одна проваленная проверка, а не средняя
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr maildomain', 'name=mix.ru elid=1\n'),
+            ('dig +short A', '93.184.216.34'),
+            ('dig +short -x', ''),                                  # PTR нет
+            ('dig +short TXT mix.ru', '"v=spf1 ip4:93.184.216.34 -all"'),
+            ('dig +short TXT _dmarc.mix.ru',
+             '"v=DMARC1; p=reject; rua=mailto:p@mix.ru"'),
+            ('for __dk in dkim._domainkey.mix.ru',
+             'dkim._domainkey.mix.ru|' + DKIM_1024 + '\n'),
+        ])
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'Провалено: 1' in out
+        assert 'обратной записи нет' in out
+
+    def test_limit_and_counters(self):
+        rows = ''.join(f'name=mx{i}.tld elid={i}\n' for i in range(60))
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain', rows)])
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'Проверено доменов: 25 из 60' in out
+        assert 'проверены первые 25 из 60' in out
+
+    def test_price_is_bounded_and_ptr_needs_an_address(self):
+        # Без лимита прогон по сотне доменов вешал бы окно на минуты. У этих
+        # доменов нет A-записи, поэтому PTR не спрашивается: 4 команды на домен.
+        rows = ''.join(f'name=mx{i}.tld elid={i}\n' for i in range(30))
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain', rows)])
+        dc.mail_auth_report(c, 'ispmanager')
+        assert c.count('dig ') == 4 * dc.HEALTH_CHECK_LIMIT
+
+    def test_ptr_is_not_invented_without_an_address(self):
+        # Без A-записи спрашивать -x нечего; рисовать ❌ «PTR нет» было бы враньём
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=only.ru elid=1\n')])
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'PTR не проверен' in out
+        assert c.count('dig +short -x') == 0
+
+    def test_local_zone_and_local_resolver_are_disclosed(self):
+        # Главная ложь, которую обязан закрывать отчёт: «SPF есть» по записи из
+        # локальной зоны, которой нет в интернете
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr maildomain', 'name=ex.com elid=1\n'),
+            ('mgrctl -m ispmgr dnszone', 'name=ex.com elid=9\n'),
+            ('cat /etc/resolv.conf', 'nameserver 10.0.0.5\n'),
+        ])
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'локальное содержимое' in out
+        assert '10.0.0.5' in out
+        assert '@1.1.1.1' in out
+
+    def test_public_resolver_adds_no_fear_note(self):
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr maildomain', 'name=ex.com elid=1\n'),
+            ('cat /etc/resolv.conf', 'nameserver 8.8.8.8\n'),
+        ])
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'локальное содержимое' not in out and '@1.1.1.1' not in out
+
+    def test_no_mail_domains_says_so(self):
+        out = dc.mail_auth_report(FakeSSH(), 'none')
+        assert 'Почтовые домены не найдены' in out
+
+
+class TestMailAuthLines:
+    def test_five_queries_per_domain_when_address_is_known(self):
+        c = FakeSSH(routes=[('dig +short A', '93.184.216.34'),
+                            ('dig +short -x', 'mail.ex.com.')])
+        verdict, _lines, ip = dc.mail_auth_lines(c, 'ex.com')
+        assert ip == '93.184.216.34'
+        assert c.count('dig ') == 5          # A, SPF, DMARC, DKIM, PTR
+        assert verdict in dc.AUTH_SEVERITY
+
+    def test_no_ptr_query_without_an_address(self):
+        c = FakeSSH()
+        _v, _l, ip = dc.mail_auth_lines(c, 'ex.com')
+        assert ip == '' and c.count('dig +short -x') == 0
+
+    def test_header_can_be_hidden_for_embedded_use(self):
+        # В «Досье домена» домен уже написан в шапке отчёта — строку со статусами
+        # того же домена дублировать не нужно
+        _v, with_header, _ip = dc.mail_auth_lines(FakeSSH(), 'ex.com')
+        _v, no_header, _ip = dc.mail_auth_lines(FakeSSH(), 'ex.com', header=False)
+        assert len(no_header) < len(with_header)
+        assert any(l.lstrip().startswith('ex.com') for l in with_header)
+        assert not any(l.lstrip().startswith('ex.com') for l in no_header)
+
+    def test_note_is_printed_once(self):
+        _v, lines, _ip = dc.mail_auth_lines(FakeSSH(), 'ex.com', note='ЗОНА ЛОКАЛЬНАЯ')
+        assert sum(1 for l in lines if 'ЗОНА ЛОКАЛЬНАЯ' in l) == 1
+
+
+class TestDomainDetailMailAuth:
+    def test_mail_domain_gets_the_auth_block(self):
+        c = FakeSSH(routes=[
+            ('cat /etc/postfix/virtual', 'info@ex.com dest@other.tld\n'),
+            ('dig +short AAAA', ''),            # раньше 'dig +short A': совпадение по подстроке
+            ('dig +short A', '93.184.216.34'),
+            ('dig +short -x', 'mail.ex.com'),
+            ('dig +short TXT _dmarc.ex.com',
+             '"v=DMARC1; p=reject; rua=mailto:p@ex.com"'),
+            ('for __dk in dkim._domainkey.ex.com',
+             'dkim._domainkey.ex.com|' + DKIM_1024 + '\n'),
+            ('dig +short TXT ex.com', '"v=spf1 ip4:93.184.216.34 -all"'),
+        ])
+        out = dc.domain_detail_report(c, 'ex.com', 'none')
+        assert 'DNS-аутентификация отправки' in out
+        assert 'подпись по селектору: dkim' in out
+        assert 'p=reject, отчёты rua настроены' in out
+
+    def test_web_only_domain_is_not_shamed(self):
+        # У чисто веб-домена SPF может не быть намеренно: ❌ напротив него был бы
+        # ложным диагнозом, поэтому аутентификацию спрашиваем только у почтового
+        c = FakeSSH()
+        out = dc.domain_detail_report(c, 'web-only.ru', 'none')
+        assert 'не заявлен как почтовый' in out
+        assert 'DNS-аутентификация' not in out
+        # Спрашивать TXT у домена, который почту не принимает, не за чем
+        assert c.count('dig +short TXT') == 0
+
+
 # ==================== ОПЕРАЦИИ С ЯЩИКАМИ: чистые функции ====================
 class TestMailboxValidation:
     def test_address_is_normalized(self):

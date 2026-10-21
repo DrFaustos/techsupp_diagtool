@@ -101,6 +101,7 @@ REPORT_MAP = [
     ("run_host_sites", "site_health_report", "host_sites"),
     ("run_host_ssl", "ssl_expiry_report", "host_ssl"),
     ("run_host_mail", "mail_overview_report", "host_mail"),
+    ("run_host_mail_auth", "mail_auth_report", "host_mail_auth"),
     ("run_host_zones", "dns_zones_report", "host_zones"),
 ]
 
@@ -127,6 +128,38 @@ class TestSslExpiryEntry:
         out = dc.ssl_expiry_report(c, 'ispmanager')
         assert c.count('s_client -servername') == dc.HEALTH_CHECK_LIMIT
         assert 'Проверено доменов: 25 из 60' in out
+
+
+class TestMailAuthEntry:
+    """Пункт «Почта: SPF/DKIM/DMARC/PTR» — вторая строка почтовой группы.
+
+    Он стоит рядом с «Почта: домены, ящики, очередь» по той же логике, по
+    которой SSL-отчёт стоит рядом с доступностью сайтов: это парная проверка
+    того же объекта, только смотрит она в DNS, а не в панель. Отдельным
+    подменю пункт не сделан намеренно: в меню хостинга подменю уже есть
+    (операции над ящиками), а сводные отчёты оператору выгоднее видеть
+    плоским списком.
+    """
+
+    def test_entry_sits_right_after_the_mail_inventory(self):
+        sep = HOSTING_MENU.index(None)
+        before = menu_handlers(HOSTING_MENU[:sep])
+        assert before.index("run_host_mail_auth") == before.index("run_host_mail") + 1
+
+    def test_it_is_a_report_not_an_operator_dialog(self):
+        # После разделителя живёт только то, где нужен ввод оператора. Отчёт
+        # по всем доменам ввод не спрашивает — значит обязан быть до разделителя.
+        sep = HOSTING_MENU.index(None)
+        assert "run_host_mail_auth" in menu_handlers(HOSTING_MENU[:sep])
+        assert "run_host_mail_auth" not in menu_handlers(HOSTING_MENU[sep + 1:])
+
+    def test_main_list_is_still_flat_except_the_mailbox_submenu(self):
+        # «Интерфейс не разрастается»: седьмой сводный отчёт не добавляет ни
+        # подменю, ни вложенности — ровно одну строку в основной список.
+        subs = [e for e in HOSTING_MENU if e and isinstance(e[1], list)]
+        assert len(subs) == 1 and subs[0][0] == "Почтовые ящики ▸"
+        top = [e for e in HOSTING_MENU if e and not isinstance(e[1], list)]
+        assert len(top) == 7
 
 
 class TestMenuIntegrity:
