@@ -1020,6 +1020,244 @@ class TestMailAuthLines:
         assert sum(1 for l in lines if 'ЗОНА ЛОКАЛЬНАЯ' in l) == 1
 
 
+class TestSpfSuggestionBasis:
+    """Основание SPF-подсказки обязано описывать ровно то, что в строке.
+
+    Здесь заперта ложь, которую прогон вскрыл в первой же версии: запись
+    `v=spf1 a mx ~all` подписывалась словами «из A-записи домена», хотя A-записи
+    не было. Оператор такую подпись проглатывает не глядя и копирует строку в
+    зону — а неверная SPF ломает доставку всего домена.
+    """
+
+    @pytest.mark.parametrize('ip,mech', [
+        ('93.184.216.34', 'ip4:93.184.216.34'),
+        ('', 'a'),
+        ('10.0.0.5', 'a'),
+        ('192.168.1.20', 'a'),
+        ('172.20.0.3', 'a'),
+        ('127.0.0.1', 'a'),
+    ])
+    def test_mechanism_matches_what_is_known(self, ip, mech):
+        assert dc.spf_basis(ip)[0] == mech
+        assert dc.spf_suggestion(ip) == f'v=spf1 {mech} mx ~all'
+
+    def test_public_address_is_declared_as_coming_from_the_a_record(self):
+        assert 'взят из A-записи' in dc.spf_basis('93.184.216.34')[1]
+
+    def test_without_an_address_the_hint_does_not_claim_one(self):
+        note = dc.spf_basis('')[1]
+        assert 'не получена' in note and 'взят из A-записи' not in note
+
+    def test_private_address_is_not_offered_as_ip4(self):
+        # Публичный SPF с ip4:10.0.0.5 не совпадёт ни с одной сессией: приёмник
+        # смотрит на адрес TCP-сессии. Предложить его = выдать мёртвую запись.
+        mech, note = dc.spf_basis('10.0.0.5')
+        assert mech == 'a' and 'ip4:10.0.0.5' not in dc.spf_suggestion('10.0.0.5')
+        assert 'приватный' in note
+
+    def test_start_is_softfail_not_hardfail(self):
+        # -all отклоняет письма CRM/рассылок, которых оператор ещё не знает.
+        # Проходить границу «мягко» — осознанная стартовая точка, не финал.
+        assert dc.spf_suggestion('1.2.3.4').endswith('~all')
+
+
+class TestMailAuthFixes:
+    """«Что вставить в DNS» — по машинночитаемому reason, а не по тексту.
+
+    Подсказка, привязанная к фразе отчёта, отвалилась бы молча при первом же
+    перефразировании и показала бы оператору неверную запись; поэтому ветки
+    расходятся по полю reason, и здесь есть тест, который это сторожит.
+    """
+
+    @staticmethod
+    def _spf_fix(txts, ip='93.184.216.34'):
+        """Подсказка про SPF на фоне «остальное в порядке».
+
+        DKIM/DMARC/PTR передаются dict'ами только с 'reason' — заодно гард:
+        генератор обязан читать reason и не зависеть от остальных полей.
+        """
+        return dc.mail_auth_fixes('ex.com', dc.parse_spf(txts),
+                                  {'reason': 'ok'}, {'reason': 'ok'},
+                                  'ok', ip=ip)
+
+    @staticmethod
+    def _dkim_fix(dkim_out, ip='1.2.3.4'):
+        return dc.mail_auth_fixes('ex.com', {'reason': 'ok'},
+                                  dc.parse_dkim(dkim_out, 'ex.com'),
+                                  {'reason': 'ok'}, 'ok', ip=ip)
+
+    @staticmethod
+    def _dmarc_fix(txts, ip='1.2.3.4'):
+        return dc.mail_auth_fixes('ex.com', {'reason': 'ok'}, {'reason': 'ok'},
+                                  dc.parse_dmarc(txts), 'ok', ip=ip)
+
+    # ---------- привязка к reason, а не к формулировке ----------
+    def test_hint_follows_reason_not_the_wording(self):
+        # Формулировку отчёта мы правим ради читаемости. Если бы генератор
+        # разбирал detail, после такого правки подсказка отвалилась бы МОЛЧА.
+        spf = dc.parse_spf([])
+        spf['detail'] = 'СОВСЕМ ДРУГОЙ ТЕКСТ ОТЧЁТА'
+        fixes = dc.mail_auth_fixes('ex.com', spf, {'reason': 'ok'},
+                                   {'reason': 'ok'}, 'ok', ip='1.2.3.4')
+        assert fixes and 'v=spf1 ip4:1.2.3.4 mx ~all' in fixes[0]
+
+    def test_every_spf_reason_has_its_own_advice(self):
+        cases = [
+            ([], 'missing', 'добавить TXT'),
+            (['v=spf ip4:1.1.1.1'], 'broken_version', 'с единицей'),
+            (['v=spf1 -all', 'v=spf1 ~all'], 'duplicate', 'ровно одну'),
+            (['v=spf1 ' + ' '.join(f'include:d{i}.ru' for i in range(12)) + ' -all'],
+             'too_many_lookups', 'DNS-запросов'),
+            (['v=spf1 +all'], 'plus_all', '~all'),
+            (['v=spf1 ip4:1.1.1.1'], 'no_mechanism', 'дописать'),
+        ]
+        for txts, reason, needle in cases:
+            parsed = dc.parse_spf(txts)
+            assert parsed['reason'] == reason, reason
+            fixes = self._spf_fix(txts)
+            assert len(fixes) == 1 and needle in fixes[0], reason
+
+    def test_healthy_spf_gets_no_advice(self):
+        assert self._spf_fix(['v=spf1 ip4:1.1.1.1 -all']) == []
+
+    # ---------- SPF: формат записи живёт в одном месте ----------
+    @pytest.mark.parametrize('ip', ['93.184.216.34', '', '10.0.0.5'])
+    def test_record_in_the_hint_is_exactly_spf_suggestion(self, ip):
+        # Оператор копирует в зону СТРОКУ из подсказки. Если подсказка пересоберёт
+        # её у себя, в зоне окажется не та запись, которую мы объяснили.
+        fixes = self._spf_fix([], ip=ip)
+        printed = fixes[0].split('\u201e')[1].split('\u201c')[0]
+        assert printed == dc.spf_suggestion(ip)
+
+    def test_private_ip_hint_never_offers_a_dead_record(self):
+        fixes = self._spf_fix([], ip='10.0.0.5')
+        assert 'ip4:10.0.0.5' not in fixes[0]
+
+    # ---------- DKIM: готовой записи не бывает ----------
+    @pytest.mark.parametrize('dkim_out', [
+        '',                                                # missing
+        'dkim._domainkey.ex.com|v=DKIM1; k=rsa; p=',      # revoked
+        'dkim._domainkey.ex.com|v=DKIM1; k=rsa; p=' + 'A' * 100,   # short
+    ])
+    def test_dkim_never_prints_a_record(self, dkim_out):
+        # Публичный ключ выводится из приватного, который на сервере. Выдуманная
+        # «готовая» запись = подпись, которую приёмник отвергнет, а оператор
+        # решит, что «всё сделали».
+        for fix in self._dkim_fix(dkim_out):
+            assert 'v=DKIM1' not in fix
+
+    def test_dkim_advice_shows_where_to_take_the_real_record(self):
+        fix = ' '.join(self._dkim_fix(''))
+        assert 'готовую запись не даём' in fix
+        assert '/etc/rspamd/dkim' in fix and '/etc/opendkim/keys' in fix
+        # .key — приватный ключ: публикация его в DNS = полная компрометация
+        assert 'никогда не .key' in fix
+
+    def test_revoked_key_is_not_confused_with_a_missing_one(self):
+        # Один совет на «нет записи» и «запись есть, но ключ отозван» был бы
+        # ошибкой: во втором случае DNS-запись уже стоит и её не надо создавать,
+        # надо выпускать новый ключ.
+        missing = ' '.join(self._dkim_fix(''))
+        revoked = ' '.join(self._dkim_fix('dkim._domainkey.ex.com|v=DKIM1; k=rsa; p='))
+        assert 'отозван' in revoked and 'отозван' not in missing
+
+    def test_short_key_advice_names_the_remedy(self):
+        fix = ' '.join(self._dkim_fix(
+            'dkim._domainkey.ex.com|v=DKIM1; k=rsa; p=' + 'A' * 100))
+        assert '2048' in fix
+        # «подписки» — бессмыслица, которую дал первый черновик; ключ короткий,
+        # а не подписка
+        assert 'подписки' not in fix
+
+    # ---------- DMARC: одну запись правят, а не плодят ----------
+    def test_missing_dmarc_starts_at_none_with_reports(self):
+        fix = ' '.join(self._dmarc_fix([]))
+        assert '_dmarc.ex.com' in fix and 'p=none' in fix
+        assert 'rua=mailto:dmarc@ex.com' in fix
+
+    def test_existing_weak_dmarc_is_not_replaced_by_a_second_record(self):
+        # Подсказка про p=none при уже существующей записи оператор понял бы как
+        # «добавить ещё одну», а две DMARC-записи — это не DMARC.
+        for txts in (['v=DMARC1; p=none'], ['v=DMARC1; p=reject']):
+            for fix in self._dmarc_fix(txts):
+                assert 'v=DMARC1' not in fix, txts
+
+    def test_monitoring_policy_is_not_called_a_failure(self):
+        # p=none — осознанный первый шаг, а не беда: совет должен объяснять,
+        # когда поднимать режим, а не требовать reject сразу.
+        fix = ' '.join(self._dmarc_fix(['v=DMARC1; p=none; rua=mailto:a@b.c']))
+        assert 'сводки' in fix and 'quarantine' in fix
+
+    def test_record_without_policy_tag_is_told_to_add_p(self):
+        fix = ' '.join(self._dmarc_fix(['v=DMARC1; rua=mailto:a@b.c']))
+        assert 'тег p' in fix
+
+    # ---------- PTR ----------
+    def test_missing_ptr_points_at_the_address_owner(self):
+        fixes = dc.mail_auth_fixes('ex.com', {'reason': 'ok'}, {'reason': 'ok'},
+                                   {'reason': 'ok'}, 'bad', ip='203.0.113.7')
+        assert len(fixes) == 1 and '203.0.113.7' in fixes[0]
+        assert 'хостер' in fixes[0] and 'панели' in fixes[0]
+
+    def test_unchecked_ptr_invents_no_advice(self):
+        # PTR не проверялся (не было IPv4) — советовать нечего, и выдуманная
+        # «обратная запись для » была бы враньём.
+        fixes = dc.mail_auth_fixes('ex.com', {'reason': 'ok'}, {'reason': 'ok'},
+                                   {'reason': 'ok'}, 'warn', ip='')
+        assert fixes == []
+
+    def test_clean_domain_gets_no_advice_at_all(self):
+        fixes = dc.mail_auth_fixes('ex.com', {'reason': 'ok'}, {'reason': 'ok'},
+                                   {'reason': 'ok'}, 'ok', ip='1.2.3.4')
+        assert fixes == []
+
+
+class TestMailAuthHintsInReports:
+    def test_hints_are_printed_after_checks_and_only_where_broken(self):
+        _v, lines = dc.summarize_mail_auth('bad.ru', '', '', '', '',
+                                           ip='93.184.216.34')
+        # Ищем именно строку диагноза PTR, а не заголовок со статусами (в нём
+        # «PTR» тоже есть, и первое вхождение было бы тривиально верным).
+        ptr_line = next(i for i, l in enumerate(lines)
+                        if l.lstrip().startswith('PTR'))
+        hint_line = next(i for i, l in enumerate(lines) if l.lstrip().startswith('→'))
+        assert hint_line > ptr_line               # сначала диагноз, потом совет
+        # Четыре беды — четыре совета: SPF, DKIM, DMARC и PTR. Пустых советов
+        # («всё хорошо») здесь быть не должно.
+        assert sum(1 for l in lines if l.lstrip().startswith('→')) == 4
+
+    def test_configured_domain_prints_no_hints(self):
+        good = 'v=DKIM1; k=rsa; p=' + 'A' * 216
+        _v, lines = dc.summarize_mail_auth(
+            'good.ru', '"v=spf1 ip4:1.2.3.4 -all"',
+            '"v=DMARC1; p=reject; rua=mailto:p@good.ru"',
+            'dkim._domainkey.good.ru|' + good + '\n',
+            'mail.good.ru.', ip='1.2.3.4')
+        assert not any('→' in l for l in lines)
+
+    def test_hints_cost_no_extra_dns_queries(self):
+        # Подсказки строятся из уже полученных ответов (в т.ч. из A-записи):
+        # совет, который стоит ещё одного запроса на домен, удвоил бы цену прогона.
+        c = FakeSSH(routes=[('dig +short A', '93.184.216.34')])
+        _v, lines, _ip = dc.mail_auth_lines(c, 'ex.com')
+        assert any(l.lstrip().startswith('→') for l in lines)
+        # A, SPF, DMARC, DKIM, PTR — ровно те же пять, что и без подсказок
+        assert c.count('dig ') == 5
+
+    def test_report_carries_the_hint_for_the_broken_domain(self):
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr maildomain', 'name=bad.ru elid=1\n'),
+            ('cat /etc/resolv.conf', 'nameserver 1.1.1.1\n'),
+            ('dig +short A', '93.184.216.34'),
+            ('dig +short -x', ''),
+        ])
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert '→ SPF: добавить TXT „v=spf1 ip4:93.184.216.34 mx ~all“' in out
+        assert '→ PTR: запросить обратную запись для 93.184.216.34' in out
+        # DKIM остаётся зоной честности: готовую TXT-signature отчёт не печатает
+        assert 'v=DKIM1' not in out
+
+
 class TestDomainDetailMailAuth:
     def test_mail_domain_gets_the_auth_block(self):
         c = FakeSSH(routes=[
