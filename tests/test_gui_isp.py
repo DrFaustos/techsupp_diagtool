@@ -144,6 +144,9 @@ class TestPanelDiagnostics:
         # Логи намеренно БЕЗ cache_key: после только что выполненного лечения
         # оператор обязан увидеть свежий хвост, а не кеш 60-секундной давности.
         ("run_isp_logs", "ispmanager_logs_report", None),
+        # Лицензия (только licctl info) — с кешем: за минуту лицензия не
+        # «оживает», а пункт кликают подряд, разбираясь с панелью.
+        ("run_isp_license_check", "ispmanager_license_report", "isp_license"),
     ])
     def test_reports_run_without_confirmation(self, monkeypatch, handler,
                                               backend, cache_key):

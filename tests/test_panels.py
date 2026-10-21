@@ -252,6 +252,9 @@ class TestGeneratedCommandsAreValidShell:
         panels_mod.ispmanager_panel_diag(c)
         panels_mod.ispmanager_unlock(c)
         panels_mod.ispmanager_license_refresh(c)
+        # Лицензия «только чтение»: команда собрана из кучи подстановок и
+        # shell-функции — её обязан проверить bash -n наравне с остальными
+        panels_mod.ispmanager_license_report(c)
         panels_mod.fastpanel_package_status(c)
         panels_mod.fastpanel_diag(c)
         panels_mod.fastpanel_reset_password(c, "Passw0rd 'quoted\"")
@@ -475,6 +478,127 @@ class TestIspmanagerLicenseRefresh:
         out = panels_mod.ispmanager_license_refresh(c)
         assert '❌ Ошибка (rc=1): network unreachable' in out
         assert '(licctl info вернул пусто)' in out
+
+
+# ============ ISPmanager: ЛИЦЕНЗИЯ ОТДЕЛЬНЫМ ПУНКТОМ (ТОЛЬКО ЧТЕНИЕ) =======
+class TestIspmanagerLicenseReport:
+    """Остаток дней считает СЕРВЕР, отчёт различает четыре состояния.
+
+    Служебные поля (LIC_DAYS и т.п.) в тестах задаём руками: их вырабатывает
+    shell-команда на сервере, и проверка «date -d вызывается там, а не здесь»
+    вынесена в отдельный гард test_days_are_computed_on_server.
+    """
+
+    # Дословный вывод licctl info ispmgr из документации ISPsystem
+    LIC = ('OS: Ubuntu 22.04.4 (x86_64)\nManager: ispmgr (6.124.0)\nID: 0\n'
+           'Name: Trial License\nExpire: 2025-07-11\nUpdate end: (2026-04-30)\n')
+
+    @staticmethod
+    def _srv(expire='2025-07-11', days='-467', update='(2026-04-30)',
+             update_days='-174', lic=None):
+        return (f'LIC_EXPIRE={expire}\nLIC_DAYS={days}\n'
+                f'LIC_UPDATE={update}\nLIC_UPDATE_DAYS={update_days}\n---\n'
+                + (TestIspmanagerLicenseReport.LIC if lic is None else lic))
+
+    def _report(self, out, default=None):
+        c = FakeSSH(routes=[('licctl info ispmgr 2>&1 | head -n 20', out)],
+                    **({} if default is None else {'default': default}))
+        return panels_mod.ispmanager_license_report(c), c
+
+    # ---------- вердикты по остатку ----------
+    def test_expired_license_names_how_long_ago(self):
+        out, c = self._report(self._srv())
+        assert '❌ Лицензия истекла 467 дн. назад' in out
+        assert 'Окончание лицензии: 2025-07-11' in out
+        assert 'Срок обновлений: (2026-04-30) (истёк)' in out
+        # подсказка про смену IP уместна, когда срок уже горит
+        assert 'licctl fetch' in out
+        assert 'Trial' in out and 'licctl info ispmgr' in c.commands[0]
+
+    def test_expiring_soon_is_warning_not_death(self):
+        out, _ = self._report(self._srv(days='12', update_days='200'))
+        assert '⚠️ Лицензия истекает через 12 дн.' in out
+        assert 'истекла' not in out
+        assert '(осталось 200 дн.)' in out
+        assert 'licctl fetch' in out
+
+    def test_healthy_license_has_no_rescue_hint(self):
+        out, _ = self._report(self._srv(days='200', update_days='400'))
+        assert '✅ Лицензия активна, осталось 200 дн.' in out
+        # подсказка «перетянуть лицензию» на здоровой панели — шум
+        assert 'licctl fetch' not in out
+
+    def test_threshold_is_exactly_warn_days(self):
+        # 30 дн. — ещё «в порядке» (порог строгий), 29 — уже предупреждение
+        assert '✅' in panels_mod.license_status_line(panels_mod.LICENSE_WARN_DAYS)
+        assert '⚠️' in panels_mod.license_status_line(
+            panels_mod.LICENSE_WARN_DAYS - 1)
+        # ноль дней — ещё не «истекла», но уже тревога
+        assert '⚠️' in panels_mod.license_status_line(0)
+        assert '❌' in panels_mod.license_status_line(-1)
+        assert '❓' in panels_mod.license_status_line(None)
+
+    # ---------- две разные причины «неизвестного» срока ----------
+    def test_missing_expire_line_says_so(self):
+        out, _ = self._report(self._srv(expire='', days='', lic=self.LIC.replace(
+            'Expire: 2025-07-11\n', '')))
+        assert '❓ Дата окончания лицензии не определена' in out
+        assert 'найти не удалось' in out
+        assert 'date её не распознала' not in out
+
+    def test_date_ignored_by_busybox_date_is_not_missing_line(self):
+        # Дата licctl вернул, а серверная date (BusyBox/BSD без -d) её не понял.
+        # Писать «строку Expire найти не удалось» — врать: оператор искал бы не там.
+        out, _ = self._report(self._srv(expire='2027-01-01', days=''))
+        assert 'серверная date её не распознала' in out
+        assert 'BusyBox' in out
+        assert 'найти не удалось' not in out
+        assert 'Окончание лицензии: 2027-01-01' in out
+
+    # ---------- отказ панели/сервера, а не лицензии ----------
+    def test_silent_licctl_is_not_a_dead_license(self):
+        # licctl молчит чаще без интернета: вешать «лицензия истекла» нельзя
+        out, _ = self._report('', default=('', '', 0))
+        assert 'не вернул ничего' in out
+        assert '❌' not in out and 'истекла' not in out
+
+    def test_missing_binary_is_not_reported_as_license_state(self):
+        # Команда собрана с 2>&1, поэтому «command not found» приходит в stdout
+        # и без отдельной ветки выглядел бы как «состояние лицензии».
+        out, _ = self._report('bash: /usr/local/mgr5/sbin/licctl: '
+                              'No such file or directory')
+        assert '❌ licctl не найден на сервере' in out
+        assert 'Дата окончания' not in out
+
+    def test_trial_flag_only_when_panel_says_trial(self):
+        lic = self.LIC.replace('Name: Trial License', 'Name: Business License')
+        out, _ = self._report(self._srv(days='200', update_days='400', lic=lic))
+        assert 'Trial' not in out
+
+    def test_days_are_computed_on_server_not_on_operators_laptop(self):
+        # Дни обязана считать серверная date -d: часы машины оператора
+        # расходятся с серверными (тот же приём, что CERT= в SSL-пробе).
+        _out, c = self._report(self._srv(days='200'))
+        assert c.count('licctl info ispmgr') == 1      # один вызов licctl
+        cmd = c.commands[0]
+        assert 'date -d' in cmd and 'date +%s' in cmd
+        # Служебные поля отделены от текста licctl разделителем: без него
+        # парсер не отличил бы «Expire: ...» из вывода licctl от своих строк.
+        assert 'echo "---"' in cmd
+
+    # ---------- чистый парсер ----------
+    def test_parser_splits_service_fields_and_raw(self):
+        info = panels_mod.parse_license_info(self._srv())
+        assert info['expire'] == '2025-07-11'
+        assert info['days'] == -467
+        assert info['update_days'] == -174
+        assert info['raw'].startswith('OS: Ubuntu')   # текст licctl как есть
+
+    def test_parser_survives_junk_and_empty(self):
+        for text in ('', None, 'совсем не наш формат', 'LIC_DAYS=не-число'):
+            info = panels_mod.parse_license_info(text)
+            assert info['days'] is None
+            assert info['raw'] is not None
 
 
 # ============== FASTPANEL: ДИАГНОСТИКА И СБРОС ПАРОЛЯ ======================
