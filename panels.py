@@ -354,6 +354,121 @@ def ispmanager_license_refresh(checker):
     return "\n".join(lines)
 
 
+# ==================== ISPmanager: ЛИЦЕНЗИЯ (ТОЛЬКО ЧТЕНИЕ) ================
+# Отдельный пункт вместо запуска всей диагностики :1500, когда оператора
+# интересует ровно один вопрос — «жива ли лицензия» (тот же принцип, по которому
+# SSL-сроки вынесены из отчёта о доступности сайтов). Формат licctl info — из
+# документации ISPsystem (knowledge-base «Where to find the panel version and
+# license ID»): строки Name / Expire / Update end. Дни до окончания считаем НА
+# СЕРВЕРЕ (date -d), а не на машине оператора: их часы расходятся (тот же приём,
+# что в SSL-пробе CERT=). Команда через echo, а не printf, — в ней нет \n-escape.
+LICCTL = '/usr/local/mgr5/sbin/licctl'
+LICENSE_WARN_DAYS = 30
+LICENSE_CHECK_CMD = (
+    'LIC=$(' + LICCTL + ' info ispmgr 2>&1 | head -n 20); '
+    '_d() { D=$(printf %s "$1" | tr -cd "0-9-"); [ -z "$D" ] && return; '
+    'E=$(date -d "$D" +%s 2>/dev/null); [ -z "$E" ] && return; '
+    'printf %s "$(( (E - $(date +%s)) / 86400 ))"; }; '
+    'EXP=$(printf %s "$LIC" | sed -n "s/^[Ee]xpire:[[:space:]]*//p" | head -n 1); '
+    'UPD=$(printf %s "$LIC" | sed -n "s/^[Uu]pdate[^:]*:[[:space:]]*//p" | head -n 1); '
+    'echo "LIC_EXPIRE=$EXP"; echo "LIC_DAYS=$(_d "$EXP")"; '
+    'echo "LIC_UPDATE=$UPD"; echo "LIC_UPDATE_DAYS=$(_d "$UPD")"; '
+    'echo "---"; echo "$LIC"'
+)
+
+
+def parse_license_info(out):
+    """Разбор вывода LICENSE_CHECK_CMD: служебные поля + сырой текст licctl.
+
+    Служебные строки идут до разделителя '---', ниже — дословный вывод licctl.
+    Дни — int либо None (пусто/не число: панель не дала даты или licctl не
+    нашёлся). 'raw' — что показывать оператору как есть.
+    """
+    head, sep, body = (out or '').partition('\n---\n')
+    fields = {}
+    for line in head.splitlines():
+        key, eq, value = line.partition('=')
+        if eq:
+            fields[key.strip()] = value.strip()
+
+    def days(key):
+        try:
+            return int(fields.get(key, ''))
+        except ValueError:
+            return None
+
+    return {'expire': fields.get('LIC_EXPIRE', ''),
+            'days': days('LIC_DAYS'),
+            'update': fields.get('LIC_UPDATE', ''),
+            'update_days': days('LIC_UPDATE_DAYS'),
+            'raw': (body if sep else (out or '')).strip()}
+
+
+def license_status_line(days):
+    """Строка-вердикт по остатку дней (None — дату определить не удалось)."""
+    if days is None:
+        return "❓ Дата окончания лицензии не определена"
+    if days < 0:
+        return f"❌ Лицензия истекла {-days} дн. назад"
+    if days < LICENSE_WARN_DAYS:
+        return f"⚠️ Лицензия истекает через {days} дн."
+    return f"✅ Лицензия активна, осталось {days} дн."
+
+
+def ispmanager_license_report(checker):
+    """licctl info ispmgr + остаток дней (считаем на сервере)."""
+    lines = ["=== ЛИЦЕНЗИЯ ISPmanager ==="]
+    out, err, _rc = checker.run(LICENSE_CHECK_CMD)
+    info = parse_license_info(out)
+    raw = info['raw'] or (err or '').strip()
+    if not raw:
+        # licctl молчит: чаще это отсутствие интернета, а не мёртвая лицензия.
+        # Вешать «лицензия умерла» по пустому выводу нельзя (грабля из диагностики).
+        lines.append("⚠️ licctl info ispmgr не вернул ничего.")
+        lines.append("   Чаще это отсутствие интернета на сервере, а не мёртвая")
+        lines.append("   лицензия. Проверьте сеть, затем «Лицензия: обновить».")
+        return "\n".join(lines)
+
+    if 'command not found' in raw.lower() or 'no such file' in raw.lower():
+        # Отдельная ветка: «licctl нет на машине» и «лицензия плохая» — разные
+        # диагнозы. Команда собрана с 2>&1, поэтому сообщение shell
+        # («licctl: command not found») приходит к нам в stdout и выглядело бы
+        # как «состояние лицензии».
+        lines.append("❌ licctl не найден на сервере — панель ISPmanager здесь,")
+        lines.append("   похоже, не установлена (либо путь /usr/local/mgr5 другой).")
+        lines.append(raw)
+        return "\n".join(lines)
+
+    lines.append(license_status_line(info['days']))
+    if info['expire']:
+        lines.append(f"   Окончание лицензии: {info['expire']}")
+    if info['update']:
+        upd = f"   Срок обновлений: {info['update']}"
+        if info['update_days'] is not None:
+            upd += (" (истёк)" if info['update_days'] < 0
+                    else f" (осталось {info['update_days']} дн.)")
+        lines.append(upd)
+    if 'trial' in raw.lower():
+        lines.append("   Тип: Trial — ограниченный срок, функциональность урезана")
+    lines.append("")
+    lines.append(raw)
+    if info['days'] is None:
+        # Две РАЗНЫЕ причины пустого остатка, и путать их нельзя:
+        # даты нет вовсе (другая версия licctl, свой формат) либо дата есть,
+        # но её не распознала серверная date (BusyBox/BSD: у неё нет -d).
+        if info['expire']:
+            lines.append(f"\n⚠️ Дата окончания «{info['expire']}» получена, но")
+            lines.append("   серверная date её не распознала (в BusyBox/BSD нет")
+            lines.append("   ключа -d): срок смотрите в выводе licctl выше.")
+        else:
+            lines.append("\n⚠️ Строку «Expire» найти не удалось — смотрите")
+            lines.append("   вывод выше: возможно, другой формат licctl.")
+    elif info['days'] < LICENSE_WARN_DAYS:
+        lines.append("\n→ Лицензия привязана к IP панели: после смены IP сервера")
+        lines.append("   выполните «Лицензия: обновить (licctl fetch)».")
+    return "\n".join(lines)
+
+
 # ==================== FASTPANEL: ДИАГНОСТИКА И СБРОС ПАРОЛЯ ==============
 # По KB FASTPANEL (kb.fastpanel.direct/ru/troubleshoot/): 404 на :8888 чаще
 # всего означает снятый менеджером пакетов пакет fastpanel2. Пароль fastuser

@@ -11,11 +11,14 @@ from diagnostic import (
     ispmanager_ssl_issue, ispmanager_disable, ispmanager_disable_geoip,
     ispmanager_check_cron_path, ispmanager_fix_cron_path,
     ispmanager_panel_diag, ispmanager_logs_report, ispmanager_unlock,
-    ispmanager_license_refresh,
+    ispmanager_license_refresh, ispmanager_license_report,
 )
 
 # Состав меню: (подпись пункта, имя метода класса). None — разделитель:
 # отделяет повседневные действия от разрушительных (Kill core, отключение).
+# «Проверить» стоит перед «обновить»: сначала смотрим (только чтение), потом
+# лечим — и пара лицензия/разблокировка держится рядом, это две причины
+# «панель не открывается».
 ISPMANAGER_MENU = [
     ("Диагностика панели (:1500)", "run_isp_diag"),
     ("Логи панели", "run_isp_logs"),
@@ -25,6 +28,7 @@ ISPMANAGER_MENU = [
     ("Проверить CRON PATH", "run_isp_cron"),
     ("Исправить CRON PATH", "run_isp_fix_cron"),
     ("Отключить GeoIP", "run_isp_geoip"),
+    ("Лицензия: проверить (licctl info)", "run_isp_license_check"),
     ("Лицензия: обновить (licctl fetch)", "run_isp_license"),
     ("Разблокировать панель", "run_isp_unlock"),
     None,
@@ -106,6 +110,15 @@ class IspmanagerMixin:
             return
         self._run_in_thread(ispmanager_logs_report, self.isp_menu_btn,
                             self.checker)
+
+    def run_isp_license_check(self):
+        # Только чтение (licctl info) — спрашивать нечего. Кеш 60 с, как у
+        # диагностики :1500: лицензия за минуту не «оживает», а пункт кликают
+        # подряд, когда разбираются с панелью.
+        if not self.checker:
+            return
+        self._run_in_thread(ispmanager_license_report, self.isp_menu_btn,
+                            self.checker, cache_key='isp_license')
 
     def run_isp_license(self):
         if not self.checker:
