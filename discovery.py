@@ -854,21 +854,29 @@ def first_ipv4(out):
 
 
 def parse_spf(txts):
-    """TXT домена -> {'status','detail','lookups','includes'}.
+    """TXT домена -> {'status','reason','detail','lookups','includes'}.
 
     bad — SPF нет или он такой, что приёмник его не применит; warn — SPF есть,
     но с ловушкой; ok. «TXT нет вообще» и «TXT есть, но не SPF» различаются в
     detail: во втором случае оператору стоит искать запись в другой зоне.
+
+    reason — машинночитаемый код беды ('missing', 'broken_version', 'duplicate',
+    'too_many_lookups', 'plus_all', 'no_mechanism', 'ok'). Подсказка «что
+    вставить» строится по нему, а НЕ по тексту detail: формулировки мы правим
+    ради читаемости отчёта, и подсказка, привязанная к фразе, отвалилась бы на
+    первом же перефразировании — молча, показав оператору неверную запись.
     """
     spf = [t for t in txts if t.lower().startswith('v=spf1')]
     if not spf:
         broken = [t for t in txts if t.lower().startswith('v=spf')]
         if broken:
             # Типичная опечатка: 'v=spf ' без единицы — приёмщик запись не видит
-            return {'status': 'bad', 'lookups': 1, 'includes': [],
+            return {'status': 'bad', 'reason': 'broken_version', 'lookups': 1,
+                    'includes': [],
                     'detail': 'запись начинается с „v=spf“ без 1 — SPF не '
                               'распознаётся: ' + broken[0][:80]}
-        return {'status': 'bad', 'lookups': 1, 'includes': [],
+        return {'status': 'bad', 'reason': 'missing', 'lookups': 1,
+                'includes': [],
                 'detail': (('TXT-записей у домена нет вообще' if not txts
                             else f'SPF (v=spf1) нет среди {len(txts)} TXT-записей')
                            + ' — письмо без SPF приёмники кладут в спам')}
@@ -880,35 +888,44 @@ def parse_spf(txts):
     shown = spf[0] if len(spf[0]) <= 88 else spf[0][:85] + '…'
     if len(spf) > 1:
         # RFC 7208 §3.6: две SPF-записи — это не SPF, приёмник отвечает PermError
-        return {'status': 'bad', 'lookups': lookups, 'includes': includes,
+        return {'status': 'bad', 'reason': 'duplicate', 'lookups': lookups,
+                'includes': includes,
                 'detail': f'{len(spf)} SPF-записи — по RFC 7208 это PermError, '
                           f'письма отклоняются; оставьте одну'}
     if lookups > MAX_SPF_LOOKUPS:
-        return {'status': 'bad', 'lookups': lookups, 'includes': includes,
+        return {'status': 'bad', 'reason': 'too_many_lookups',
+                'lookups': lookups, 'includes': includes,
                 'detail': f'{lookups} DNS-запросов (include: {len(includes)}) > '
                           f'{MAX_SPF_LOOKUPS} — по RFC 7208 PermError, часть '
                           f'приёмников письмо отклонит'}
     if ' redirect=' in low:
-        return {'status': 'ok', 'lookups': lookups, 'includes': includes,
-                'detail': shown + '  (redirect=)'}
+        return {'status': 'ok', 'reason': 'ok', 'lookups': lookups,
+                'includes': includes, 'detail': shown + '  (redirect=)'}
     if '+all' in low:
-        return {'status': 'bad', 'lookups': lookups, 'includes': includes,
+        return {'status': 'bad', 'reason': 'plus_all', 'lookups': lookups,
+                'includes': includes,
                 'detail': shown + ' — „+all“ разрешает отправлять с ЛЮБОГО IP, '
                                   'фильтры такую запись не учитывают'}
     if not re.search(r'(^|\s)[-?~]all(\s|$)', low):
-        return {'status': 'warn', 'lookups': lookups, 'includes': includes,
+        return {'status': 'warn', 'reason': 'no_mechanism', 'lookups': lookups,
+                'includes': includes,
                 'detail': shown + ' — нет механизма all: формально разрешены '
                                   'чужие серверы'}
-    return {'status': 'ok', 'lookups': lookups, 'includes': includes,
-            'detail': shown}
+    return {'status': 'ok', 'reason': 'ok', 'lookups': lookups,
+            'includes': includes, 'detail': shown}
 
 
 def parse_dkim(out, domain):
-    """Строки 'имя|значение' -> {'status','selectors','revoked','detail'}.
+    """Строки 'имя|значение' -> {'status','reason','selectors','revoked','detail'}.
 
     Пустой p= — отдельный случай, а не «запись есть»: так отзывают ключ, и
     подпись с такой записью получатель проверить не сможет (частая грабля после
     «чистили DNS»). Строк без v=DKIM1 (CNAME на чужую зону, мусор) не считаем.
+
+    reason ('ok' | 'short_key' | 'revoked' | 'missing') — по нему подсказка
+    решает, что можно сказать оператору: для DKIM готовую запись не выдают
+    никогда (приватный ключ живёт на сервере), и различать «нет» / «отозван» /
+    «короткий» важно, иначе совет был бы один на все три беды.
     """
     suffix = '._domainkey.' + domain.lower()
     found, short, revoked = [], [], []
@@ -945,33 +962,40 @@ def parse_dkim(out, domain):
             if len(key) < DKIM_MIN_KEY_B64:
                 short.append(selector)
     if not found and not revoked:
-        return {'status': 'bad', 'selectors': [], 'revoked': [],
+        return {'status': 'bad', 'reason': 'missing', 'selectors': [],
+                'revoked': [],
                 'detail': f'записи нет ни по одному из '
                           f'{len(MAIL_AUTH_SELECTORS)} проверенных селекторов'}
     if not found:
-        return {'status': 'bad', 'selectors': [], 'revoked': revoked,
+        return {'status': 'bad', 'reason': 'revoked', 'selectors': [],
+                'revoked': revoked,
                 'detail': f'запись есть, но p= пустой ({", ".join(revoked)}): '
                           f'ключ отозван — подпись проверить нельзя'}
     detail = 'подпись по селектору: ' + ', '.join(found[:4])
     if revoked:
         detail += f' (+{len(revoked)} с пустым p=)'
     if short:
-        return {'status': 'warn', 'selectors': found, 'revoked': revoked,
+        return {'status': 'warn', 'reason': 'short_key', 'selectors': found,
+                'revoked': revoked,
                 'detail': f'ключ короче 1024 бит: {", ".join(short[:4])} — '
                           f'строгие приёмники такую подпись не примут'}
-    return {'status': 'ok', 'selectors': found, 'revoked': revoked,
-            'detail': detail}
+    return {'status': 'ok', 'reason': 'ok', 'selectors': found,
+            'revoked': revoked, 'detail': detail}
 
 
 def parse_dmarc(txts):
-    """TXT _dmarc -> {'status','policy','rua','detail'}.
+    """TXT _dmarc -> {'status','reason','policy','rua','detail'}.
 
     Отсутствие DMARC — warn, а не bad: по RFC 7489 это рекомендация, и письма
     без него продолжают доходить. Рисовать за это ❌ нельзя.
+
+    reason ('ok' | 'missing' | 'no_policy_tag' | 'bad_policy' | 'monitoring' |
+    'no_rua') — по нему подсказка различает «записи нет вовсе» (можно выдать
+    шаблон) и «запись есть, но настроена слабо» (её правят, а не плодят вторую).
     """
     rec = next((t for t in txts if t.lower().startswith('v=dmarc1')), None)
     if not rec:
-        return {'status': 'warn', 'policy': '', 'rua': '',
+        return {'status': 'warn', 'reason': 'missing', 'policy': '', 'rua': '',
                 'detail': 'записи _dmarc нет: без DMARC SPF и DKIM к заголовку '
                           'From не применяются — поддомен могут слать от вашего '
                           'имени'}
@@ -986,22 +1010,26 @@ def parse_dmarc(txts):
         # RFC 7489 делает тег p обязательным: без него приёмник запись не
         # применяет. Назвать это «p=none» было бы враньём — режим наблюдения
         # хотя бы собирает сводки, а здесь DMARC не работает вовсе.
-        return {'status': 'warn', 'policy': '', 'rua': rua,
+        return {'status': 'warn', 'reason': 'no_policy_tag', 'policy': '',
+                'rua': rua,
                 'detail': 'нет обязательного тега p: по RFC 7489 приёмник такую '
                           'запись не применяет, DMARC не работает'}
     if policy not in ('none', 'quarantine', 'reject'):
-        return {'status': 'warn', 'policy': policy, 'rua': rua,
+        return {'status': 'warn', 'reason': 'bad_policy', 'policy': policy,
+                'rua': rua,
                 'detail': f'режим p={policy or "—"} не распознан — приёмник '
                           f'применит NONE'}
     if policy == 'none':
-        return {'status': 'warn', 'policy': policy, 'rua': rua,
+        return {'status': 'warn', 'reason': 'monitoring', 'policy': policy,
+                'rua': rua,
                 'detail': 'p=none — только наблюдение, письма не отклоняются'
                           + ('' if rua else '; rua нет — сводок не будет')}
     if not rua:
-        return {'status': 'warn', 'policy': policy, 'rua': rua,
+        return {'status': 'warn', 'reason': 'no_rua', 'policy': policy,
+                'rua': rua,
                 'detail': f'p={policy}, но rua нет: сводки о чужой рассылке с '
                           f'домена приходить не будут'}
-    return {'status': 'ok', 'policy': policy, 'rua': rua,
+    return {'status': 'ok', 'reason': 'ok', 'policy': policy, 'rua': rua,
             'detail': f'p={policy}, отчёты rua настроены'}
 
 
@@ -1044,6 +1072,152 @@ def zone_view_note(domain, zones, resolver_note=''):
     return '; '.join(bits)
 
 
+# ---------- «что вставить в DNS»: подсказки по машинночитаемым reason ----------
+# Отчёт «где чинить» оператор читает и так. Недоступный ответ — «что именно
+# вставить». Генератор строит его по полю reason, а НЕ по тексту detail:
+# формулировки отчёта правятся ради читаемости, и подсказка, привязанная к
+# фразе, отвалилась бы молча и показала бы оператору неверную запись.
+#
+# Граница честности: DKIM не генерируется НИКОГДА. Публичная TXT выводится из
+# приватного ключа, который живёт на сервере (rspamd — /etc/rspamd/dkim,
+# opendkim — /etc/opendkim/keys/<домен>/; панель FASTPANEL кладёт свою копию в
+# раздел «Почта → DKIM»). Выдуманная «готовая» DKIM-запись = подпись, которую
+# приёмник отвергнет, а оператор решит, что «мы всё сделали». Поэтому для DKIM
+# даётся только путь, где взять настоящую запись.
+#
+# SPF собирается из фактов, которые мы уже достали этим прогоном (A-запись), —
+# новых запросов подсказка не стоит. ~all, а не -all: жёсткий запрет ломает
+# доставку через сторонние ретрансляторы (CRM, рассылки), а softfail письмо не
+# отклоняет — это безопасная точка старта, а не финальная настройка.
+def spf_suggestion(ip=''):
+    """Стартовая SPF-запись из фактических данных домена.
+
+    Механизмы выбираются по тому, что реально известно: ip4 — только если мы
+    видим ПУБЛИЧНЫЙ IPv4 домена, иначе a (справит приёмник, IP может
+    смениться). mx добавляется всегда: для домена, который только принимает
+    почту, шлюзом часто значится именно MX-хост. ~all вместо -all — не
+    перестраховка: -all отклоняет письма от CRM/рассылок, которые оператор
+    ещё не внёс в запись.
+    """
+    return f'v=spf1 {spf_basis(ip)[0]} mx ~all'
+
+
+def spf_basis(ip=''):
+    """(механизм, откуда он взялся) — подпись обязана соответствовать записи.
+
+    Три разных случая, и путать их нельзя: ложная подпись «из A-записи» под
+    записью с механизмом a оператор проглотит не глядя, а скопированная в зону
+    SPF ломает доставку всего домена.
+
+    Приватный адрес (10.x, 192.168.x, 172.16-31.x, 127.x) — отдельный случай,
+    а не частность: его даёт локальная зона или домен за NAT. Публичный SPF с
+    ip4:10.0.0.5 приёмником не совпадёт никогда (он смотрит на адрес TCP-сессии),
+    поэтому предлагать его значило бы выдать заведомо мёртвую запись.
+    """
+    if not ip:
+        return 'a', ('A-запись домена не получена, поэтому механизм a, а не '
+                     'ip4: проверьте, что A-запись вообще указывает на этот сервер')
+    if _is_private_ip(ip) or ip.startswith('127.'):
+        return 'a', (f'A-запись домена — {ip}, это приватный адрес: в публичной '
+                     f'SPF он не совпадёт ни с какой сессией. Механизм a; '
+                     f'публичный IP отправки сверьте у хостера')
+    return f'ip4:{ip}', f'ip4 взят из A-записи домена ({ip})'
+
+
+def dmarc_suggestion(domain):
+    """Первый шаг DMARC: p=none + rua на сам домен (RFC 7489).
+
+    p=none ничего не отклоняет и только собирает сводки — поднять режим сразу
+    до reject без этих сводок значит дать приёмнику право убивать письма, о
+    которых мы ничего не знаем. rua на тот же домен принципиально: rua на
+    ЧУЖОЙ домен приёмник обязан верифицировать отдельным DNS-тестом, и
+    «настроенная» сводка на самом деле не приходила бы никогда.
+    """
+    return f'v=DMARC1; p=none; rua=mailto:dmarc@{domain}'
+
+
+# Пути MTA названы как «обычно так»: панель может хранить ключи в своей БД, а
+# не в файле. Поэтому подсказка указывает, ГДЕ смотреть, и запрещает брать не
+# то: в .key лежит приватный ключ, публикация его в DNS = полная компрометация
+# подписи.
+DKIM_WHERE_HINT = (
+    "готовую запись не даём: публичный ключ выводится из приватного, а он на "
+    "сервере. Включите подпись в панели (FASTPANEL: Почта → «DKIM» у домена; "
+    "ISPmanager: DKIM у почтового домена) либо возьмите TXT из ключей MTA — "
+    "обычно /etc/rspamd/dkim или /etc/opendkim/keys/<домен>/; брать .txt, "
+    "никогда не .key (там приватный ключ)")
+
+
+def mail_auth_fixes(domain, spf, dkim, dmarc, ptr_status, ip=''):
+    """Строки «что сделать» — только по reason, без новых DNS-запросов.
+
+    Возвращает [] когда чинить нечего: пустой блок честнее списка советов про
+    уже настроенный домен. Ответственность за ложь здесь прямая: неверная
+    SPF-строка, скопированная оператором в зону, ломает доставку всего домена.
+    """
+    fixes = []
+    # Основание SPF-подсказки считаем один раз: текст совета обязан описывать
+    # ровно тот механизм, который попал в строку (см. spf_basis).
+    spf_basis_note = spf_basis(ip)[1]
+
+    if spf['reason'] == 'missing':
+        # Строку берём из spf_suggestion, а не пересобираем здесь: два формата
+        # одной записи однажды разъехались бы, а оператор копирует в зону
+        # именно её — разошёлся бы формат, и в зоне оказалась бы другая запись,
+        # чем та, что мы объяснили.
+        fixes.append(f'SPF: добавить TXT „{spf_suggestion(ip)}“ — '
+                     f'{spf_basis_note}; если письмо уходит через сторонние '
+                     f'сервисы (CRM, рассылки), добавьте их include: до '
+                     f'перехода на -all')
+    elif spf['reason'] == 'broken_version':
+        fixes.append('SPF: заменить запись — должно быть „v=spf1“ с единицей, '
+                     'с „v=spf“ приёмник запись не видит')
+    elif spf['reason'] == 'duplicate':
+        fixes.append('SPF: оставить ровно одну TXT с v=spf1 — две записи по '
+                     'RFC 7208 это PermError, письма отклоняются')
+    elif spf['reason'] == 'too_many_lookups':
+        fixes.append(f'SPF: меньше {MAX_SPF_LOOKUPS} DNS-запросов — '
+                     f'сейчас {spf["lookups"]}; include: заменяйте на ip4:/a: '
+                     f'— они запросов не стоят')
+    elif spf['reason'] == 'plus_all':
+        fixes.append('SPF: „+all“ заменить на „~all“ — +all разрешает '
+                     'отправлять с ЛЮБОГО IP, фильтры запись игнорируют')
+    elif spf['reason'] == 'no_mechanism':
+        fixes.append('SPF: дописать в конец „~all“ — без механизма all чужие '
+                     'серверы формально не запрещены')
+
+    if dkim['reason'] == 'missing':
+        fixes.append('DKIM: ' + DKIM_WHERE_HINT)
+    elif dkim['reason'] == 'revoked':
+        fixes.append('DKIM: p= пустой — ключ отозван; выпускать новый и '
+                     'публиковать новую TXT, старую запись не «реанимировать»')
+    elif dkim['reason'] == 'short_key':
+        fixes.append('DKIM: сгенерировать ключ 2048 бит и перевыпустить запись '
+                     '(подписи с коротким ключом часть приёмников не принимает)')
+
+    if dmarc['reason'] == 'missing':
+        fixes.append(f'DMARC: добавить TXT на _dmarc.{domain} '
+                     f'„{dmarc_suggestion(domain)}“ — p=none только собирает '
+                     f'сводки, ничего не отклоняя; режим поднимут после них')
+    elif dmarc['reason'] == 'no_policy_tag':
+        fixes.append('DMARC: добавить обязательный тег p (none/quarantine/'
+                     'reject) — без него приёмник запись не применяет')
+    elif dmarc['reason'] == 'bad_policy':
+        fixes.append('DMARC: p= принимает none, quarantine или reject — '
+                     'остальное трактуется как none')
+    elif dmarc['reason'] == 'monitoring':
+        fixes.append('DMARC: p=none безопасен; когда rua-сводки покажут, что '
+                     'чужой рассылки нет, поднимите до p=quarantine')
+    elif dmarc['reason'] == 'no_rua':
+        fixes.append(f'DMARC: добавить rua=mailto:dmarc@{domain} — иначе '
+                     f'сводок о чужой рассылке с домена не будет')
+
+    if ptr_status == 'bad':
+        fixes.append(f'PTR: запросить обратную запись для {ip} у владельца '
+                     f'адреса (хостер/дата-центр) — из панели она не настраивается')
+    return fixes
+
+
 def summarize_mail_auth(domain, spf_out, dmarc_out, dkim_out, ptr_out,
                         ip='', note='', header=True):
     """(вердикт, строки) по СЫРЫМ выводам dig — чистая, все ветки в тестах.
@@ -1081,6 +1255,10 @@ def summarize_mail_auth(domain, spf_out, dmarc_out, dkim_out, ptr_out,
     lines.append(f'{pad}DKIM  {dkim["detail"]}{dkim_note}')
     lines.append(f'{pad}DMARC {dmarc["detail"]}')
     lines.append(f'{pad}PTR   {ptr_text}')
+    # Подсказки — только там, где чинить есть что: у настроенного домена список
+    # пуст, и дописывать «всё хорошо» некуда (вердикт ok это уже сказал).
+    for fix in mail_auth_fixes(domain, spf, dkim, dmarc, ptr_status, ip=ip):
+        lines.append(f'{pad}→ {fix}')
     if note:
         lines.append(f'{pad}⚠️ {note}')
     return verdict, lines
@@ -1106,10 +1284,11 @@ def mail_auth_lines(checker, domain, note='', header=True):
 
 MAIL_AUTH_FIX_HINT = (
     "\nКак чинить: SPF, DKIM и DMARC — DNS-записи домена, их правят там, где у "
-    "домена зона (панель → DNS либо регистратор/облако). DKIM в FASTPANEL "
-    "включается в разделе «Почта» кнопкой DKIM у домена, в ISPmanager — при "
-    "добавлении почтового домена. PTR настраивает владелец IP-адреса (хостер), "
-    "а не панель.")
+    "домена зона (панель → DNS либо регистратор/облако). Готовую строку даёт "
+    "строка «→» под соответствующей проверкой домена — её и копируют, а не "
+    "сочиняют свою. DKIM — исключение: там запись берут из ключа MTA или "
+    "включают подпись в панели (см. «→ DKIM»). PTR настраивает владелец "
+    "IP-адреса (хостер), а не панель.")
 
 
 def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
