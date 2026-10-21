@@ -28,7 +28,7 @@ import subprocess
 import pytest
 
 import discovery as dc
-from support import FakeSSH
+from support import FakeSSH, FakeSftpClient
 
 
 # ==================== ЧИСТЫЕ ПАРСЕРЫ ====================
@@ -681,19 +681,24 @@ class TestMailboxCommands:
 
     def test_isp_create_matches_kb_script(self):
         # KB ispmanager (массовое создание): email.edit domainname/name/plid/
-        # aliases/passwd/confirm/sok=ok, БЕЗ elid — именно создание
-        cmd = dc.isp_mailbox_create_command('info', 'example.com', 'Sec ret1')
+        # aliases/sok=ok, БЕЗ elid — именно создание. Пароль — отдельным -e
+        # (ISPsystem, «Mgrctl utility»), в argv его нет вовсе.
+        cmd = dc.isp_mailbox_env_command(
+            dc.isp_mailbox_create_args('info', 'example.com'))
         assert 'email.edit' in cmd and 'elid' not in cmd
         assert 'domainname=example.com' in cmd and 'name=info' in cmd
         assert 'plid=example.com' in cmd and "aliases=''" in cmd
         assert 'sok=ok' in cmd
-        assert "passwd='Sec ret1'" in cmd
+        assert "-e 'passwd=$DIAG_MAILBOX_SECRET'" in cmd
+        assert 'Sec ret1' not in cmd and 'passwd=Sec' not in cmd
 
     def test_isp_passwd_targets_by_full_address(self):
         # elid ящика — полный адрес (KB: email.responder elid=admin@domain.com)
-        cmd = dc.isp_mailbox_passwd_command('info@example.com', 'pw12345678')
+        cmd = dc.isp_mailbox_env_command(
+            dc.isp_mailbox_passwd_args('info@example.com'))
         assert 'email.edit' in cmd and 'elid=info@example.com' in cmd
         assert 'sok=ok' in cmd
+        assert "-e 'confirm=$DIAG_MAILBOX_SECRET'" in cmd
 
     def test_isp_delete_uses_email_delete(self):
         cmd = dc.isp_mailbox_delete_command('info@example.com')
@@ -715,20 +720,39 @@ class TestMailboxCommands:
         with pytest.raises((ValueError, TypeError)):
             dc.fp_mailbox_delete_command('7; rm -rf /')
 
+    def test_env_file_keeps_tainted_password_as_one_value(self):
+        """Заражённый пароль в env-файле обязан остаться ОДНИМ значением.
+
+        Кривое экранирование здесь опаснее, чем в argv: файл источников
+        (`.`) исполняется тем же bash, и неразрешённая кавычка превратила бы
+        $(rm -rf /) в команду на сервере.
+        """
+        evil = "x'$(rm -rf /)`tick`\"dq\" && rm -rf /"
+        content = dc.mailbox_secret_content(evil)
+        assert content.startswith('export DIAG_MAILBOX_SECRET=')
+        assert content.endswith('\n') and content.count('\n') == 1
+        proc = subprocess.run(['bash', '-n', '-c', content],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, content
+        parts = shlex.split(content.strip())
+        assert len(parts) == 2 and parts[0] == 'export', parts
+        assert parts[1].startswith('DIAG_MAILBOX_SECRET='), parts
+        # значение дошло текстом, а не развернулось в команду
+        assert '$(rm -rf /)' in parts[1]
+
     def test_all_commands_are_valid_shell_and_injection_safe(self):
         """Заражённое значение обязано остаться ОДНИМ параметром команды.
 
-        Считать «сколько раз встретилось rm -rf» бессмысленно: ISPmanager
-        требует passwd И confirm, то же значение входит в команду дважды — это
-        штатно. Проверяем другое: каждый токен, куда попало значение, начинается
-        с имени параметра. Кривая кавычка распала бы '$(rm -rf /)' на отдельные
+        Проверяем другое: каждый токен, куда попало значение, начинается с имени
+        параметра. Кривая кавычка распала бы '$(rm -rf /)' на отдельные
         аргументы (rm, -rf) — вот это и есть настоящая инъекция.
         """
         evil = "x'$(rm -rf /)`tick`\"dq\""
-        prefixes = ('passwd=', 'confirm=', '--password=', 'elid=')
-        for cmd in (dc.isp_mailbox_create_command('a', 'ex.com', evil),
-                    dc.isp_mailbox_passwd_command('a@ex.com', evil),
-                    dc.isp_mailbox_delete_command('a@ex.com; rm -rf /'),
+        prefixes = ('--password=', 'elid=', 'name=', 'domainname=', 'plid=')
+        for cmd in (dc.isp_mailbox_delete_command('a@ex.com; rm -rf /'),
+                    dc.isp_mailbox_env_command(
+                        dc.isp_mailbox_create_args('a; rm -rf /',
+                                                   'ex.com; rm -rf /')),
                     dc.fp_mailbox_create_command('a', 'ex.com', evil)):
             parts = shlex.split(cmd)
             tainted = [p for p in parts if 'rm -rf' in p]
@@ -740,12 +764,15 @@ class TestMailboxCommands:
                                   capture_output=True, text=True)
             assert proc.returncode == 0, cmd
 
-    def test_isp_create_passes_password_twice_by_design(self):
+    def test_isp_password_reaches_panel_twice_by_design(self):
         # passwd + confirm — требование панели (форма создания ящика). Тест
         # держит это как договор: убрав confirm, получим невнятную ошибку API.
-        parts = shlex.split(dc.isp_mailbox_create_command('a', 'ex.com', 'pw'))
-        assert parts.count('passwd=pw') == 1
-        assert parts.count('confirm=pw') == 1
+        # Обе ссылки указывают на одну переменную — секрет передаётся дважды.
+        parts = shlex.split(dc.isp_mailbox_env_command(
+            dc.isp_mailbox_create_args('a', 'ex.com')))
+        assert parts.count('-e') == 2
+        assert parts.count('passwd=$DIAG_MAILBOX_SECRET') == 1
+        assert parts.count('confirm=$DIAG_MAILBOX_SECRET') == 1
 
 
 # ============ ОПЕРАЦИИ С ЯЩИКАМИ: пред-проверки и маскирование ============
@@ -858,11 +885,18 @@ class TestIspRows:
 class TestRedactSecrets:
     def test_password_with_space_is_fully_masked(self):
         # Regression: регэксп по пробелам съедал только первое слово,
-        # 'sup3r secret' уезжал в отчёт наполовину
-        cmd = dc.isp_mailbox_create_command('a', 'ex.com', 'sup3r secret')
-        out = dc.redact_secrets(cmd)
+        # 'sup3r secret' уезжал в отчёт наполовину. В argv ISPmanager пароля
+        # теперь нет вовсе — но панель может вернуть его в тексте ошибки.
+        out = dc.redact_secrets("panel reply: passwd='sup3r secret' rejected")
         assert 'sup3r' not in out and 'secret' not in out
-        assert 'passwd=***' in out and 'confirm=***' in out
+        assert 'passwd=***' in out
+
+    def test_env_reference_is_not_masked(self):
+        # -e 'passwd=$DIAG_MAILBOX_SECRET' — НЕ секрет, в нём только имя
+        # переменной. Замаскировав её, мы лишаем оператора возможности
+        # повторить команду руками (главная ценность показа команды).
+        cmd = dc.isp_mailbox_env_command(dc.isp_mailbox_create_args('a', 'ex.com'))
+        assert dc.redact_secrets(cmd) == cmd
 
     def test_plain_values_masked(self):
         out = dc.redact_secrets(dc.fp_mailbox_create_command('a', 'ex.com',
@@ -916,14 +950,25 @@ class TestFindFpMailboxId:
 ISP_LIST = "mgrctl -m ispmgr email 2>&1"
 
 
-def isp_env(lists, edit=('maildomain', 'name=example.com elid=3\n')):
+# Каталог под env-файл берётся из mktemp: без маршрута на него новый код
+# ЧЕСТНО отказывается (пароль нельзя передать безопасно) — падение теста с
+# «mktemp не создал каталог» означает именно это, а не поломку операций.
+SECRET_DIR = '/tmp/diagn_mail.TESTDIR'
+
+
+def isp_env(lists, edit=('maildomain', 'name=example.com elid=3\n'),
+            mktemp=(SECRET_DIR + '\n', '', 0), sftp='auto'):
     """FakeSSH с почтовым доменом, списком ящиков (последовательность) и edit."""
-    return FakeSSH(routes=[
+    routes = [
         ('mgrctl -m ispmgr maildomain', edit[1]),
         ('mgrctl -m ispmgr email.edit', ('', '', 0)),
         ('mgrctl -m ispmgr email.delete', ('', '', 0)),
+        ('mktemp -d', mktemp),
         (ISP_LIST, lists),
-    ])
+    ]
+    if sftp == 'auto':
+        sftp = FakeSftpClient()
+    return FakeSSH(routes=routes, client=sftp)
 
 
 class TestMailboxActionsIspmanager:
@@ -936,11 +981,16 @@ class TestMailboxActionsIspmanager:
         assert '✅ Ящик new@example.com создан' in out
         # Команда показана (повторить руками) и маска в ней
         assert '$ /usr/local/mgr5/sbin/mgrctl -m ispmgr email.edit' in out
-        assert 'passwd=***' in out and 'confirm=***' in out
+        # Показываем команду ПАНЕЛИ, а не обвязку (source/rm): её содержимое
+        # совпадает с примером из документации ISPsystem, т.е. её можно
+        # повторить руками, экспортировав переменную.
+        assert "-e 'passwd=$DIAG_MAILBOX_SECRET'" in out
+        assert 'source' not in out and out.count('rm -rf') == 0
         # Пароль не уехал ни в команду-эхо, ни в отчёт
         assert 'Sup3rSecret!' not in out
-        # Предупреждение про ps — пароль был в аргументах, это факт
-        assert 'виден в ps' in out
+        # Предупреждение обязано соответствовать каналу: в ps пароля НЕ было
+        assert 'виден в ps' not in out
+        assert 'в ps на сервере он не светился' in out
 
     def test_password_checked_before_any_panel_call(self):
         # Короткий пароль: панель не дёргается вообще (ни maildomain, ни edit)
@@ -973,8 +1023,9 @@ class TestMailboxActionsIspmanager:
             ('mgrctl -m ispmgr maildomain', 'name=example.com elid=3\n'),
             ('mgrctl -m ispmgr email.edit',
              ('ERROR=weak password', 'rc', 0)),
+            ('mktemp -d', SECRET_DIR + '\n'),
             (ISP_LIST, ''),
-        ])
+        ], client=FakeSftpClient())
         out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!',
                                 'ispmanager')
         assert 'weak password' in out
@@ -986,8 +1037,9 @@ class TestMailboxActionsIspmanager:
         c = FakeSSH(routes=[
             ('mgrctl -m ispmgr maildomain', 'name=example.com elid=3\n'),
             ('mgrctl -m ispmgr email.edit', ('', '', 0)),
+            ('mktemp -d', SECRET_DIR + '\n'),
             (ISP_LIST, ['name=info@example.com\n', 'ERROR=timeout']),
-        ])
+        ], client=FakeSftpClient())
         out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!',
                                 'ispmanager')
         assert 'список ящиков после неё не получен' in out
@@ -1025,6 +1077,113 @@ class TestMailboxActionsIspmanager:
         out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'none')
         assert 'недоступно' in out and 'mogwai' in out
         assert c.find('email.edit') is None
+
+
+class TestMailboxSecretChannel:
+    """Канал пароля мимо argv: ISPmanager либо получает секрет из окружения,
+    либо отказывается. Тихий фолбэк «посвечу пароль аргументом» запрещён —
+    он и есть тот долг, который этот канал закрывает.
+    """
+
+    def test_no_sftp_means_no_panel_call(self):
+        # checker.client=None: write_remote_file не сможет открыть SFTP.
+        # Команда панели не должна уйти НИКОГДА — без env-файла -e раскроется
+        # в пустой пароль, и панель либо откажет, либо (хуже) поставит его.
+        c = isp_env(['name=info@example.com elid=5\n'], sftp=None)
+        out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'ispmanager')
+        assert 'Не удалось записать env-файл' in out
+        assert c.find('email.edit') is None
+        # каталог, который mktemp всё-таки создал, обязан быть вычищен
+        assert c.find('rm -rf ' + SECRET_DIR) is not None
+
+    def test_no_mktemp_means_no_panel_call(self):
+        # Нет mktemp (read-only /tmp, нет coreutils) — значит нет и безопасного
+        # канала. Отказ обязан объяснять причину, а не молчать.
+        c = isp_env(['name=info@example.com elid=5\n'],
+                    mktemp=('', 'mktemp: No such file or directory', 1))
+        out = dc.mailbox_passwd(c, 'info@example.com', 'Sup3rSecret!',
+                                'ispmanager')
+        assert 'mktemp не создал каталог' in out
+        assert 'Передать пароль безопасно нельзя' in out
+        assert c.find('email.edit') is None
+
+    def test_mktemp_junk_is_not_trusted_as_a_path(self):
+        # Ответ mktemp идёт в путь, а затем в `. <путь>`. Строка, не похожая на
+        # абсолютный путь (мусор, предупреждение, многострочный вывод), не должна
+        # превращаться в команду.
+        c = isp_env(['name=info@example.com elid=5\n'],
+                    mktemp='warning: something odd\n')
+        out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'ispmanager')
+        assert '⛔' in out and c.find('email.edit') is None
+        # и тем более в команду source этот текст не попал
+        assert 'warning: something odd' not in ' '.join(
+            cmd for cmd in c.commands if cmd.startswith('.'))
+
+    def test_secret_file_is_created_0600_and_never_named_in_argv(self):
+        sftp = FakeSftpClient()
+        c = isp_env(['name=info@example.com elid=5\n',
+                     'name=info@example.com elid=5\n'
+                     'name=a@example.com elid=7\n'], sftp=sftp)
+        dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'ispmanager')
+        # файл создан ДО команды панели (иначе -e раскроется в пустой пароль)
+        assert c.find('chmod 600') is not None
+        assert c.find('chmod 600 ' + SECRET_DIR) is not None
+        assert list(sftp.store) == [SECRET_DIR + '/secret.env']
+        assert sftp.store[SECRET_DIR + '/secret.env'].startswith(
+            'export DIAG_MAILBOX_SECRET=')
+        run_idx = [i for i, cmd in enumerate(c.commands)
+                   if 'email.edit' in cmd and cmd.startswith('.')]
+        chmod_idx = [i for i, cmd in enumerate(c.commands)
+                     if cmd.startswith('chmod 600')]
+        assert run_idx and chmod_idx and chmod_idx[0] < run_idx[0]
+
+    def test_password_never_reaches_the_server_command_line(self):
+        # Главный гард слайса: ни в одной отправленной команде пароля нет.
+        # Раньше он был и в passwd=..., и в confirm=... (дважды на команду).
+        sftp = FakeSftpClient()
+        c = isp_env(['name=info@example.com elid=5\n',
+                     'name=info@example.com elid=5\n'
+                     'name=a@example.com elid=7\n'], sftp=sftp)
+        dc.mailbox_passwd(c, 'info@example.com', 'Sup3r secret with spaces',
+                          'ispmanager')
+        assert not [cmd for cmd in c.commands if 'Sup3r' in cmd]
+        # секрет дошёл до панели: в env-файле он есть (и только там)
+        assert "Sup3r secret with spaces" in sftp.store[
+            SECRET_DIR + '/secret.env']
+
+    def test_secret_dir_removed_even_if_panel_errors(self):
+        # Панель ответила ошибкой — файл с паролем всё равно обязан исчезнуть.
+        # Очистка двойная: rm -rf внутри составной команды (после rc=$?) и
+        # страховкой на python-стороне — команда может не дойти до своего rm,
+        # если оператор отменил задачу (канал закрывается).
+        # Маршрут email.edit задаём СВОИМ списком: FakeSSH берёт первое
+        # совпадение, вставка в routes после общего email.edit ничего бы не
+        # изменила (прожжённая грабля подстрок).
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr maildomain', 'name=example.com elid=3\n'),
+            ('mgrctl -m ispmgr email.edit', ('ERROR=weak password', '', 1)),
+            ('mktemp -d', SECRET_DIR + '\n'),
+            (ISP_LIST, 'name=info@example.com elid=5\n'),
+        ], client=FakeSftpClient())
+        out = dc.mailbox_create(c, 'a@example.com', 'Sup3rSecret!', 'ispmanager')
+        assert '❌ Панель ответила ошибкой (rc=1)' in out
+        assert 'weak password' in out
+        assert 'Sup3rSecret!' not in out                 # и в ошибке панели не светится
+        assert 'rm -rf ' + SECRET_DIR + ' 2>/dev/null' in c.commands
+        wrapped = [cmd for cmd in c.commands if cmd.startswith('. ')]
+        assert wrapped and 'rm -rf ' + SECRET_DIR in wrapped[0]
+
+    def test_full_wrapped_command_is_valid_shell(self):
+        # Команда с `. файла`, &&, rc=$? и rm -rf — составная; её обязан
+        # принимать bash -n наравне с остальными командами проекта.
+        cmd = dc.isp_secret_run_command(
+            SECRET_DIR, dc.isp_mailbox_create_args('a; x', "ex'.com"))
+        proc = subprocess.run(['bash', '-n', '-c', cmd],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        shlex.split(cmd)
+        # rc снимается ДО rm: иначе провал панели выглядел бы успехом
+        assert cmd.index('rc=$?') < cmd.index('rm -rf')
 
 
 class TestMailboxActionsFastpanel:
