@@ -30,15 +30,25 @@ class _Btn:
 
 
 class _Dialogs:
-    """Двойник messagebox: askyesno отдаёт askyesno_ret и пишет обращения."""
+    """Двойник messagebox + simpledialog: ответы отдаются, обращения пишутся.
 
-    def __init__(self, askyesno_ret=True):
+    askstring нужен обработчику «Активировать по ключу»: он спрашивает секрет,
+    поэтому показывается и `show` — ключ обязан вводиться со звёздочками.
+    """
+
+    def __init__(self, askyesno_ret=True, askstring_ret=None):
         self.askyesno_ret = askyesno_ret
+        self.askstring_ret = askstring_ret
         self.asked = []
+        self.askstring_called = []
 
     def askyesno(self, title, msg, parent=None):
         self.asked.append((title, msg))
         return self.askyesno_ret
+
+    def askstring(self, title, prompt, show=None, parent=None, **kw):
+        self.askstring_called.append((title, prompt, show))
+        return self.askstring_ret
 
     def showerror(self, *a, **k):
         pass
@@ -52,6 +62,9 @@ class _Host(IspmanagerMixin):
         self.root = None
         self.isp_menu_btn = _Btn()
         self.calls = []
+        # Живой DiagnosticApp имеет кеш диагностики (gui.py) — обработчик
+        # активации обязан его протухать, поэтому заглушке тоже есть что терять.
+        self._diag_cache = {}
 
     def _run_in_thread(self, target_func, btn=None, *args, **kwargs):
         self.calls.append((target_func, btn, args, kwargs))
@@ -195,3 +208,128 @@ class TestUnlockAndLicense:
         assert args == (checker,)
         assert kwargs == {}
         assert dialogs.asked, "обработчик обязан спросить подтверждение"
+
+
+# ===== «Лицензия ▾ → Активировать по ключу»: секрет спрашивается ПОСЛЕ спроса =====
+class TestLicenseActivateHandler:
+    """Три порядка, которые здесь важны.
+
+    1. Подтверждение ДО запроса ключа: спросить секрет, а потом отказаться,
+       — плохой разговор с оператором (у него уже спрашивали пароль).
+    2. Отмена диалога ключа не отправляет на сервер НИЧЕГО.
+    3. Кеш отчёта «Проверить» обязан протухнуть: показать состояние «до»
+       сразу после того, как мы его поменяли, — значит соврать оператору.
+    """
+
+    def test_declined_confirmation_never_asks_for_key(self, monkeypatch):
+        host = _Host(FakeSSH())
+        dialogs = _Dialogs(askyesno_ret=False, askstring_ret='SOME-KEY')
+        monkeypatch.setattr(gui_isp, "messagebox", dialogs)
+        monkeypatch.setattr(gui_isp, "simpledialog", dialogs)
+        host.run_isp_license_activate()
+        assert host.calls == []
+        assert dialogs.asked, "пункт обязан спросить подтверждение"
+        assert dialogs.askstring_called == [], "ключ спрашивается после согласия"
+
+    def test_cancelled_key_dialog_runs_nothing(self, monkeypatch):
+        host = _Host(FakeSSH())
+        dialogs = _Dialogs(askyesno_ret=True, askstring_ret=None)
+        monkeypatch.setattr(gui_isp, "messagebox", dialogs)
+        monkeypatch.setattr(gui_isp, "simpledialog", dialogs)
+        host.run_isp_license_activate()
+        assert host.calls == []
+        assert dialogs.askstring_called, "согласившемуся оператору показан ввод"
+
+    def test_confirmed_key_goes_to_backend(self, monkeypatch):
+        checker = FakeSSH()
+        host = _Host(checker)
+        dialogs = _Dialogs(askyesno_ret=True, askstring_ret='K1-ABCD-1234')
+        monkeypatch.setattr(gui_isp, "messagebox", dialogs)
+        monkeypatch.setattr(gui_isp, "simpledialog", dialogs)
+        host.run_isp_license_activate()
+        assert len(host.calls) == 1
+        fn, btn, args, kwargs = host.calls[0]
+        assert fn is gui_isp.ispmanager_license_activate
+        assert btn is host.isp_menu_btn
+        # Ключ — второй аргумент бэкенда (первым идёт checker) и без cache_key:
+        # закешированный отчёт активации бессмысленен.
+        assert args == (checker, 'K1-ABCD-1234')
+        assert kwargs == {}
+
+    def test_key_is_masked_on_screen(self, monkeypatch):
+        # show='*': ключ вводят/вставляют, а не читают через плечо оператора.
+        host = _Host(FakeSSH())
+        dialogs = _Dialogs(askyesno_ret=True, askstring_ret='K1-ABCD-1234')
+        monkeypatch.setattr(gui_isp, "messagebox", dialogs)
+        monkeypatch.setattr(gui_isp, "simpledialog", dialogs)
+        host.run_isp_license_activate()
+        assert dialogs.askstring_called
+        _title, _prompt, show = dialogs.askstring_called[0]
+        assert show == '*'
+
+    def test_stale_license_report_cache_is_dropped(self, monkeypatch):
+        checker = FakeSSH()
+        host = _Host(checker)
+        host._diag_cache = {'isp_license': (0.0, '❌ Лицензия истекла'),
+                            'isp_diag': (0.0, 'что-то ещё')}
+        dialogs = _Dialogs(askyesno_ret=True, askstring_ret='K1-ABCD-1234')
+        monkeypatch.setattr(gui_isp, "messagebox", dialogs)
+        monkeypatch.setattr(gui_isp, "simpledialog", dialogs)
+        host.run_isp_license_activate()
+        assert 'isp_license' not in host._diag_cache
+        # Чужие кеши трогать незачем — протухает ровно то, что изменилось.
+        assert 'isp_diag' in host._diag_cache
+        assert len(host.calls) == 1
+
+    def test_warning_in_confirmation_names_real_risks(self, monkeypatch):
+        # Подтверждение обязано говорить настоящие риски, а не абстрактное
+        # «вы уверены?»: одноразовость ключа и видимость его в ps.
+        host = _Host(FakeSSH())
+        dialogs = _Dialogs(askyesno_ret=False)
+        monkeypatch.setattr(gui_isp, "messagebox", dialogs)
+        monkeypatch.setattr(gui_isp, "simpledialog", dialogs)
+        host.run_isp_license_activate()
+        text = " ".join(msg for _t, msg in dialogs.asked)
+        assert 'одноразов' in text and 'ps' in text
+        assert 'Обновить под IP' in text   # подсказка, как не сжигать ключ
+
+
+class TestLicenseSubmenu:
+    """Лицензия собрана в подменю: основной список не разрастается.
+
+    Разделитель None в составе меню — не пара (подпись, значение), поэтому
+    распаковку делает общий _entries: тест, который её не фильтрует, падает
+    на распаковке None и ничего не проверяет.
+    """
+
+    @staticmethod
+    def _entries():
+        return [e for e in ISPMANAGER_MENU if e is not None]
+
+    def test_license_group_is_a_submenu(self):
+        labels = dict(self._entries())
+        assert 'Лицензия ▾' in labels
+        assert isinstance(labels['Лицензия ▾'], list)
+
+    def test_submenu_order_is_read_then_treat_then_spend_key(self):
+        sub = dict(self._entries())['Лицензия ▾']
+        assert [m for _l, m in sub] == ["run_isp_license_check",
+                                        "run_isp_license",
+                                        "run_isp_license_activate"]
+
+    def test_flat_list_did_not_grow(self):
+        # Три лицензионных операции не занимают три строки верхнего меню:
+        # плоских пунктов ровно 11 (было 10 до подменю и до его появления).
+        flat = [v for _l, v in self._entries() if not isinstance(v, list)]
+        assert len(flat) == 11
+
+    def test_no_license_items_left_in_flat_menu(self):
+        assert not [l for l, v in self._entries()
+                    if not isinstance(v, list) and l.startswith('Лицензия')]
+
+    def test_submenu_handlers_reach_the_class(self):
+        # Вложенные обработчики живут на миксине так же, как плоские:
+        # getattr в _fill_panel_menu достанет их по имени при построении меню.
+        host = _Host()
+        for name in menu_handlers(dict(self._entries())['Лицензия ▾']):
+            assert callable(getattr(host, name, None)), name

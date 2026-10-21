@@ -860,6 +860,124 @@ class TestMailboxGuard:
         assert c.commands == []
 
 
+# ============ РОДИТЕЛЬ ЯЩИКА (plid) БЕРЁТСЯ ИЗ ПАНЕЛИ ======================
+class TestMailParent:
+    """plid — parent list unique identifier, т.е. name элемента maildomain
+    (ISPsystem, «Service parameters»). Значит его нельзя вырезать из ввода
+    оператора: берём из списка панели — тем написанием, каким его хранит панель.
+    """
+
+    def test_canonical_name_comes_from_panel_not_from_input(self):
+        # Панель хранит домен «Example.COM»; оператор ввёл lower. Резолв обязан
+        # вернуть написание панели — email.edit принимает именно его.
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=Example.COM elid=3\n')])
+        name, why = dc.isp_mail_parent(c, 'example.com')
+        assert name == 'Example.COM' and why is None
+
+    def test_error_list_is_not_treated_as_empty(self):
+        # «Панель ответила ошибкой» и «почтовых доменов нет» — разные ответы.
+        # По ошибке резолв запрещён: plid уехал бы наугад.
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'ERROR: connection refused\n')])
+        name, why = dc.isp_mail_parent(c, 'example.com')
+        assert name is None
+        assert 'Панель не вернула список почтовых доменов' in why
+        # Причина с первой строкой ответа панели: оператору нужно видеть, ЧТО
+        # именно сказал mgrctl, а не только «мы не смогли».
+        assert 'connection refused' in why
+
+    def test_valid_empty_list_is_a_real_absence(self):
+        # mgrctl ответил чисто и пустотой: домена правда нет — отказ со списком
+        # (пустым), а не «панель не ответила».
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain', '')])
+        name, why = dc.isp_mail_parent(c, 'example.com')
+        assert name is None
+        assert 'не найден среди почтовых доменов панели' in why
+        assert 'maildomain: —' in why
+
+    def test_missing_domain_lists_known_parents(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=alpha.tld elid=1\nname=beta.tld elid=2\n')])
+        name, why = dc.isp_mail_parent(c, 'gamma.tld')
+        assert name is None and 'alpha.tld, beta.tld' in why
+
+
+class TestMailboxCreateParentResolution:
+    """Создание ящика: без подтверждённого родителя команда панели не уходит.
+
+    Роль резолва именно в этом: guard пропускает домен, найденный где угодно
+    (панель, postfix-карты, dovecot), а plid обязан быть элементом maildomain.
+    Домен, который postfix принимает, но панель как почтовый не знает, — ровно
+    тот случай, когда раньше уезжал plid=<строка из адреса>.
+    """
+
+    @staticmethod
+    def _env(maildomain, virtual='catch@legacy.tld\n', boxes=('', '')):
+        sftp = FakeSftpClient()
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr maildomain', maildomain),
+            ('postfix/virtual', virtual),
+            (ISP_LIST, boxes),
+            ('mgrctl -m ispmgr email.edit', ('', '', 0)),
+            ('mktemp -d', SECRET_DIR + '\n'),
+        ], client=sftp)
+        return c, sftp
+
+    def test_domain_known_only_to_postfix_is_refused(self):
+        c, sftp = self._env('name=other.tld elid=3\n')
+        out = dc.mailbox_create(c, 'info@legacy.tld', 'Sup3rSecret!',
+                                'ispmanager')
+        # Guard домен пропустил (postfix его принимает) — и именно резолв
+        # остановил операцию: панели такой родитель неизвестен.
+        assert '⛔' in out and 'не найден среди почтовых доменов панели' in out
+        assert c.find('email.edit') is None
+        assert c.find('mktemp') is None
+        # Секрет не готовился там, где операция уже отменена.
+        assert sftp.store == {} or all('DIAG_MAILBOX_SECRET' not in v
+                                       for v in sftp.store.values())
+
+    def test_parent_refusal_happens_before_secret_is_written(self):
+        # Порядок принципиален: сначала родитель, потом env-файл с паролем.
+        c, _ = self._env('')                      # maildomain пуст
+        dc.mailbox_create(c, 'info@other.tld', 'Sup3rSecret!', 'ispmanager')
+        order = [cmd for cmd in c.commands
+                 if 'maildomain' in cmd or 'mktemp' in cmd or 'email.edit' in cmd]
+        assert order and 'maildomain' in order[0]
+        assert not [cmd for cmd in order if 'mktemp' in cmd or 'email.edit' in cmd]
+
+    def test_panel_writing_is_used_in_plid_and_shown_to_operator(self):
+        c, _ = self._env('name=Example.COM elid=3\n', virtual='',
+                         boxes=['', 'name=new@example.com elid=6\n'])
+        out = dc.mailbox_create(c, 'new@example.com', 'Sup3rSecret!',
+                                'ispmanager')
+        # Разница написаний обязана быть показана, иначе оператор решит, что
+        # панель завела ящик «на другой домен».
+        assert 'ℹ️ Родитель-домен взят из панели: Example.COM' in out
+        assert 'в запросе было example.com' in out
+        edit = c.find('email.edit')
+        assert 'plid=Example.COM' in edit and 'domainname=Example.COM' in edit
+        assert '✅ Ящик new@example.com создан' in out
+
+    def test_identical_writing_adds_no_notice(self):
+        c, _ = self._env('name=example.com elid=3\n', virtual='',
+                         boxes=['', 'name=new@example.com elid=6\n'])
+        out = dc.mailbox_create(c, 'new@example.com', 'Sup3rSecret!',
+                                'ispmanager')
+        assert 'Родитель-домен взят из панели' not in out   # шуметь не о чем
+        assert '✅ Ящик new@example.com создан' in out
+
+    def test_passwd_does_not_need_parent_resolution(self):
+        # Смена пароля идёт по elid (полный адрес) — родителя не резолвим и
+        # maildomain не читаем лишний раз сверх guard'а.
+        c = isp_env(['name=info@example.com elid=5\n'] * 2)
+        out = dc.mailbox_passwd(c, 'info@example.com', 'Sup3rSecret!',
+                                'ispmanager')
+        assert '✅ Ящик info@example.com: пароль изменён' in out
+        assert c.count('mgrctl -m ispmgr maildomain') == 1   # только guard
+        assert 'Родитель-домен' not in out
+
+
 class TestIspRows:
     def test_ok_rows(self):
         c = FakeSSH(routes=[('mgrctl -m ispmgr email',

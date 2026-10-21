@@ -12,6 +12,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import pytest
 import shlex
 
 from support import FakeSSH
@@ -255,6 +256,9 @@ class TestGeneratedCommandsAreValidShell:
         # Лицензия «только чтение»: команда собрана из кучи подстановок и
         # shell-функции — её обязан проверить bash -n наравне с остальными
         panels_mod.ispmanager_license_report(c)
+        # Активация по ключу: ключ идёт аргументом и обязан быть экранирован —
+        # именно такие команды ломаются кавычками чаще всего
+        panels_mod.ispmanager_license_activate(c, "KEY'with;space`tick`")
         panels_mod.fastpanel_package_status(c)
         panels_mod.fastpanel_diag(c)
         panels_mod.fastpanel_reset_password(c, "Passw0rd 'quoted\"")
@@ -599,6 +603,150 @@ class TestIspmanagerLicenseReport:
             info = panels_mod.parse_license_info(text)
             assert info['days'] is None
             assert info['raw'] is not None
+
+
+# ======= ISPmanager: АКТИВАЦИЯ ЛИЦЕНЗИИ ПО КЛЮЧУ (licctl fetch mgrName key) ==
+# Синтаксис — официальный док ISPsystem «Activating a license with a key»:
+#     /usr/local/mgr5/sbin/licctl fetch mgrName key
+# Формы «licctl activate ...» в официальной документации НЕТ (она встречается
+# только в сторонних KB) — гард test_no_invented_activate_subcommand не даст
+# занести её в код после нас.
+KEY = 'K1-TESTKEY-0000'
+
+
+class TestIspmanagerLicenseActivate:
+    """licctl fetch ispmgr <ключ>, и вердикт — по ПЕРЕЧИТАННОМУ licctl info.
+
+    Код возврата licctl нам не доказательство, поэтому licctl info вызывается
+    всегда (в том числе после ошибки) и вердикт пишется по состоянию лицензии.
+    """
+
+    @staticmethod
+    def _srv(**kw):
+        return TestIspmanagerLicenseReport._srv(**kw)
+
+    @staticmethod
+    def _fake(fetch=('', '', 0), info=None):
+        return FakeSSH(routes=[
+            ('licctl fetch ispmgr', fetch),
+            ('licctl info ispmgr 2>&1 | head -n 20',
+             TestIspmanagerLicenseActivate._srv(**(info or {}))),
+        ])
+
+    # ---------- отказ ДО отправки ----------
+    def test_empty_key_refuses_without_any_command(self):
+        c = FakeSSH()
+        out = panels_mod.ispmanager_license_activate(c, '   ')
+        assert '⛔ Ключ активации не задан' in out
+        assert 'Ни одна команда на сервер не отправлялась' in out
+        assert c.commands == []
+
+    def test_none_key_refuses_without_any_command(self):
+        c = FakeSSH()
+        assert '⛔' in panels_mod.ispmanager_license_activate(c, None)
+        assert c.commands == []
+
+    def test_fetch_without_key_is_a_different_operation(self):
+        # licctl fetch БЕЗ ключа перетягивает лицензию на текущий IP. Молча
+        # отправить её вместо активации — значит тронуть лицензию не тем
+        # действием, поэтому отказ обязан называть альтернативный пункт.
+        out = panels_mod.ispmanager_license_activate(FakeSSH(), '')
+        assert 'перетягивает' in out and 'Обновить под IP' in out
+
+    @pytest.mark.parametrize('bad', ['ABC DEF', 'ABC\nDEF', 'ABC\tDEF'])
+    def test_key_with_whitespace_is_refused(self, bad):
+        # Инъекции тут не было бы и без проверки (q() экранирует), но licctl
+        # принял бы мусор как ключ и сжёг ОДНОРАЗОВЫЙ ключ зря.
+        c = FakeSSH()
+        out = panels_mod.ispmanager_license_activate(c, bad)
+        assert 'не должен содержать пробелов и переносов' in out
+        assert c.commands == []
+
+    # ---------- сама команда ----------
+    def test_command_matches_official_documentation(self):
+        c = self._fake()
+        panels_mod.ispmanager_license_activate(c, KEY)
+        assert c.count('licctl fetch') == 1
+        parts = shlex.split(c.find('licctl fetch'))
+        assert parts[:4] == ['/usr/local/mgr5/sbin/licctl', 'fetch',
+                             'ispmgr', KEY]
+
+    def test_no_invented_activate_subcommand(self):
+        # «licctl activate» — синтаксис из сторонней KB. Если кто-то (в т.ч.
+        # следующий коммит) занесёт его в код — падает тест, а не сервер.
+        c = self._fake()
+        panels_mod.ispmanager_license_activate(c, KEY)
+        assert not [cmd for cmd in c.commands if 'activate' in cmd]
+
+    def test_weird_key_stays_one_argument(self):
+        evil = "AB'CD;touch"
+        c = self._fake()
+        panels_mod.ispmanager_license_activate(c, evil)
+        parts = shlex.split(c.find('licctl fetch'))
+        assert parts[3] == evil                      # значение дошло целиком
+        assert 'touch' not in parts                  # отдельной команды нет
+
+    # ---------- ключ обязан оставаться секретом отчёта ----------
+    def test_key_never_appears_in_report(self):
+        c = self._fake()
+        out = panels_mod.ispmanager_license_activate(c, KEY)
+        assert KEY not in out
+        assert 'licctl fetch ispmgr *** 2>&1' in out   # смысл виден, ключ — нет
+
+    def test_key_repeated_by_licctl_is_masked(self):
+        # licctl способен напечатать ключ в сообщении об ошибке — отчёт обязан
+        # быть чистым: его сохраняют в файл и пересылают в тикет.
+        c = self._fake(fetch=(f'invalid key {KEY} for this IP', '', 1))
+        out = panels_mod.ispmanager_license_activate(c, KEY)
+        assert KEY not in out
+        assert 'invalid key *** for this IP' in out
+
+    # ---------- подтверждение фактом, а не кодом возврата ----------
+    def test_info_is_reread_even_after_error(self):
+        c = self._fake(fetch=('', 'network unreachable', 1))
+        out = panels_mod.ispmanager_license_activate(c, KEY)
+        assert '❌ Ошибка (rc=1): network unreachable' in out
+        assert c.count('licctl info ispmgr') == 1
+        assert '✅ Лицензия активна' not in out
+
+    def test_success_verdict_from_reread_state(self):
+        c = self._fake(info={'days': '200', 'update_days': '400'})
+        out = panels_mod.ispmanager_license_activate(c, KEY)
+        assert '✅ Лицензия активна после запроса по ключу.' in out
+        assert 'Окончание лицензии: 2025-07-11' in out
+
+    def test_accepted_but_still_expired_is_not_called_success(self):
+        # Ключ мог быть уже использован: licctl молчит, состояние не меняется.
+        c = self._fake(info={})
+        out = panels_mod.ispmanager_license_activate(c, KEY)
+        assert 'НЕ активна' in out and 'Перевыпустите' in out
+        assert '✅ Лицензия активна' not in out
+
+    def test_unknown_date_is_not_reported_as_active(self):
+        # Третья ветка: сервер не дал понятной даты. Рапортовать «активна»
+        # нельзя — это не доказательство активации.
+        c = self._fake(info={'days': '', 'update_days': ''})
+        out = panels_mod.ispmanager_license_activate(c, KEY)
+        assert 'подтвердить нельзя' in out
+        assert '✅ Лицензия активна' not in out
+
+    def test_silent_info_after_activation_says_so(self):
+        c = FakeSSH(routes=[
+            ('licctl fetch ispmgr', ('', '', 0)),
+            ('licctl info ispmgr 2>&1 | head -n 20', ''),
+        ])
+        out = panels_mod.ispmanager_license_activate(c, KEY)
+        assert 'не вернул ничего' in out
+        assert '✅ Лицензия активна' not in out
+
+    # ---------- честность про канал передачи ключа ----------
+    def test_one_time_key_and_ps_warning(self):
+        c = self._fake(info={'days': '200', 'update_days': '400'})
+        out = panels_mod.ispmanager_license_activate(c, KEY)
+        assert 'Ключ активации одноразовый' in out
+        # Врать про «безопасный канал» там, где его нет, нельзя: licctl не
+        # умеет принимать ключ из окружения (в отличие от mgrctl -e $ENV).
+        assert 'был виден в ps' in out and 'mgrctl -e' in out
 
 
 # ============== FASTPANEL: ДИАГНОСТИКА И СБРОС ПАРОЛЯ ======================

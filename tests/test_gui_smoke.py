@@ -125,15 +125,21 @@ class TestNoLostSelfAttributes:
         """Каждый пункт меню панели обязан вести на реальный метод класса.
 
         Меню собирается через getattr, поэтому `command=self.*`-скан его не
-        видит; проверяем состав списков напрямую.
+        видит; проверяем состав списков напрямую. Сбор имён — общий
+        menu_handlers: он разворачивает подменю (локальная распаковка item[1]
+        на подменю даёт список вместо имени и hasattr на нём падает, а не
+        находит ошибку) и фильтрует разделители.
         """
+        from support import menu_handlers
         from gui_isp import ISPMANAGER_MENU
         from gui_fastpanel import FASTPANEL_MENU
         from gui_bitrix import BITRIX_MENU
+        from gui_hosting import HOSTING_MENU
         for name, items in (('ISPMANAGER_MENU', ISPMANAGER_MENU),
                             ('FASTPANEL_MENU', FASTPANEL_MENU),
-                            ('BITRIX_MENU', BITRIX_MENU)):
-            methods = [m for item in items if item is not None for m in (item[1],)]
+                            ('BITRIX_MENU', BITRIX_MENU),
+                            ('HOSTING_MENU', HOSTING_MENU)):
+            methods = menu_handlers(items)
             assert methods, f'{name} пуст'
             lost = sorted(m for m in methods if not hasattr(gui_mod.DiagnosticApp, m))
             assert not lost, f'{name} ссылается на несуществующие методы: {lost}'
