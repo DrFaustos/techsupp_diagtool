@@ -1258,6 +1258,331 @@ class TestMailAuthHintsInReports:
         assert 'v=DKIM1' not in out
 
 
+# ---------- внешняя сверка с публичным DNS ----------
+# Здесь заперты грабли, которые вскрыл живой прогон dig, а не догадки:
+#  - резолвер задаётся ТОЛЬКО через @server: positional-форма (`dig A name
+#    1.1.1.1`) адрес сервером не считает, запрос уходил на местный резолвер и
+#    отвечал за 0.0 с даже при заведомо мёртвом IP — «сверка извне» печатала бы
+#    локальную зону с подписью «из интернета»;
+#  - пустой вывод при недоступном резолвере неотличим от честного «записей
+#    нет», поэтому решение принимает rc из самой команды;
+#  - непроверенное не имеет права печататься как «в порядке».
+
+def _verify_routes(spf='"v=spf1 ip4:10.0.0.5 -all"',
+                   dmarc='"v=DMARC1; p=reject; rua=mailto:p@lie.ru"',
+                   dkim=DKIM_1024, ip='10.0.0.5', ptr='mail.lie.ru.',
+                   ext_spf='rc=0\n', ext_dmarc='rc=0\n', ext_ptr='rc=0\n',
+                   ext_ip='93.184.216.34\nrc=0\n', ext_rc='rc=0\n',
+                   probe='198.41.0.4\n', rows='name=lie.ru elid=1\n'):
+    """Маршрут «локально всё зелёное, извне — пусто».
+
+    Порядок игл важен: внешние запросы содержат '@1.1.1.1', локальные — нет,
+    поэтому внешние стоят раньше и не перехватываются общими иглами.
+    """
+    return [
+        ('mgrctl -m ispmgr maildomain', rows),
+        ('cat /etc/resolv.conf', 'nameserver 127.0.0.53\n'),
+        ('a.root-servers.net', probe),                 # probe жив
+        ('__bad=0', ext_rc),                           # внешний DKIM-цикл
+        ('A lie.ru @', ext_ip),                        # внешняя A
+        ('TXT _dmarc.lie.ru @', ext_dmarc),
+        ('TXT lie.ru @', ext_spf),
+        ('-x 93.184.216.34 @', ext_ptr),
+        ('@1.1.1.1', 'rc=0\n'),                        # прочий внешний запрос
+        ('dig +short TXT lie.ru', spf + '\n'),
+        ('dig +short TXT _dmarc.lie.ru', dmarc + '\n'),
+        ('dig +short A lie.ru', ip + '\n'),
+        ('-x ' + ip, ptr + '\n'),
+        ('for __dk', f'dkim._domainkey.lie.ru|{dkim}\n'),
+    ]
+
+
+def _diff_lines(out):
+    """Строки «🌐» как таковые.
+
+    Считать просто `'🌐' in line` нельзя: символ встречается и в пометке
+    «сверка с публичным DNS: см. строки «🌐»», и тест засчитал бы её за
+    расхождение (проверено на живом прогоне).
+    """
+    return [l for l in out.splitlines() if l.lstrip().startswith('🌐')]
+
+
+def _fix_lines(out, kind):
+    return [l for l in out.splitlines() if l.lstrip().startswith('→ ' + kind)]
+
+
+class TestExternalVerifyCommands:
+    """Команды сверки: резолвер, rc и защита от сырого имени."""
+
+    def test_resolver_is_passed_with_at_sign(self):
+        # Без @ dig считает адрес ещё одним ИМЕНЕМ и спрашивает местный
+        # резолвер: проверка «извне» показывала бы локальную зону.
+        cmd = dc.external_query_command('TXT', 'ex.com')
+        assert 'TXT ex.com @1.1.1.1' in cmd
+        assert 'TXT ex.com 1.1.1.1' not in cmd
+
+    def test_answer_code_is_printed(self):
+        # Без rc пустой вывод при недоступном резолвере = «записей нет», и
+        # сверка сама стала бы источником лжи.
+        assert 'rc=' in dc.external_query_command('TXT', 'ex.com')
+        assert 'rc=' in dc.external_dkim_query_command('ex.com')
+
+    def test_dkim_flag_covers_the_whole_loop(self):
+        # Код последней команды цикла ничего не говорит о предыдущих: одна
+        # таймаутная итерация выглядела бы как «извне записей нет».
+        cmd = dc.external_dkim_query_command('ex.com')
+        assert '__bad' in cmd and '|| __bad=1' in cmd
+
+    def test_probe_asks_a_name_that_must_exist(self):
+        # Пустой ответ от 1.1.1.1 значит «мы не у дел», а не «интернет есть».
+        assert dc.EXTERNAL_PROBE_NAME in dc.external_probe_command()
+        assert '@1.1.1.1' in dc.external_probe_command()
+
+    @pytest.mark.parametrize('rtype', ['rm -rf /', 'TXT; touch /tmp/PWNED', ''])
+    def test_raw_query_type_is_refused(self, rtype):
+        # rtype попадает в команду НЕ через q(): список разрешённых типов —
+        # единственная преграда на пути сырого имени в shell.
+        with pytest.raises(ValueError):
+            dc.external_query_command(rtype, 'ex.com')
+
+    @pytest.mark.parametrize('rtype', dc.EXTERNAL_QUERY_TYPES)
+    def test_allowed_types_are_valid_shell(self, rtype):
+        cmd = dc.external_query_command(rtype, 'ex.com')
+        shlex.split(cmd)
+        proc = subprocess.run(['bash', '-n', '-c', cmd],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_evil_domain_stays_one_argument(self):
+        evil = "ex.com'; touch /tmp/PWNED; echo '"
+        for cmd in (dc.external_query_command('TXT', evil),
+                    dc.external_dkim_query_command(evil),
+                    dc.external_probe_command()):
+            parts = shlex.split(cmd)
+            assert 'touch' not in parts and ';' not in parts
+
+
+class TestParseExternalAnswer:
+    """Разбор вывода сверки: rc и мусор, который dig пишет в stdout."""
+
+    def test_empty_answer_with_rc0_is_a_real_empty_zone(self):
+        assert dc.parse_external_answer('rc=0\n') == ('', 0)
+
+    def test_values_are_kept_and_rc_removed(self):
+        text, rc = dc.parse_external_answer('"v=spf1 -all"\nrc=0\n')
+        assert text == '"v=spf1 -all"' and rc == 0
+
+    def test_unreachable_resolver_is_not_an_empty_zone(self):
+        # Проверено живым dig: при недоступном резолвере ошибка летит в STDOUT
+        # (2>/dev/null не спасает), и без отсечения ушла бы в парсер TXT.
+        out = (';; communications error to 1.1.1.1#53: timed out\n'
+               ';; no servers could be reached\nrc=9\n')
+        text, rc = dc.parse_external_answer(out)
+        assert text == '' and rc == 9
+
+    def test_error_tail_after_selector_name_is_cut(self):
+        # В DKIM-цикле имя печатается до запроса, поэтому ошибка приклеена к
+        # нему: парсер не должен увидеть «;;» значением записи.
+        out = ('dkim._domainkey.ex.com|;; communications error\n'
+               ';; no servers could be reached\nrc=1\n')
+        text, rc = dc.parse_external_answer(out)
+        assert ';;' not in text and rc == 1
+
+    def test_missing_rc_means_no_answer(self):
+        assert dc.parse_external_answer('"v=spf1 -all"\n')[1] is None
+
+    def test_garbage_rc_is_not_an_answer(self):
+        assert dc.parse_external_answer('rc=нет\n')[1] is None
+
+
+class TestPublicResolverProbe:
+    def test_first_answering_resolver_is_chosen(self):
+        c = FakeSSH(routes=[('dig +short A', '198.41.0.4\n')])
+        assert dc.public_resolver(c) == dc.PUBLIC_RESOLVERS[0]
+
+    def test_dead_resolvers_mean_no_verification(self):
+        assert dc.public_resolver(FakeSSH()) == ''
+
+    def test_garbage_answer_is_not_liveness(self):
+        # «Резолвер жив» обязан означать ответ-адрес: иначе любой мусор в
+        # stdout сошёл бы за подтверждение, и сверка началась бы вслепую.
+        c = FakeSSH(routes=[('dig +short A', 'connection refused\n')])
+        assert dc.public_resolver(c) == ''
+
+    def test_probe_is_one_command_per_resolver(self):
+        c = FakeSSH()
+        dc.public_resolver(c)
+        assert c.count('dig ') == len(dc.PUBLIC_RESOLVERS)
+
+
+class TestExternalVerification:
+    """Главный смысл слайса: локальная зона не может врать безнаказанно."""
+
+    def test_local_lie_is_exposed_and_verdict_follows_the_public_view(self):
+        # Локально всё зелёное (приватный ip4 из локальной зоны, локальный PTR),
+        # публичная зона пуста. Именно тут старый отчёт врал: «SPF ✅».
+        c = FakeSSH(routes=_verify_routes())
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'Провалено: 1, с замечаниями: 0' in out
+        assert '[извне]' in out
+        assert len(_diff_lines(out)) == 4              # SPF, DKIM, DMARC, PTR
+        assert 'TXT-записей у домена нет вообще' in out
+
+    def test_local_lines_stay_printed(self):
+        # По локальным строкам ищут, где именно зона разошлась: убрать их —
+        # значит оставить оператора с двумя правками в двух местах.
+        c = FakeSSH(routes=_verify_routes())
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'подпись по селектору: dkim' in out     # локальный DKIM
+        assert 'v=spf1 ip4:10.0.0.5 -all' in out       # локальный SPF
+
+    def test_hints_use_the_public_a_record_not_the_private_one(self):
+        # Локальная A показывает 10.0.0.5: в публичном SPF такой ip4 не
+        # совпадёт ни с одной сессией. Основанием обязан стать внешний ответ.
+        c = FakeSSH(routes=_verify_routes())
+        out = dc.mail_auth_report(c, 'ispmanager')
+        hint = _fix_lines(out, 'SPF')[0]
+        assert 'ip4:93.184.216.34' in hint and 'ip4:10.0.0.5' not in hint
+
+    def test_hint_follows_the_public_record_not_the_local_one(self):
+        # Локально «+all» (беда), публично запись правильная: совет «чините
+        # +all» был бы выдуманной бедой — приёмник-то видит вторую запись.
+        c = FakeSSH(routes=_verify_routes(
+            spf='"v=spf1 +all"',
+            ext_spf='"v=spf1 ip4:93.184.216.34 -all"\nrc=0\n'))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert not _fix_lines(out, 'SPF')
+
+    def test_public_problem_gets_the_hint_even_when_local_is_clean(self):
+        c = FakeSSH(routes=_verify_routes(
+            spf='"v=spf1 ip4:10.0.0.5 -all"', ext_spf='"v=spf1 +all"\nrc=0\n'))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert _fix_lines(out, 'SPF')
+        assert '+all' in _fix_lines(out, 'SPF')[0]
+
+    def test_dkim_record_is_never_printed_after_verification(self):
+        # Граница честности не зависит от появления второго источника: TXT
+        # выводится из приватного ключа, которого нет ни локально, ни «извне».
+        c = FakeSSH(routes=_verify_routes())
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'v=DKIM1' not in out
+
+    def test_identical_zones_say_so_instead_of_staying_silent(self):
+        c = FakeSSH(routes=_verify_routes(
+            ip='93.184.216.34',
+            spf='"v=spf1 ip4:93.184.216.34 -all"',
+            ext_spf='"v=spf1 ip4:93.184.216.34 -all"\nrc=0\n',
+            ext_dmarc='"v=DMARC1; p=reject; rua=mailto:p@lie.ru"\nrc=0\n',
+            ext_ptr='mail.lie.ru.\nrc=0\n',
+            ext_rc=f'dkim._domainkey.lie.ru|{DKIM_1024}\nrc=0\n'))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'публичные записи совпадают' in out
+        assert len(_diff_lines(out)) == 1              # ровно одно сообщение
+        assert 'Провалено: 0, с замечаниями: 0' in out
+
+    def test_price_of_verification(self):
+        # 1 probe + 5 локальных + 5 внешних. Ценой сверки нельзя делать
+        # удвоение времени прогона по всем доменам: gate решает, кому сверять.
+        c = FakeSSH(routes=_verify_routes())
+        dc.mail_auth_report(c, 'ispmanager')
+        assert c.count('dig ') == 11
+
+    def test_probe_is_asked_once_per_run_not_per_domain(self):
+        rows = 'name=lie.ru elid=1\nname=two.ru elid=2\n'
+        c = FakeSSH(routes=_verify_routes(rows=rows))
+        dc.mail_auth_report(c, 'ispmanager')
+        assert c.count('a.root-servers.net') == 1
+
+
+class TestUnverifiedIsNotClean:
+    """Непроверенное ≠ проваленное, но и ≠ «в порядке»."""
+
+    def test_failed_verification_is_a_warning_not_a_clean_domain(self):
+        c = FakeSSH(routes=_verify_routes(
+            ext_rc='', ext_ip='', ext_spf='', ext_dmarc='', ext_ptr=''))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'Провалено: 0, с замечаниями: 1' in out
+        assert '[не сверено]' in out
+        assert 'сверить не удалось' in out
+        assert 'dig +short TXT lie.ru @1.1.1.1' in out   # чем проверить вручную
+
+    def test_dead_public_resolvers_cost_no_domain_queries(self):
+        # Резолверов нет — не тратим 5 запросов на домен вслепую, но и не
+        # печатаем домен проверенным.
+        c = FakeSSH(routes=_verify_routes(probe=''))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert c.count('a.root-servers.net') == len(dc.PUBLIC_RESOLVERS)
+        assert sum(1 for x in c.commands
+                   if '@' in x and 'root-servers' not in x) == 0
+        assert '[не сверено]' in out
+        assert 'Провалено: 0, с замечаниями: 1' in out
+
+    def test_failure_never_softens_a_real_problem(self):
+        # Поднимаем только ok → warn: bad обязан остаться bad — понижения
+        # строгости отчёт не имеет права делать.
+        c = FakeSSH(routes=_verify_routes(spf='', ext_rc='', ext_ip='',
+                                          ext_spf='', ext_dmarc='', ext_ptr=''))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'Провалено: 1' in out
+
+    # ---------- PTR: «не получили ответ» ≠ «записи нет» ----------
+    @pytest.mark.parametrize('ip,name,answered,status', [
+        ('', 'anything', True, 'warn'),      # спрашивать нечего
+        ('93.184.216.34', '', False, 'warn'),   # запросил, ответа нет
+        ('93.184.216.34', '', True, 'bad'),     # честный пустой ответ
+        ('93.184.216.34', 'mail.ex.com', True, 'ok'),
+    ])
+    def test_ptr_has_three_states_not_two(self, ip, name, answered, status):
+        # Свести «таймаут» к «пустому ответу» — значит заявить «обратной записи
+        # нет» на основании недоступного DNS.
+        assert dc._ptr_view(ip, name, answered)[0] == status
+
+    def test_ptr_timeout_is_not_reported_as_a_missing_record(self):
+        # Внешняя A получена, а -x упало по таймауту: внешний PTR обязан стать
+        # «не проверен», а не ❌.
+        c = FakeSSH(routes=_verify_routes(ext_ptr=''))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        ptr_line = [l for l in _diff_lines(out) if 'PTR' in l]
+        assert ptr_line and 'не получен' in ptr_line[0]
+        assert '93.184.216.34' in ptr_line[0]
+        assert 'обратной записи нет' not in '\n'.join(ptr_line)
+
+    def test_ptr_answered_flag_is_per_query(self):
+        # Общий 'answered' PTR не покрывает: он идёт пятым и зависит от внешней A.
+        c = FakeSSH(routes=[('-x 1.2.3.4 @', ';; no servers\nrc=9\n'),
+                            ('@1.1.1.1', '1.2.3.4\nrc=0\n')])
+        ans = dc.external_auth_answers(c, 'ex.com')
+        assert ans['answered'] and not ans['ptr_answered']
+
+    def test_no_verification_when_local_view_is_public(self):
+        # Внешний резолвер и чужая зона: ложный ✅ невозможен, платить 5
+        # запросов и probe не за что.
+        routes = [(n, r) for n, r in _verify_routes()
+                  if n != 'cat /etc/resolv.conf']
+        c = FakeSSH(routes=routes)
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert c.count('dig ') == 5
+        assert c.count('a.root-servers.net') == 0
+        assert '[извне]' not in out and '[не сверено]' not in out
+
+
+class TestZoneViewNoteAfterVerify:
+    def test_manual_command_is_dropped_when_report_already_verified(self):
+        note = dc.zone_view_note('ex.com', {'ex.com'}, verified=True)
+        assert 'см. строки' in note
+        assert 'dig +short TXT' not in note        # работу сделали за оператора
+
+    def test_manual_command_survives_while_verification_is_pending(self):
+        assert 'dig +short TXT ex.com @1.1.1.1' in dc.zone_view_note(
+            'ex.com', {'ex.com'})
+
+    def test_note_never_claims_a_finished_verification_it_cannot_see(self):
+        # verified=True приходит от вызывающего, который знает лишь «резолвер
+        # жив»: «выполнена» было бы ложью при отказе ответить по домену.
+        assert 'выполнена' not in dc.zone_view_note('ex.com', {'ex.com'},
+                                                    verified=True)
+
+
 class TestDomainDetailMailAuth:
     def test_mail_domain_gets_the_auth_block(self):
         c = FakeSSH(routes=[
