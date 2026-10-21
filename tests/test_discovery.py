@@ -594,6 +594,102 @@ class TestMailOverview:
         assert 'mailq недоступен' in out
 
 
+# ==================== доставка из лога внутри почтовых отчётов ==============
+# Снимок и дайджест встроены в существующие отчёты, а не вынесены отдельным
+# пунктом меню: тикет «письма уходят в спам» закрывается одним прогоном, и меню
+# не разрастается. Перекрываются ровно те места, ради которых они встроены —
+# причина отказа печатается рядом с DNS-диагнозом — и цена: лог читается ОДИН
+# раз на прогон, а не на домен (25 доменов × чтение лога = минуты простоя GUI).
+GMAIL_SPAM_BOUNCE = (
+    'Oct 10 12:00:05 host postfix/smtp[124]: AAA2: to=<c@gmail.com>, '
+    'relay=gmail-smtp-in.l.google.com[142.251.8.27]:25, dsn=5.7.26, '
+    'status=bounced (gmail-smtp-in.l.google.com[142.251.8.27] said: '
+    '550-5.7.26 [203.0.113.9] unauthenticated mail was rejected, please '
+    'learn about SPF)')
+
+
+def _log_routes(*lines):
+    # read_mail_log выбирает maillog/mail.log циклом ВНУТРИ одной команды,
+    # поэтому и игла одна: подменять каждую команду дистрибутива по отдельности
+    # означало бы тестировать не тот код, который уходит на сервер.
+    return [('for __p in',
+             '#LOG /var/log/mail.log\n' + '\n'.join(lines) + '\n')]
+
+
+class TestDeliveryInInventory:
+    """Почтовая сводка обязана объяснять ПРИЧИНУ, а не только считать очередь."""
+
+    def test_inventory_shows_failure_reason_from_log(self):
+        c = FakeSSH(routes=[('mailq', '-- 4 Messages'),
+                            ('__svc_status', 'postfix=active\n')]
+                   + _log_routes(GMAIL_SPAM_BOUNCE))
+        out = dc.mail_overview_report(c, 'none')
+        assert 'Доставка по логу' in out
+        # Группа причины, а не сырая строка лога: из этих слов оператор понимает,
+        # куда идти (DNS и репутация), а не «копай postfix».
+        assert 'спам или блокировка репутации' in out
+        assert 'gmail.com' in out                       # кому бьёт — видно
+
+    def test_dead_log_is_not_reported_as_clean(self):
+        # «Не проверено» не имеет права печататься как «в порядке»: иначе сводка
+        # с молчаливым логом закрыла бы тикет ложным «отказов нет».
+        c = FakeSSH(routes=[('mailq', 'Mail queue is empty')])
+        out = dc.mail_overview_report(c, 'none')
+        assert 'лог не найден' in out
+        assert 'Отказов нет' not in out
+
+    def test_snapshot_costs_one_log_read_per_run(self):
+        c = FakeSSH(routes=[('mailq', 'Mail queue is empty')]
+                   + _log_routes(GMAIL_SPAM_BOUNCE))
+        dc.mail_overview_report(c, 'none')
+        assert c.count('for __p in') == 1
+
+
+# Иглы внешних запросов обязаны стоять раньше локальных: '@1.1.1.1' встречается в
+# команде внешнего запроса, а первое совпадение по подстроке выигрывает.
+AUTH_ROUTES = [
+    ('cat /etc/resolv.conf', 'nameserver 127.0.0.53\n'),
+    ('mgrctl -m ispmgr dnszone', 'name=lie.ru elid=1\n'),
+    ('a.root-servers.net', '198.41.0.4\n'),
+    ('__bad=0', 'rc=0\n'),
+    (' @1.1.1.1', 'rc=0\n'),
+    ('dig +short TXT', '"v=spf1 ip4:10.0.0.5 -all"\n'),
+    ('dig +short A', '10.0.0.5\n'),
+    ('-x 10.0.0.5', 'mail.lie.ru.\n'),
+]
+
+
+class TestDeliveryDigestInMailAuth:
+    """Дайджест в SPF-отчёте: доказательство, что DNS-беда УЖЕ ломает почту."""
+
+    def test_spam_bounce_confirms_the_dns_verdict(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=lie.ru elid=1\n')] + AUTH_ROUTES
+                   + _log_routes(GMAIL_SPAM_BOUNCE))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'Что лог говорит о доставке' in out
+        assert 'спам или блокировка репутации — 1' in out
+        # Главная фраза слайса: отказ приёмника связан с проваленным DNS.
+        assert 'DNS-беда уже ломает доставку' in out
+
+    def test_digest_is_read_once_even_for_many_domains(self):
+        # Дайджест вызывается вне цикла по доменам. Гард не даст вернуть его
+        # внутрь: 25 доменов означали бы 25 чтений лога и висящее окно GUI.
+        rows = 'name=a.ru elid=1\nname=b.ru elid=2\nname=lie.ru elid=3\n'
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain', rows)] + AUTH_ROUTES
+                   + _log_routes(GMAIL_SPAM_BOUNCE))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'Проверено доменов: 3' in out
+        assert c.count('for __p in') == 1
+
+    def test_dead_log_refuses_to_confirm_instead_of_faking_clean(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=lie.ru elid=1\n')] + AUTH_ROUTES)
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'не найден' in out and 'не проверено' in out
+        assert 'DNS-беда уже ломает доставку' not in out
+
+
 class TestInventoryAndDomain:
     def test_inventory_joins_three_parts(self):
         c = FakeSSH(routes=[('mailq', 'Mail queue is empty')])

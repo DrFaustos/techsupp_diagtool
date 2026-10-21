@@ -1174,3 +1174,98 @@ class TestDbSecretSurvivesCancel:
         assert 'Не удалось удалить временный файл с паролем БД' in out
         assert bx.DBCHECK_CNF in out
         assert 'sup3r-secret' not in out
+
+
+# ==================== почтовый лог: общая read_mail_log ====================
+# Эти тесты запирают два решения, а не одну функцию.
+#
+# Первое: почтовый лог читает ОДНА функция (logs.read_mail_log). У нас уже были
+# парные реализации, и здесь расхождение выглядело бы как «в отчёте Битрикса лог
+# есть, в сводке — логов нет» на одном сервере. Дубль проверяется ПОВЕДЕНИЕМ:
+# сколько команд ушло на сервер, а не разбором исходника (счётчик команд — то,
+# что оператор и так видит в логе операций).
+#
+# Второе: Debian. Раньше читался только /var/log/maillog, а /var/log/mail.log —
+# нет; об этом прямо говорил наш собственный текст («лог может писаться в
+# /var/log/mail.log»), и тест констатировал «мы его не читаем». На Debian отчёт
+# о почте был слеп.
+GMAIL_BOUNCE = ('Oct 10 12:00:05 host postfix/smtp[124]: AAA2: to=<c@gmail.com>, '
+                'relay=gmail-smtp-in.l.google.com[142.251.8.27]:25, dsn=5.7.26, '
+                'status=bounced (gmail-smtp-in.l.google.com[142.251.8.27] said: '
+                '550-5.7.26 unauthenticated mail was rejected, please learn '
+                'about SPF)')
+
+
+def _mail_log_routes(body=''):
+    """Одна игла на весь выбор файла: цикл maillog/mail.log живёт ВНУТРИ команды."""
+    return [('for __p in',
+             ('#LOG /var/log/mail.log\n' + body + '\n') if body else '')]
+
+
+class TestMailLogSingleImplementation:
+    """Ни одного отдельного чтения почтового лога мимо read_mail_log."""
+
+    def test_report_uses_the_shared_reader_only(self):
+        c = FakeSSH(routes=[('is-active postfix', 'active'),
+                            ('mailq', 'Mail queue is empty')]
+                   + _mail_log_routes(GMAIL_BOUNCE))
+        bx.bitrix_mail_report(c)
+        # Ровно одна команда-чтение: цикл по обоим путям внутри неё.
+        assert c.count('for __p in') == 1
+        # Старых точечных чтений остаться не должно ни в каком виде.
+        assert c.count('tail -n 15 /var/log/maillog') == 0
+        assert c.count('journalctl -u postfix -n 15') == 0
+
+    def test_send_test_uses_the_shared_reader_only(self):
+        c = FakeSSH(routes=[('command -v sendmail', '/usr/sbin/sendmail'),
+                            ('printf %s', ('', '', 0)),
+                            ('mailq', 'Mail queue is empty')]
+                   + _mail_log_routes('AAA: to=<op@example.com>, status=sent '
+                                      '(250 Ok)'))
+        bx.bitrix_mail_send_test(c, 'op@example.com')
+        assert c.count('for __p in') == 1
+        assert c.count('tail -n 50 /var/log/maillog') == 0
+        assert c.count('journalctl -u postfix -n 50') == 0
+
+
+class TestMailLogDebianPath:
+    """Debian пишет в /var/log/mail.log — раньше этот путь не читался нигде."""
+
+    def test_report_reads_mail_log_and_names_the_source(self):
+        c = FakeSSH(routes=[('is-active postfix', 'active'),
+                            ('mailq', 'Mail queue is empty')]
+                   + _mail_log_routes(GMAIL_BOUNCE))
+        out = bx.bitrix_mail_report(c)
+        assert '/var/log/mail.log (последние 15 строк)' in out
+        # Источник в заголовке — не украшение: по нему видно, чей rsyslog править.
+        assert 'unauthenticated mail was rejected' in out
+        # '-- No entries --' — вывод journalctl о пустом журнале, а не содержимое
+        # лога; прежний код печатал его оператору как строки лога.
+        assert '-- No entries --' not in out
+
+    def test_send_test_finds_its_entry_on_debian(self):
+        c = FakeSSH(routes=[('command -v sendmail', '/usr/sbin/sendmail'),
+                            ('printf %s', ('', '', 0)),
+                            ('mailq', 'Mail queue is empty')]
+                   + _mail_log_routes('AAA: to=<operator@example.com>, '
+                                      'relay=g[1]:25, status=sent (250 Ok)'))
+        out = bx.bitrix_mail_send_test(c, 'operator@example.com')
+        assert '✅ Письмо ушло с сервера (status=sent)' in out
+        assert '(/var/log/mail.log)' in out
+        # Поиск обязан идти по ОБОИМ путям, иначе на Debian запись «не найдена»
+        # при целом логе — то есть вранье про успешно ушедшее письмо.
+        cmd = c.find('for __p in')
+        assert '/var/log/mail.log' in cmd and '/var/log/maillog' in cmd
+        assert 'to=<operator@example.com>' in cmd
+
+    def test_prompt_no_longer_promises_a_path_we_now_read(self):
+        # Текст «лог может писаться в /var/log/mail.log» после починки стал бы
+        # ложью: путь читается, обещание надо снять, а не оставить «на всякий».
+        c = FakeSSH(routes=[('command -v sendmail', '/usr/sbin/sendmail'),
+                            ('printf %s', ('', '', 0)),
+                            ('mailq', 'Mail queue is empty')]
+                   + _mail_log_routes(''))
+        out = bx.bitrix_mail_send_test(c, 'operator@example.com')
+        assert 'лог может писаться' not in out
+        assert 'ls -l /var/log/mail*' in out         # ручная проверка осталась
+        assert 'повторите через минуту' in out       # асинхронность postfix
