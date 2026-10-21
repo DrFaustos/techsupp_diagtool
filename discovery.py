@@ -15,7 +15,7 @@ postfix-карты), — чистые функции: проверяются т�
 import re
 import shlex
 
-from common import q, find_files, read_file_content
+from common import q, find_files, read_file_content, write_remote_file
 from logs import find_logs
 from metrics import detect_panel, services_status_cmd, parse_service_statuses
 from bitrix import parse_mailq_count
@@ -875,17 +875,108 @@ def parse_mailbox_address(address):
     return (local, domain), None
 
 
-def isp_mailbox_create_command(local, domain, password):
-    """email.edit БЕЗ elid = создание ящика (так же делает скрипт из KB)."""
-    return (f'{MGRCTL} email.edit domainname={q(domain)} name={q(local)} '
-            f'plid={q(domain)} aliases={q("")} passwd={q(password)} '
-            f'confirm={q(password)} sok=ok 2>&1')
+# ==================== ПАРОЛЬ МИМО argv (ISPmanager) ====================
+# Панель берёт секрет из окружения: `-e '<param>=$ENV_NAME>` (ISPsystem,
+# «Mgrctl utility» — доступно с COREmanager 5.325+). Это единственный способ
+# убрать пароль из argv: exec_command у нас = `bash -c '<вся строка>'`, поэтому
+# `export SECRET=пароль` внутри команды светился бы в ps ровно так же, как
+# passwd=пароль. Проверено локально: после `. файла` env дочернего процесса
+# содержит переменную (1), `ps -eo args | grep -v grep | grep -c '<пароль>'` = 0.
+MAILBOX_SECRET_ENV = 'DIAG_MAILBOX_SECRET'
+MAILBOX_SECRET_FILE = 'secret.env'
+MAILBOX_SECRET_TMP = '/tmp/diagn_mail.XXXXXXXX'
 
 
-def isp_mailbox_passwd_command(address, password):
-    """email.edit c elid — смена пароля существующего ящика."""
-    return (f'{MGRCTL} email.edit elid={q(address)} passwd={q(password)} '
-            f'confirm={q(password)} sok=ok 2>&1')
+def mailbox_secret_content(password):
+    """Содержимое env-файла: export ИМЯ='значение'.
+
+    export ОБЯЗАТЕЛЕН: без него `.` объявляет переменную только в текущем
+    shell, и mgrctl как дочерний процесс её не увидел бы (проверено: env | grep
+    даёт 0 совпадений). Значение экранировано q() (shlex.quote) — bash снимает
+    одинарные кавычки при source, поэтому пароль с пробелом, $, ` или кавычкой
+    доходит до панели байт в байт.
+    """
+    return f'export {MAILBOX_SECRET_ENV}={q(password)}\n'
+
+
+def secret_dir_command():
+    """mktemp, а не фиксированный путь: /diag_mail.XXXX создаётся атомарно.
+
+    Фиксированный /tmp/xxx на расшаренном сервере — это symlink/race-проблема
+    (кто-то мог создать файл заранее). Каталог от mktemp — 0700 и уникальный.
+    """
+    return f'mktemp -d {MAILBOX_SECRET_TMP} 2>/dev/null'
+
+
+def isp_mailbox_create_args(local, domain):
+    """email.edit БЕЗ elid = создание ящика (так же делает скрипт из KB).
+
+    Пароля здесь нет намеренно: он придёт через -e (см. isp_mailbox_env_command).
+    sok=ok — параметр функции, поэтому стоит до -e, как в синтаксисе у ISPsystem
+    (funcname [param=value ...] [-e '<param>=$ENV']).
+    """
+    return ['email.edit', f'domainname={q(domain)}', f'name={q(local)}',
+            f'plid={q(domain)}', f'aliases={q("")}', 'sok=ok']
+
+
+def isp_mailbox_passwd_args(address):
+    """email.edit с elid — смена пароля существующего ящика."""
+    return ['email.edit', f'elid={q(address)}', 'sok=ok']
+
+
+def isp_mailbox_env_command(args, env_name=MAILBOX_SECRET_ENV):
+    """mgrctl <func> <params> -e 'passwd=$ENV' -e 'confirm=$ENV'.
+
+    В строке нет секрета — только имя переменной, поэтому её можно показать
+    оператору (операцию можно повторить руками, экспортировав переменную) и
+    она не нуждается в маскировании. Кавычки из q() — не для shell: mgrctl сам
+    раскрывает $ИМЯ из своего окружения, пример в документации ISPsystem
+    показывает именно -e 'passwd=$SECRET_PASSWORD'.
+    """
+    return (f'{MGRCTL} ' + ' '.join(args) +
+            f' -e {q("passwd=$" + env_name)}'
+            f' -e {q("confirm=$" + env_name)} 2>&1')
+
+
+def isp_secret_run_command(secret_dir, args, env_name=MAILBOX_SECRET_ENV):
+    """. env-файл -> mgrctl -e -> удаление файла, даже если панель ошиблась.
+
+    rc=$? снимается ДО rm: иначе кодом возврата строки стал бы rm, и провал
+    панели выглядел бы успехом (классическая грабля «очистка съела rc»).
+    """
+    return ('. ' + q(f'{secret_dir}/{MAILBOX_SECRET_FILE}') + ' && ' +
+            isp_mailbox_env_command(args, env_name) +
+            '; rc=$?; rm -rf ' + q(secret_dir) + ' 2>/dev/null; exit $rc')
+
+
+def prepare_mailbox_secret(checker, password):
+    """Готовит каталог с env-файлом секрета: (путь, None) либо (None, причина).
+
+    Порядок: mktemp -d (0700, имя уникальное и создаётся атомарно) -> запись
+    через SFTP -> chmod 600 на сам файл.
+
+    SFTP, а не `cat > file <<'EOF'`: наш транспорт — exec_command, то есть
+    `bash -c '<вся строка>'`, и пароль в heredoc был бы виден в ps ровно так
+    же, как в passwd=... Файл пишет ДРУГОЙ канал, а в argv сервера остаётся
+    только путь.
+    """
+    out, err, rc = checker.run(secret_dir_command())
+    text = (out or '').strip()
+    secret_dir = text.splitlines()[-1].strip() if text else ''
+    if rc != 0 or not secret_dir.startswith('/'):
+        # Фолбэк «тогда пароль аргументом» здесь запрещён сознательно: он и
+        # есть тот долг, который закрывается этой веткой.
+        detail = (err or '').strip() or text
+        return None, ('mktemp не создал каталог для env-файла'
+                      + (f': {detail}' if detail else '')
+                      + '. Передать пароль безопасно нельзя, операция отменена.')
+    path = f'{secret_dir}/{MAILBOX_SECRET_FILE}'
+    ok, why = write_remote_file(checker, path, mailbox_secret_content(password))
+    if not ok:
+        checker.run(f'rm -rf {q(secret_dir)} 2>/dev/null')
+        return None, f'Не удалось записать env-файл с паролем: {why}'
+    checker.run(f'chmod 600 {q(path)} 2>/dev/null')
+    return secret_dir, None
 
 
 def isp_mailbox_delete_command(address):
@@ -1057,13 +1148,23 @@ def redact_secrets(text):
         if parts is not None:
             redacted = False
             for i, token in enumerate(parts):
-                key, sep, _value = token.partition('=')
-                if sep and key.lower() in _SECRET_KEYS:
+                key, sep, value = token.partition('=')
+                # Ссылка на окружение (-e 'passwd=$DIAG_MAILBOX_SECRET') — НЕ
+                # секрет: в ней только имя переменной. Маскировать её — значит
+                # лишить оператора возможности повторить команду руками.
+                if sep and key.lower() in _SECRET_KEYS and not value.startswith('$'):
                     parts[i] = f'{key}=***'
                     redacted = True
             if redacted:
                 return ' '.join(parts)
-    return _SECRET_RE.sub(lambda m: f'{m.group(1)}=***', text)
+    return _SECRET_RE.sub(_redact_match, text)
+
+
+def _redact_match(m):
+    """Регэксп-фолбэк: значение-ссылка на переменную не маскируется."""
+    if m.group(2).lstrip('\'"').startswith('$'):
+        return m.group(0)
+    return f'{m.group(1)}=***'
 
 
 def panel_unsupported(panel_type, what):
@@ -1123,13 +1224,30 @@ def _mailbox_action(checker, address, password, panel_type, mode):
         lines.append(f"⛔ Операция отменена до отправки команды панели:\n   {reason}")
         return "\n".join(lines)
 
+    # Собираем команду. Для ISPmanager пароль идёт ОТДЕЛЬНЫМ каналом (env-файл),
+    # поэтому секрет готовим ЗДЕСЬ, а не в начале операции: до guard писать файл
+    # с паролем на сервер, где операция всё равно отменена, — лишний секрет.
+    secret_dir = None
+    shown = None                       # что показать оператору (без обвязки)
     if panel_type == 'ispmanager':
         if mode == 'create':
-            cmd = isp_mailbox_create_command(local, domain, password)
+            args = isp_mailbox_create_args(local, domain)
         elif mode == 'passwd':
-            cmd = isp_mailbox_passwd_command(addr, password)
+            args = isp_mailbox_passwd_args(addr)
         else:
+            args = None                # удаление — секрета нет
+        if args is None:
             cmd = isp_mailbox_delete_command(addr)
+        else:
+            secret_dir, why = prepare_mailbox_secret(checker, password)
+            if secret_dir is None:
+                lines.append(f"⛔ {why}")
+                return "\n".join(lines)
+            cmd = isp_secret_run_command(secret_dir, args)
+            # В отчёте — команду панели, а не обвязку (source/rm): её содержимое
+            # совпадает с примером из документации ISPsystem, значит её можно
+            # повторить руками, экспортировав переменную.
+            shown = isp_mailbox_env_command(args)
     else:  # fastpanel (passwd отсеян выше)
         if mode == 'create':
             cmd = fp_mailbox_create_command(local, domain, password)
@@ -1142,8 +1260,15 @@ def _mailbox_action(checker, address, password, panel_type, mode):
                 return "\n".join(lines)
             cmd = fp_mailbox_delete_command(box_id)
 
-    lines.append("$ " + redact_secrets(cmd))
-    out, errtxt, rc = checker.run(cmd)
+    lines.append("$ " + redact_secrets(shown or cmd))
+    try:
+        out, errtxt, rc = checker.run(cmd)
+    finally:
+        # rm -rf есть и внутри команды, но она может не дойти до него (отмена
+        # задачи закрывает канал). Эта страховка обязана быть: файл с паролем
+        # не должен пережить операцию ни при каком исходе.
+        if secret_dir:
+            checker.run(f'rm -rf {q(secret_dir)} 2>/dev/null')
     report = (out or '').strip() or (errtxt or '').strip()
     if rc != 0:
         lines.append(f"❌ Панель ответила ошибкой (rc={rc}): "
@@ -1173,8 +1298,20 @@ def _mailbox_action(checker, address, password, panel_type, mode):
                          "в списке панели — проверьте вручную.")
 
     if mode in ('create', 'passwd'):
-        lines.append("⚠️ Пароль передавался аргументом команды и был виден в ps:")
-        lines.append("   при возможности смените его на постоянный через панель.")
+        # Предупреждение обязано соответствовать фактическому каналу передачи:
+        # наврать «был виден в ps» там, где мы его убрали, — обесценить сам
+        # фикс (оператор перестанет верить отчёту целиком).
+        if panel_type == 'ispmanager':
+            lines.append("ℹ️ Пароль передан через временный файл 0600 и окружение")
+            lines.append("   процесса — в ps на сервере он не светился; файл")
+            lines.append("   удалён сразу после команды панели.")
+        else:
+            # FASTPANEL: mogwai не умеет принимать пароль из окружения или со
+            # stdin — только --password=аргумент. Это ограничение CLI панели,
+            # честно говорим о нём, а не делаем вид, что его нет.
+            lines.append("⚠️ CLI FASTPANEL принимает пароль только аргументом —")
+            lines.append("   он был виден в ps на сервере. При возможности")
+            lines.append("   смените пароль на постоянный через панель.")
     return "\n".join(lines)
 
 
