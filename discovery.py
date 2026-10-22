@@ -614,29 +614,77 @@ def discover_dns_zones(checker, panel_type=None):
 
 # ==================== ОТЧЁТЫ ====================
 def cert_days_label(days):
-    """Человеческая подпись остатка: 'осталось 87 дн.', 'истёк 3 дн. назад'."""
+    """Человеческая подпись остатка: 'осталось 87 дн.', 'ИСТЁК 3 дн. назад'.
+
+    При None причина НЕ называется: у этой функции нет кода ответа, а «порт
+    закрыт» при ОТКРЫТОМ порте (https ответил 500 без рабочего TLS) был бы
+    ложью о причине. Причина даёт `no_cert_reason` — там код ответа есть.
+    """
     if days is None:
-        return 'сертификат не получен (порт закрыт/нет TLS)'
+        return 'сертификат не получен'
     if days < 0:
         return f'ИСТЁК {-days} дн. назад'
     return f'осталось {days} дн.'
+
+
+def no_cert_reason(https):
+    """Почему сертификата нет — по коду ответа, а не по догадке.
+
+    Порт закрыт и «порт открыт, но TLS не работает» чинят по-разному: первое —
+    фаерволлом и прослушиванием 443, второе — конфигом vhost (нет
+    ssl_certificate или не тот путь). Одна подпись на оба случая отправила бы
+    оператора проверять не туда.
+    """
+    return ('https не отвечает' if https in ('000', '')
+            else 'https отвечает без рабочего TLS')
+
+
+def cert_note_state(status):
+    """Состояние сертификата для пометки строки; None — пометки нет вовсе.
+
+    ЕДИНСТВЕННОЕ место, где решается «показывать ли SSL по этому домену»:
+    молчащий HTTPS означает, что рукопожатие сорвалось на чужом дефолтном
+    vhost, и его сертификат в строке домена оператор принял бы за свой. От
+    этого же ответа зависит сводный счётчик, поэтому решение не имеет права
+    быть продублированным в печатающей функции: иначе сводка считала бы ❓,
+    которого в строках нет (или молчала о показанном).
+    """
+    if status['https'] in ('000', ''):
+        return None
+    return cert_state(status['cert_days'])
+
+
+def ssl_note(status, sep='  '):
+    """SSL-пометка строки: иконка + подпись + честная причина отсутствия.
+
+    Единая на все отчёты (сводка доступности, SSL-отчёт, «Досье домена»): две
+    формулировки однажды разъехались бы («истёк» против «просрочен»), и
+    оператор не узнал бы в досье свою же беду из сводки.
+    """
+    state = cert_note_state(status)
+    if state is None:
+        return ''
+    label = cert_days_label(status['cert_days'])
+    if state == 'none':
+        label = f'{label} ({no_cert_reason(status["https"])})'
+    return f'{sep}{CERT_STATE_ICON[state]} SSL {label}'
 
 
 def site_health_probe(checker, sites, limit=HEALTH_CHECK_LIMIT):
     """Одна проба на домен; состояния — ТЕМИ ЖЕ функциями, что печатают иконки.
 
     Возвращает (домен, состояние_доступности, состояние_сертификата, статус).
-    Состояние сертификата равен None, когда SSL-пометка в строке не печатается
+    Состояние сертификата равно None, когда SSL-пометка в строке не печатается
     (HTTPS молчит: сертификат чужого дефолтного vhost нельзя показывать как
     свой). Считать тогда сертификат в сводке — значит учесть то, что отчёт
-    намеренно не показал.
+    намеренно не показал. Решает это cert_note_state — та же функция, что
+    решает то же для печатаемой пометки.
     """
     rows = []
     for site in sites[:limit]:
         status = parse_site_status(
             checker.exec_command(site_status_command(site['domain']))[0])
-        cert = (cert_state(status['cert_days'])
-                if status['https'] not in ('000', '') else None)
+        cert = cert_note_state(status)
         rows.append((site['domain'],
                      http_site_state(status['http'], status['https']),
                      cert, status))
@@ -647,10 +695,9 @@ def site_health_render(probed):
     """Строки состояния по уже снятой пробе (второй прогон проб — не здесь)."""
     lines = []
     for dom, state, cert, status in probed:
-        ssl = ''
-        if cert is not None:
-            ssl = (f"  {CERT_STATE_ICON[cert]} SSL "
-                   f"{cert_days_label(status['cert_days'])}")
+        # Пометка строится общим ssl_note: при молчащем HTTPS он пуст (cert
+        # тогда None), поэтому отдельная проверка в этом цикле не нужна.
+        ssl = ssl_note(status)
         lines.append(f"  {HTTP_STATE_ICON[state]} {dom:45s} "
                      f"http={status['http']:3s} https={status['https']:3s}"
                      f"{ssl}")
@@ -836,9 +883,9 @@ def ssl_expiry_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
         # вторую реализацию того же счёта.
         lines.append("\n❓ СЕРТИФИКАТ НЕ ПОЛУЧЕН (порт 443 молчит или нет TLS):")
         for dom, _, https_code in quiet:
-            why = ('https отвечает без рабочего TLS'
-                   if https_code not in ('000', '') else 'https не отвечает')
-            lines.append(f"  {dom:45s} {why}")
+            # Причина — общим no_cert_reason: своя ветка `why` была ВТОРОЙ
+            # формулировкой того же факта и однажды разъехалась бы с досье.
+            lines.append(f"  {dom:45s} {no_cert_reason(https_code)}")
 
     if len(sites) > limit:
         lines.append(f"\n… проверены первые {limit} из {len(sites)} доменов "
@@ -1954,10 +2001,15 @@ def domain_detail_report(checker, domain, panel_type=None):
 
     status = parse_site_status(checker.exec_command(site_status_command(dom))[0])
     icon = http_status_icon(status['http'], status['https'])
+    # Подпись — общим ssl_note, а не «ok / истекает/нет». Команда пробы знает о
+    # сертификате только «ok / не ok», и в эту одну подпись сваливались три
+    # разные беды: «истёк 4 дня назад» (браузер уже ругается), «истекёт через
+    # 9 дней» (чинить на неделе) и «сертификата нет вообще». У оператора досье
+    # и сводки обязаны называть беду одними словами. Проба при этом та же —
+    # второй пробы ради одной строки не добавилось.
     lines.append(f"\n{icon} Доступность: http={status['http']} "
                  f"https={status['https']}"
-                 + ('' if status['https'] in ('000', '')
-                    else f" | SSL {'ok' if status['ssl'] == 'ok' else 'истекает/нет'}"))
+                 + ssl_note(status, sep=' | '))
 
     lines.append("\nDNS (с самого сервера, dig):")
     for rtype in ('A', 'AAAA', 'MX'):
