@@ -1046,6 +1046,97 @@ class TestInventoryAndDomain:
         assert 'info@site1.ru' in out
         assert 'привязан к loopback' in out
 
+    # ---------- SSL-подпись в досье: три состояния, а не «истекает/нет» ----------
+    # Команда пробы знает о сертификате только «ok / не ok»: SSL=bad — это и
+    # «истёк 4 дня назад» (браузер уже ругается), и «истекёт через 9 дней» (чинить
+    # на неделе). Досье печатало ровно эту двусмысленность строкой «истекает/нет»,
+    # хотя точный остаток (CERT=) в проекте давно есть и показан в сводке
+    # доступности и в SSL-отчёте. Беды с разной срочностью выглядели одинаково.
+
+    def _dossier(self, probe_answer, dom='site1.ru'):
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain', ISP_WEBDOMAIN),
+            ("printf 'HTTP=", probe_answer),
+        ])
+        return dc.domain_detail_report(c, dom, 'ispmanager'), c
+
+    # Подпись берём ровно ту же, что печатает сводка доступности
+    # ('❌ SSL ИСТЁК 4 дн. назад'): два отчёта обязаны называть беду одними
+    # словами, иначе оператор не узнает в досье свою же строку из сводки.
+    def test_dossier_names_the_exact_cert_days(self):
+        out, _ = self._dossier('HTTP=200\nHTTPS=200\nSSL=ok\nCERT=87')
+        assert '✅ SSL осталось 87 дн.' in out
+        assert 'истекает/нет' not in out
+
+    def test_dossier_does_not_call_an_expired_cert_soon(self):
+        out, _ = self._dossier('HTTP=200\nHTTPS=200\nSSL=bad\nCERT=-4')
+        assert '❌ SSL ИСТЁК 4 дн. назад' in out
+        assert 'истекает/нет' not in out
+        out2, _ = self._dossier('HTTP=200\nHTTPS=200\nSSL=bad\nCERT=9')
+        assert '⚠️ SSL осталось 9 дн.' in out2
+
+    def test_dossier_explains_a_missing_cert_by_the_real_reason(self):
+        # HTTPS отвечает, а сертификата нет: «порт закрыт» был бы ложной причиной,
+        # а прежняя подпись «истекает/нет» ещё и утверждала бы, что сертификат
+        # есть и просто истекает.
+        out, _ = self._dossier('HTTP=200\nHTTPS=500\nSSL=none\nCERT=none')
+        assert ('❓ SSL сертификат не получен '
+                '(https отвечает без рабочего TLS)') in out
+        assert 'истёк' not in out and 'истекает' not in out
+        assert 'порт закрыт' not in out      # порт ОТКРЫТ: причина не должна врать
+
+    def test_missing_cert_label_does_not_invent_a_closed_port(self):
+        # cert_days_label(None) не знает про порт — значит не имеет права
+        # про него говорить. Причина живёт в no_cert_reason, где код ответа есть.
+        assert 'порт' not in dc.cert_days_label(None)
+
+    def test_dossier_stays_silent_about_ssl_when_https_is_dead(self):
+        out, _ = self._dossier('HTTP=000\nHTTPS=000\nSSL=none\nCERT=none')
+        line = next(l for l in out.splitlines() if 'Доступность:' in l)
+        # Сертификат чужого дефолтного vhost показывать в строке домена нельзя —
+        # оператор принял бы его за свой (то же правило, что в сводке).
+        assert 'SSL' not in line
+
+    def test_dossier_and_health_share_one_cert_formulation(self):
+        # Один и тот же ответ пробы обязан называться одинаково в двух отчётах:
+        # две формулировки однажды разъехались бы («истёк» против «просрочен»), и
+        # оператор не узнал бы в досье свою же беду из сводки.
+        probe = 'HTTP=200\nHTTPS=200\nSSL=bad\nCERT=-4'
+        out, _ = self._dossier(probe)
+        c = FakeSSH(routes=[('mgrctl -m ispmgr webdomain', ISP_WEBDOMAIN),
+                            ("printf 'HTTP=", probe)])
+        label = 'ИСТЁК 4 дн. назад'
+        assert label in dc.site_health_report(c, 'ispmanager')
+        assert label in out
+
+    def test_dossier_ssl_note_costs_no_extra_probe(self):
+        # Подпись строится из уже снятой пробы: второй вызов site_status_command
+        # ради одной строки удвоил бы число внешних хендшейков на домен.
+        _out, c = self._dossier('HTTP=200\nHTTPS=200\nSSL=ok\nCERT=87')
+        assert c.count("printf 'HTTP=") == 1
+
+    def test_no_cert_reason_is_shared_between_reports(self):
+        # Причина «сертификата нет» обязана быть одной на все отчёты: порт
+        # закрыт чинят фаерволлом, «нет рабочего TLS» — конфиг vhost.
+        assert dc.no_cert_reason('000') == 'https не отвечает'
+        assert dc.no_cert_reason('500') == 'https отвечает без рабочего TLS'
+
+    def test_visibility_of_the_note_decided_in_one_place(self):
+        # Guard на ЕДИНСТВЕННОЕ решение «показывать ли SSL-пометку»: от него
+        # зависят и строка, и сводный счётчик. Если условие продублировать в
+        # печатающей функции, сводка начнёт считать ❓, которого в строках нет
+        # (или промолчит о показанном), — тот же разъезд, что лечился везде.
+        cases = [
+            ({'https': '000', 'cert_days': None}, None),   # молчит
+            ({'https': '', 'cert_days': -1}, None),        # молчит, и даже истёк
+            ({'https': '500', 'cert_days': None}, 'none'),     # порт открыт
+            ({'https': '200', 'cert_days': -4}, 'expired'),
+            ({'https': '301', 'cert_days': 9}, 'soon'),
+            ({'https': '200', 'cert_days': 200}, 'ok'),
+        ]
+        for status, expected in cases:
+            assert dc.cert_note_state(status) == expected, status
+
     def test_domain_detail_not_found_anywhere(self):
         out = dc.domain_detail_report(FakeSSH(), 'ghost.tld', 'none')
         assert 'Домен не найден ни в списке панели' in out
