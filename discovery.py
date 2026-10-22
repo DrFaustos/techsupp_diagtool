@@ -308,13 +308,27 @@ def parse_site_status(out):
             'cert_days': cert}
 
 
+HTTP_STATE_ICON = {'ok': '✅', 'http_only': '🟡', 'silent': '❌'}
+
+
+def http_site_state(http, https):
+    """Состояние доступности: 'ok' / 'http_only' / 'silent'.
+
+    Единая классификация, из которой берут И иконку строки, И сводный счётчик.
+    Второй реализации не будет сознательно: два набора правил однажды
+    разъехались бы, и сводка стала бы считать одну беду, а строка — другую
+    (оператор прочитал бы «молчит — 1» там, где лежит другой сайт).
+    """
+    if https not in ('000', '') and https[0] in '23':
+        return 'ok'
+    if http not in ('000', '') and http[0] in '23':
+        return 'http_only'
+    return 'silent'
+
+
 def http_status_icon(http, https):
     """Зелёный — HTTPS отвечает 2xx/3xx; жёлтый — только HTTP; красный — тихоня."""
-    if https not in ('000', '') and https[0] in '23':
-        return '✅'
-    if http not in ('000', '') and http[0] in '23':
-        return '🟡'
-    return '❌'
+    return HTTP_STATE_ICON[http_site_state(http, https)]
 
 
 HOSTS_LE_PREFIXES = ('127.0.0.1', '::1')
@@ -360,15 +374,27 @@ def parse_cert_days(out):
     return None
 
 
+CERT_STATE_ICON = {'expired': '❌', 'soon': '⚠️', 'ok': '✅', 'none': '❓'}
+
+
+def cert_state(days):
+    """Состояние сертификата: 'expired' / 'soon' / 'ok' / 'none' (не получен).
+
+    Как и http_site_state — единственная классификация: из неё берут и иконку
+    строки, и сводный счётчик. Второй реализации нет намеренно.
+    """
+    if days is None:
+        return 'none'
+    if days < 0:
+        return 'expired'
+    if days < SSL_WARN_DAYS:
+        return 'soon'
+    return 'ok'
+
+
 def cert_days_icon(days):
     """Иконка по остатку: None — сертификат не получен (порт/нет TLS)."""
-    if days is None:
-        return '❓'
-    if days < 0:
-        return '❌'
-    if days < SSL_WARN_DAYS:
-        return '⚠️'
-    return '✅'
+    return CERT_STATE_ICON[cert_state(days)]
 
 
 # ==================== ЧИТАТЕЛИ ПАНЕЛЕЙ ====================
@@ -596,24 +622,108 @@ def cert_days_label(days):
     return f'осталось {days} дн.'
 
 
-def site_health_lines(checker, sites, limit=HEALTH_CHECK_LIMIT):
-    """HTTP/HTTPS-коды и остаток SSL по сайтам (не больше limit внешних проб)."""
-    lines = []
+def site_health_probe(checker, sites, limit=HEALTH_CHECK_LIMIT):
+    """Одна проба на домен; состояния — ТЕМИ ЖЕ функциями, что печатают иконки.
+
+    Возвращает (домен, состояние_доступности, состояние_сертификата, статус).
+    Состояние сертификата равен None, когда SSL-пометка в строке не печатается
+    (HTTPS молчит: сертификат чужого дефолтного vhost нельзя показывать как
+    свой). Считать тогда сертификат в сводке — значит учесть то, что отчёт
+    намеренно не показал.
+    """
+    rows = []
     for site in sites[:limit]:
         status = parse_site_status(
             checker.exec_command(site_status_command(site['domain']))[0])
-        icon = http_status_icon(status['http'], status['https'])
+        cert = (cert_state(status['cert_days'])
+                if status['https'] not in ('000', '') else None)
+        rows.append((site['domain'],
+                     http_site_state(status['http'], status['https']),
+                     cert, status))
+    return rows
+
+
+def site_health_render(probed):
+    """Строки состояния по уже снятой пробе (второй прогон проб — не здесь)."""
+    lines = []
+    for dom, state, cert, status in probed:
         ssl = ''
-        if status['https'] not in ('000', ''):
-            days = status['cert_days']
-            ssl = f"  {cert_days_icon(days)} SSL {cert_days_label(days)}"
-        lines.append(f"  {icon} {site['domain']:45s} "
+        if cert is not None:
+            ssl = (f"  {CERT_STATE_ICON[cert]} SSL "
+                   f"{cert_days_label(status['cert_days'])}")
+        lines.append(f"  {HTTP_STATE_ICON[state]} {dom:45s} "
                      f"http={status['http']:3s} https={status['https']:3s}"
                      f"{ssl}")
-    if len(sites) > limit:
-        lines.append(f"  … доступность проверялась для первых {limit} "
-                     f"из {len(sites)}")
     return lines
+
+
+def site_health_counts(probed):
+    """Счётчики категорий из тех же состояний, что напечатали иконки."""
+    known = ('ok', 'http_only', 'silent')
+    return dict(
+        ok=sum(1 for r in probed if r[1] == 'ok'),
+        http_only=sum(1 for r in probed if r[1] == 'http_only'),
+        silent=sum(1 for r in probed if r[1] == 'silent'),
+        unknown=sum(1 for r in probed if r[1] not in known),
+        cert_expired=sum(1 for r in probed if r[2] == 'expired'),
+        cert_soon=sum(1 for r in probed if r[2] == 'soon'),
+        cert_none=sum(1 for r in probed if r[2] == 'none'))
+
+
+def site_health_summary(ok=0, http_only=0, silent=0, unknown=0,
+                        cert_expired=0, cert_soon=0, cert_none=0, total=0):
+    """Сколько сайтов лежит — строки в шапку блока, до чтения списка.
+
+    Считается СОСТОЯНИЕМ, а не символом «❌» в готовом тексте: в строке домена
+    ДВЕ иконки — доступности (сайт молчит) и сертификата (истёк), и подсчёт по
+    символу дал бы «мёртвых сайтов» больше, чем их есть. Та же грабля, что с
+    «🌐» в SPF-отчёте.
+
+    Число непроверенных доменов называет знаменатель («25 из 30») плюс сноска
+    про HEALTH_CHECK_LIMIT снизу: отдельной строки о них нет намеренно —
+    третье упоминание оператор читает как невнимательность.
+    """
+    checked = ok + http_only + silent + unknown
+    if not checked:
+        return []
+    parts = []
+    if ok:
+        parts.append(f'HTTPS 2xx/3xx — {ok}')
+    if http_only:
+        parts.append(f'только HTTP — {http_only}')
+    if silent:
+        parts.append(f'молчит — {silent}')
+    if unknown:
+        # Неизвестное состояние = «мы не поняли», а не «в порядке»: молча
+        # отнести его в ok значило бы занизить число бед.
+        parts.append(f'Не распознано — {unknown}')
+    lines = [f"Проверено доступности: {checked} из {total or checked}"
+             + (': ' + ', '.join(parts) if parts else '.')]
+    cert_parts = []
+    if cert_expired:
+        cert_parts.append(f'истёк — {cert_expired}')
+    if cert_soon:
+        cert_parts.append(f'истекает < {SSL_WARN_DAYS} дн. — {cert_soon}')
+    if cert_none:
+        cert_parts.append(f'сертификат не получен — {cert_none}')
+    if cert_parts:
+        # Отдельная строка: мёртвый сертификат и молчащий сайт — разные беды,
+        # чинят их разные люди (let's encrypt против nginx).
+        lines.append('   SSL: ' + ', '.join(cert_parts))
+    return lines
+
+
+def site_health_footnote(sites, limit=HEALTH_CHECK_LIMIT):
+    """Сноска о том, что за limit доступность не смотрели (один текст на всех)."""
+    if len(sites) <= limit:
+        return []
+    return [f"  … доступность проверялась для первых {limit} из {len(sites)}"]
+
+
+def site_health_lines(checker, sites, limit=HEALTH_CHECK_LIMIT):
+    """HTTP/HTTPS-коды и остаток SSL по сайтам (не больше limit внешних проб)."""
+    return (site_health_render(site_health_probe(checker, sites, limit))
+            + site_health_footnote(sites, limit))
 
 
 def site_health_report(checker, panel_type=None):
@@ -637,8 +747,36 @@ def site_health_report(checker, panel_type=None):
         parts.append(f"      источник: {site['vhost']}")
         lines.append("\n".join(parts))
     lines.append("\n--- Проверка доступности ---")
-    lines.extend(site_health_lines(checker, sites))
+    # Проба снимается ОДИН раз и кормит И сводку, И список: второй вызов
+    # site_health_probe означал бы ещё 25 внешних хендшейков на прогон (и GUI
+    # висел бы вдвое дольше). Сводка печатается ДО строк: при 25 доменах
+    # оператор обязан узнать масштаб беды, а не досчитывать иконки глазами.
+    probed = site_health_probe(checker, sites)
+    lines.extend(site_health_summary(**site_health_counts(probed),
+                                     total=len(sites)))
+    lines.extend(site_health_render(probed))
+    lines.extend(site_health_footnote(sites))
     return "\n".join(lines)
+
+
+def ssl_expiry_head_lines(not_received=0):
+    """Что шапка SSL-отчёта обязана сказать, кроме «истекло / истекает».
+
+    До этой правки шапка говорила «Истекло: 0, истекает < 30 дн.: 0» — и
+    оператор, прочитавший её, уже решил, что с SSL всё хорошо. А блок «СЕРТИФИКАТ
+    НЕ ПОЛУЧЕН» (порт 443 молчит) прятался под всем списком доменов. Неполученный
+    сертификат — не «истёк» и не «в порядке»: это третье состояние, и то, что о
+    нём молчит первая строка, нарушает закон «не проверено ≠ в порядке».
+
+    Число берётся только из ПРОВЕРЕННЫХ доменов: домены за HEALTH_CHECK_LIMIT не
+    могли «не получить» сертификат, который никто не запрашивал. Отдельной
+    строки про них нет: знаменатель «25 из 30» в той же шапке называет их и так.
+    """
+    if not not_received:
+        return []
+    return [f"   Сертификат не получен — {not_received}: HTTPS не отвечает или "
+            f"отвечает без рабочего TLS. Это не «с SSL всё в порядке»,",
+            "   и не «истекло»: список таких доменов — в блоке ниже."]
 
 
 def ssl_expiry_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
@@ -671,9 +809,13 @@ def ssl_expiry_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
     expired = [r for r in rows if r[1] is not None and r[1] < 0]
     warning = [r for r in rows
                if r[1] is not None and 0 <= r[1] < SSL_WARN_DAYS]
+    quiet = [r for r in rows if r[1] is None]
     lines.append(f"Проверено доменов: {len(rows)} из {len(sites)}. "
                  f"Истекло: {len(expired)}, истекает < {SSL_WARN_DAYS} дн.: "
                  f"{len(warning)}")
+    # Сразу под шапкой, а не под всем списком: «Истекло: 0» — ещё не «всё в
+    # порядке», если у половины доменов сертификат не получен вообще.
+    lines.extend(ssl_expiry_head_lines(not_received=len(quiet)))
     if expired:
         lines.append("\n❌ СЕРТИФИКАТЫ ИСТЕКЛИ (браузер показывает предупреждение):")
         for dom, days, _ in expired:
@@ -689,8 +831,9 @@ def ssl_expiry_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
         for dom, days, _ in rest:
             lines.append(f"  {dom:45s} {cert_days_label(days)}")
 
-    quiet = [r for r in rows if r[1] is None]
     if quiet:
+        # Список уже посчитан выше (для шапки) — второй фильтр означал бы
+        # вторую реализацию того же счёта.
         lines.append("\n❓ СЕРТИФИКАТ НЕ ПОЛУЧЕН (порт 443 молчит или нет TLS):")
         for dom, _, https_code in quiet:
             why = ('https отвечает без рабочего TLS'
