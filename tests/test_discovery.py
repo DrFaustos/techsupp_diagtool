@@ -560,6 +560,238 @@ class TestSiteHealth:
         assert c.count("printf 'HTTP=") == 25
 
 
+# ---------- сводка доступности: масштаб беды над списком ----------
+# Игла '-servername домен' есть И в health-пробе, И в SSL-отчёте (одна и та же
+# site_status_command), поэтому одна фикстура кормит оба отчёта и не зависит от
+# порядка обхода инвентаря.
+
+def _site_rows(names):
+    return ''.join(f'name={d} elid={i} owner=u\n'
+                   for i, d in enumerate(names, 1))
+
+
+def _site_routes(names, answers):
+    return [('mgrctl -m ispmgr webdomain', _site_rows(names))] + [
+        ('s_client -servername ' + d, text) for d, text in answers.items()]
+
+
+OK_SITE = 'HTTP=200\nHTTPS=200\nSSL=ok\nCERT=200'
+HTTP_ONLY = 'HTTP=200\nHTTPS=000\nSSL=none\nCERT=none'
+DEAD_SITE = 'HTTP=000\nHTTPS=000\nSSL=none\nCERT=none'
+EXPIRED_SITE = 'HTTP=200\nHTTPS=200\nSSL=bad\nCERT=-4'
+SOON_SITE = 'HTTP=200\nHTTPS=200\nSSL=bad\nCERT=9'
+NO_CERT_SITE = 'HTTP=200\nHTTPS=500\nSSL=none\nCERT=none'
+
+
+class TestSiteHealthSummary:
+    """Сколько сайтов лежит — до чтения списка из 25 строк.
+
+    Считается ПО ТОЙ ЖЕ функции, что напечатала иконку. Подсчёт по символу «❌»
+    в готовом тексте запрещён: в строке сайта ДВЕ иконки — `http_status_icon`
+    (сайт молчит) и `cert_days_icon` (сертификат просрочен), и «❌» посчитал бы
+    мёртвый сертификат как упавший сайт. Та же грабля, что с «🌐» в SPF-отчёте.
+    """
+
+    # ---------- чистая функция ----------
+    def test_summary_names_the_checked_denominator(self):
+        out = '\n'.join(dc.site_health_summary(ok=1, http_only=1, silent=1,
+                                               total=4))
+        assert 'Проверено доступности: 3 из 4' in out
+
+    def test_categories_sum_up_to_the_checked_count(self):
+        # Ни один проверенный домен не имеет права потеряться в сводке: если
+        # иконку поменяют и она выпадет из распознавания, сумма разойдётся с
+        # знаменателем и этот тест покраснеет вместо тихой лжи.
+        out = '\n'.join(dc.site_health_summary(ok=10, http_only=5, silent=2,
+                                               unknown=1, total=18))
+        assert 'Проверено доступности: 18 из 18' in out
+
+    def test_unrecognized_icon_is_admitted_not_swallowed(self):
+        # Неизвестная иконка = «мы не поняли», а не «в порядке». Молча отнести
+        # её в ok значило бы занизить число бед.
+        out = '\n'.join(dc.site_health_summary(ok=3, unknown=1, total=4))
+        assert 'Не распознано — 1' in out
+
+    def test_zero_categories_are_not_printed(self):
+        out = '\n'.join(dc.site_health_summary(ok=4, total=4))
+        assert 'HTTPS 2xx/3xx — 4' in out
+        assert 'молчит' not in out and 'только HTTP' not in out
+        assert 'SSL:' not in out
+
+    def test_ssl_categories_printed_only_when_present(self):
+        out = '\n'.join(dc.site_health_summary(ok=2, cert_expired=1,
+                                               cert_soon=2, total=3))
+        assert 'SSL: истёк — 1, истекает < 30 дн. — 2' in out
+
+    def test_denominator_already_names_the_unchecked(self):
+        # ОТДЕЛЬНАЯ строка «домены без проверки» запрещена намеренно (и этот
+        # тест записан ПОСЛЕ того, как я её требовал): знаменатель «25 из 30»
+        # сам называет число непроверенных, а снизу стоит сноска
+        # HEALTH_CHECK_LIMIT. Третье упоминание — тот же повтор, ради отказа
+        # от которого в v1.13 была удалена сводка «расхождений нет».
+        out = '\n'.join(dc.site_health_summary(ok=25, total=30))
+        assert 'Проверено доступности: 25 из 30' in out
+        assert 'не проверя' not in out
+        assert 'HEALTH_CHECK_LIMIT' not in out
+
+    def test_nothing_checked_is_silence(self):
+        assert dc.site_health_summary() == []
+
+    # ---------- интеграция в отчёт ----------
+    def test_summary_counts_kinds_not_icons(self):
+        names = ['good.ru', 'http.ru', 'dead.ru']
+        c = FakeSSH(routes=_site_routes(
+            names, {'good.ru': OK_SITE, 'http.ru': HTTP_ONLY,
+                    'dead.ru': DEAD_SITE}))
+        out = dc.site_health_report(c, 'ispmanager')
+        assert 'Проверено доступности: 3 из 3' in out
+        assert 'HTTPS 2xx/3xx — 1, только HTTP — 1, молчит — 1' in out
+
+    def test_dead_certificate_is_not_counted_as_a_dead_site(self):
+        # В строке этого домена ДВА креста: ✅ по доступности и ❌ по SSL.
+        # Наивный подсчёт «❌» дал бы «молчит — 1» про сайт, который на самом
+        # деле отвечает.
+        c = FakeSSH(routes=_site_routes(['exp.ru'], {'exp.ru': EXPIRED_SITE}))
+        out = dc.site_health_report(c, 'ispmanager')
+        assert 'HTTPS 2xx/3xx — 1' in out
+        assert 'молчит — 1' not in out
+        assert 'SSL: истёк — 1' in out
+
+    def test_ssl_icons_are_counted(self):
+        names = ['exp.ru', 'soon.ru', 'nocert.ru', 'good.ru']
+        c = FakeSSH(routes=_site_routes(
+            names, {'exp.ru': EXPIRED_SITE, 'soon.ru': SOON_SITE,
+                    'nocert.ru': NO_CERT_SITE, 'good.ru': OK_SITE}))
+        out = dc.site_health_report(c, 'ispmanager')
+        assert ('SSL: истёк — 1, истекает < 30 дн. — 1, '
+                'сертификат не получен — 1') in out
+
+    def test_cert_is_not_counted_when_https_silent(self):
+        # При молчащем HTTPS SSL-пометка в строке не печатается (сертификат
+        # чужого дефолтного vhost нельзя показывать как свой). Значит и в
+        # счётчике его быть не может: считать то, что не показал, — врать.
+        c = FakeSSH(routes=_site_routes(['quiet.ru'], {'quiet.ru': DEAD_SITE}))
+        out = dc.site_health_report(c, 'ispmanager')
+        assert 'SSL:' not in out
+        assert 'молчит — 1' in out
+
+    def test_summary_printed_above_the_status_list(self):
+        c = FakeSSH(routes=_site_routes(['good.ru'], {'good.ru': OK_SITE}))
+        out = dc.site_health_report(c, 'ispmanager').splitlines()
+        head = next(i for i, l in enumerate(out) if 'Проверено доступности' in l)
+        gate = next(i for i, l in enumerate(out)
+                    if 'Проверка доступности' in l)
+        body = next(i for i, l in enumerate(out) if 'http=200' in l)
+        assert gate < head < body      # сразу под заголовком блока, ДО строк
+
+    def test_unchecked_domains_named_by_the_denominator(self):
+        names = [f'site{i}.ru' for i in range(30)]
+        c = FakeSSH(routes=[('mgrctl -m ispmgr webdomain', _site_rows(names))])
+        out = dc.site_health_report(c, 'ispmanager')
+        assert 'Проверено доступности: 25 из 30' in out
+        # Отдельная строка про непроверенные запрещена: 25 из 30 + сноска
+        # HEALTH_CHECK_LIMIT снизу говорят то же самое.
+        assert 'не проверя' not in out
+
+    def test_summary_costs_no_extra_probes(self):
+        # Сводка считается из уже полученных ответов: строка, которая стоит
+        # ещё одного хендшейка на домен, удвоила бы цену прогона.
+        names = [f'site{i}.ru' for i in range(30)]
+        c = FakeSSH(routes=[('mgrctl -m ispmgr webdomain', _site_rows(names))])
+        dc.site_health_report(c, 'ispmanager')
+        assert c.count("printf 'HTTP=") == 25
+
+    def test_all_healthy_still_reports_the_number(self):
+        # Пустая сводка была бы неотличима от «не считали»: число говорим
+        # всегда, проблемные категории — только когда они есть.
+        names = ['a1.ru', 'a2.ru']
+        c = FakeSSH(routes=_site_routes(names, {n: OK_SITE for n in names}))
+        out = dc.site_health_report(c, 'ispmanager')
+        assert 'Проверено доступности: 2 из 2' in out
+        assert 'HTTPS 2xx/3xx — 2' in out
+        assert 'молчит' not in out
+
+
+class TestSslHeadHonesty:
+    """Шапка SSL-отчёта не имеет права оставлять «всё в порядке» недосказанным.
+
+    До фикса шапка говорила «Истекло: 0, истекает < 30 дн.: 0» — и оператор,
+    прочитавший её, уже решил, что с SSL всё хорошо. А ниже, за всем списком,
+    прятался блок «СЕРТИФИКАТ НЕ ПОЛУЧЕН» на пять доменов: там просто нет
+    HTTPS. Это тот же закон, что «не проверено ≠ провалено» и «≠ в порядке».
+    """
+
+    # ---------- чистая функция ----------
+    def test_not_received_cert_is_named_in_the_head(self):
+        out = '\n'.join(dc.ssl_expiry_head_lines(not_received=5))
+        assert 'Сертификат не получен — 5' in out
+        assert 'не «с SSL всё в порядке»' in out
+        assert 'блоке ниже' in out              # куда смотреть за деталями
+
+    def test_not_received_is_counted_only_over_checked_domains(self):
+        # Число берётся из проверенных доменов: приписать ему домены за limit
+        # значило бы соврать дважды — и про масштаб беды, и про знаменатель.
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain',
+             _site_rows([f'site{i}.tld' for i in range(30)])),
+            ('s_client -servername site0.tld', 'HTTP=200\nHTTPS=200\n'
+             'SSL=ok\nCERT=200'),
+            ('s_client -servername site1.tld', 'HTTP=200\nHTTPS=200\n'
+             'SSL=ok\nCERT=200'),
+            ('s_client -servername site2.tld', 'HTTP=200\nHTTPS=200\n'
+             'SSL=ok\nCERT=200'),
+        ])
+        out = dc.ssl_expiry_report(c, 'ispmanager')
+        assert 'Сертификат не получен — 22' in out
+        assert 'Сертификат не получен — 30' not in out
+        assert 'Проверено доменов: 25 из 30' in out
+
+    def test_clean_run_prints_nothing_new(self):
+        assert dc.ssl_expiry_head_lines() == []
+        assert dc.ssl_expiry_head_lines(not_received=0) == []
+
+    # ---------- интеграция в отчёт ----------
+    def test_head_names_quiet_domains_above_the_list(self):
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain', 'name=quiet.tld elid=1\n'),
+            ('s_client -servername quiet.tld',
+             'HTTP=200\nHTTPS=000\nSSL=none\nCERT=none'),
+        ])
+        out = dc.ssl_expiry_report(c, 'ispmanager').splitlines()
+        head = next(i for i, l in enumerate(out)
+                    if 'Сертификат не получен — 1' in l)
+        body = next(i for i, l in enumerate(out)
+                    if 'СЕРТИФИКАТ НЕ ПОЛУЧЕН' in l)
+        assert head < body
+        # Прежняя формулировка шапки не поехала: её держат другие тесты.
+        assert any('Истекло: 0, истекает < 30 дн.: 0' in l for l in out)
+
+    def test_head_counts_only_the_checked_quiet_domains(self):
+        names = [f'site{i}.tld' for i in range(30)]
+        c = FakeSSH(routes=[('mgrctl -m ispmgr webdomain', _site_rows(names))])
+        out = dc.ssl_expiry_report(c, 'ispmanager')
+        # Ни один сайт не отвечает → все ПРОВЕРЕННЫЕ «без сертификата»; пять
+        # доменов за limit в это число попасть не могут (их не проверяли).
+        assert 'Сертификат не получен — 25' in out
+        assert 'Сертификат не получен — 30' not in out
+        assert 'Проверено доменов: 25 из 30' in out
+
+    def test_uncapped_healthy_run_stays_silent(self):
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain', 'name=ok.tld elid=1\n'),
+            ('s_client -servername ok.tld', OK_SITE),
+        ])
+        out = dc.ssl_expiry_report(c, 'ispmanager')
+        assert 'Сертификат не получен' not in out
+        assert 'Не проверялось' not in out
+
+    def test_head_costs_no_extra_handshakes(self):
+        names = [f'site{i}.tld' for i in range(30)]
+        c = FakeSSH(routes=[('mgrctl -m ispmgr webdomain', _site_rows(names))])
+        dc.ssl_expiry_report(c, 'ispmanager')
+        assert c.count('s_client -servername') == 25
+
+
 class TestMailOverview:
     def test_domains_boxes_queue_services(self):
         # Службы спрашиваются ОДНОЙ командой services_status_cmd (в ней нет
