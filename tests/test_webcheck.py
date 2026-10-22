@@ -165,19 +165,116 @@ class TestWhoisReport:
 
 
 class TestPortScanReport:
+    """Итоги проб — три разных диагноза, а не одна фраза «не ответил».
+
+    Прежний код брал `out2, _, _ = checker.run(...)`, то есть ВЫБРАСЫВАЛ код
+    возврата всех 18 проб. Проверено живьём: `connection refused` — это rc=1 за
+    4 мс (хост жив, он присылает RST: служба не слушает), а недоступный или
+    фильтруемый хост — rc=124 за 2002 мс (пакеты молча дрейпятся). Пустой вывод
+    у обоих одинаковый, поэтому отчёт печатал «ни один из типовых портов не
+    ответил» и в том, и в другом случае. Диагнозы при этом ПРОТИВОПОЛОЖНЫЕ:
+    «поднимай службы / перезагружай» против «службы в порядке, проверяй
+    firewall и cloud security group». Оператор, которому фильтруют путь, ехал
+    перезагружать живой сервер.
+    """
+
+    LISTEN_22 = 'tcp   LISTEN 0      128    0.0.0.0:22    0.0.0.0:*'
+
+    @staticmethod
+    def _stat(open_, refused, noreply, total=18):
+        return (f'PORTSTAT open={open_} refused={refused} '
+                f'noreply={noreply} total={total}\n')
+
+    def _report(self, answer, routes_extra=(), host='93.184.216.34'):
+        c = FakeSSH(routes=[('ss -tulpn', self.LISTEN_22),
+                            ('/dev/tcp/', answer)] + list(routes_extra))
+        return webcheck_mod.port_scan_report(c, host=host), c
+
     def test_open_ports_listed(self):
+        # Было: отчёт обязан показывать и слушающие, и реально ответившие, и
+        # слать пробу на указанный хост. Требование сохраняется; в фикстуру
+        # добавлен PORTSTAT, потому что новой команде он нужен, а без него
+        # выводы были бы «не проверено».
         c = FakeSSH(routes=[('ss -tulpn', 'tcp  LISTEN  0  128  *:22'),
-                             ('/dev/tcp/', '  22 открыт\n')])
+                            ('/dev/tcp/', '  22 открыт\n' + self._stat(1, 17, 0))])
         out = webcheck_mod.port_scan_report(c, host='93.184.216.34')
         assert 'tcp  LISTEN  0  128  *:22' in out
         assert '22 открыт' in out
         probe = c.find('/dev/tcp/')
-        assert probe is not None and '93.184.216.34/22' in probe
+        assert probe is not None and '93.184.216.34' in probe
 
-    def test_no_tools_no_open_ports(self):
-        out = webcheck_mod.port_scan_report(FakeSSH(), host='127.0.0.1')
+    def test_refused_everywhere_means_services_are_not_listening(self):
+        out, _ = self._report(self._stat(0, 18, 0))
+        assert 'Порты закрыты' in out
+        assert 'RST' in out                    # хост жив: он ОТВЕТИЛ отказом
+        assert 'открыт' not in out             # прежний guard: не выдумывать
+                                               # открытые порты — оставляем
+        assert 'не видно' not in out           # здесь как раз всё видно
+
+    def test_silence_is_not_reported_as_closed(self):
+        out, _ = self._report(self._stat(0, 0, 18))
+        assert '⚠️' in out
+        assert 'не видно' in out
+        assert 'Порты закрыты' not in out      # вот это и было ложью
+        assert 'firewall' in out               # куда идти оператору
+
+    def test_partially_filtered_is_not_reported_as_closed(self):
+        # Смешанный ответ (часть RST, часть дрейф) — про «закрыто» сказать
+        # нельзя: молчащие порты мы не видели.
+        out, _ = self._report(self._stat(0, 3, 15))
+        assert 'Порты закрыты' not in out
+        assert 'фильтр' in out
+
+    def test_listening_locally_but_silent_out_is_called_filtering(self):
+        # Решающая связка: ss ЗДЕСЬ показывает LISTEN :22, а снаружи порт молчит.
+        # Это не «службы лежат» — это путь фильтруют. Данные уже в прогоне,
+        # второй запрос не нужен.
+        out, _ = self._report(self._stat(0, 0, 18))
+        assert 'ℹ️' in out and '22' in out
+        assert 'фильтрац' in out
+
+    def test_no_probe_data_is_not_reported_as_closed(self):
+        # Команда не выполнилась вообще (нет timeout/bash, обрыв) — состояния не
+        # знаем, и «порты закрыты» тут было бы догадкой.
+        c = FakeSSH()
+        out = webcheck_mod.port_scan_report(c, host='127.0.0.1')
         assert '(ss/netstat недоступны)' in out
-        assert 'ни один из типовых портов не ответил' in out
+        assert 'Порты закрыты' not in out
+        assert 'неизвестно' in out
+
+    def test_service_line_is_not_shown_to_the_operator(self):
+        out, _ = self._report('  22 открыт\n' + self._stat(1, 17, 0))
+        assert 'PORTSTAT' not in out
+
+    def test_verdict_is_consistent_with_the_denominator(self):
+        # Счётчик обязательно сходится со знаменателем: «18 из 18» видно всегда,
+        # иначе масштаб беды придётся считать глазами (тот же закон, что в
+        # сводке доступности).
+        for stat in (self._stat(0, 18, 0), self._stat(0, 0, 18),
+                     self._stat(0, 3, 15)):
+            out, _ = self._report(stat)
+            assert '18' in out
+
+    def test_host_cannot_escape_into_the_command(self):
+        # Вскрыто живым прогоном, а не догадкой: прежний код вставлял host в
+        # `</dev/tcp/{host}/{p}` неэкранированным, и host вида
+        # «127.0.0.1; echo INJECTED» РЕАЛЬНО выполнял echo (в выводе был
+        # «INJECTED/22», rc=0 — то есть 18 ложных «порт открыт»). Кавычки
+        # внутрь пути /dev/tcp ставить нельзя (проверено: проба ломается),
+        # поэтому хост уходит отдельным словом и в путь попадает позиционным
+        # параметром.
+        evil = "127.0.0.1; echo INJECTED"
+        _, c = self._report(self._stat(0, 18, 0), host=evil)
+        probe = c.find('/dev/tcp/')
+        assert 'INJECTED/22' not in probe
+        assert 'INJECTED/' not in probe
+        assert f"'{evil}'" in probe          # экранирован как единое слово
+
+    def test_price_is_two_commands_per_report(self):
+        # Цена прогона не растёт: по-прежнему ровно две SSH-команды (ss/netstat
+        # + одна проба, внутри которой 18 локальных коннектов).
+        _, c = self._report(self._stat(0, 18, 0))
+        assert len(c.commands) == 2
 
 
 class TestGrepLogsReport:
