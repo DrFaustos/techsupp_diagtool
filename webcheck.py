@@ -111,27 +111,163 @@ def whois_report(checker, domain):
     return "\n".join(lines)
 
 
+# Типовые порты, которые проверяет «Сканирование портов».
+COMMON_PORTS = [21, 22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995,
+                3306, 5432, 6379, 8080, 8443, 27017]
+
+_PORTSTAT_RE = re.compile(
+    r'PORTSTAT open=(\d+) refused=(\d+) noreply=(\d+) total=(\d+)')
+_OPEN_LINE_RE = re.compile(r'^\s+(\d+) открыт', re.M)
+_LISTEN_PORT_RE = re.compile(r':(\d{1,5})$')
+
+
+def port_probe_cmd(target, ports=None):
+    """Одна команда: 18 локальных коннектов и счётчик ИСХОДОВ проб.
+
+    Исходы различимы, и раньше именно это выбрасывалось (`out2, _, _ =
+    checker.run(...)`). Проверено живьём: `connection refused` — rc=1 за 4 мс
+    (хост ЖИВ, он присылает RST: служба не слушает), недоступный или фильтруемый
+    хост — rc=124 за 2002 мс (пакеты молча дрейпятся). Пустой stdout у обоих
+    одинаковый, поэтому прежняя фраза «ни один из типовых портов не ответил»
+    закрывала два ПРОТИВОПОЛОЖНЫХ диагноза: «поднимай службы / перезагружай» и
+    «службы в порядке, проверяй firewall». Оператор, которому фильтруют путь,
+    ехал перезагружать живой сервер.
+
+    Хост уходит отдельным словом, а в путь /dev/tcp попадает позиционным
+    параметром: кавычки ВНУТРИ пути ставить нельзя (проверено — проба ломается и
+    даёт rc=1, то есть «закрыто» там, где мы просто не смогли проверить), а
+    неэкранированная вставка РЕАЛЬНО выполняла чужой код (живой прогон с
+    host='127.0.0.1; echo INJECTED' дал «INJECTED/22» и rc=0 — 18 ложных
+    «порт открыт»).
+    """
+    ports = ports or COMMON_PORTS
+    plist = ' '.join(str(int(p)) for p in ports)
+    return (
+        f'''T={q(str(target))}; OPEN=0; REFUSED=0; NOREPLY=0; '''
+        f'''for p in {plist}; do '''
+        '''if timeout 1 bash -c '</dev/tcp/"$1"/"$2"' _ "$T" "$p" 2>/dev/null; '''
+        '''then printf '  %s открыт\\n' "$p"; OPEN=$((OPEN+1)); '''
+        '''else rc=$?; if [ "$rc" -ge 124 ]; then NOREPLY=$((NOREPLY+1)); '''
+        '''else REFUSED=$((REFUSED+1)); fi; fi; '''
+        '''done; TOTAL=$((OPEN+REFUSED+NOREPLY)); '''
+        '''printf 'PORTSTAT open=%s refused=%s noreply=%s total=%s\\n' '''
+        '''"$OPEN" "$REFUSED" "$NOREPLY" "$TOTAL"'''
+    )
+
+
+def parse_port_stat(out):
+    """Счётчик исходов из служебной строки PORTSTAT (None — данных нет).
+
+    None — это «не проверено», а НЕ «порты закрыты»: команды могла не быть
+    (нет bash/timeout, обрыв соединения).
+    """
+    found = None
+    for line in out.splitlines():
+        m = _PORTSTAT_RE.search(line)
+        if m:
+            found = m
+    if not found:
+        return None
+    return {'open': int(found.group(1)), 'refused': int(found.group(2)),
+            'noreply': int(found.group(3)), 'total': int(found.group(4))}
+
+
+def parse_listening_ports(out):
+    """Номера TCP-портов в состоянии LISTEN из вывода ss/netstat.
+
+    Только LISTEN и только tcp: udp-записи (systemd-resolved 5353) и ESTAB
+    (активные соединения) иначе выдали бы «слушает тут», которой нет.
+    """
+    ports = set()
+    for line in out.splitlines():
+        fields = line.split()
+        if not fields or fields[0].lower() not in ('tcp', 'tcp6'):
+            continue
+        if not any(f.lower() == 'listen' for f in fields):
+            continue
+        for field in fields:
+            m = _LISTEN_PORT_RE.search(field)
+            if not m:
+                continue
+            port = int(m.group(1))
+            if 1 <= port <= 65535:
+                ports.add(port)
+            break
+    return ports
+
+
+def port_scan_verdict(out2, listening, shown, ports=None):
+    """Итог проб: три разных диагноза вместо одной фразы «не ответил».
+
+    Единственный источник и иконки, и слов, и цифр — один `stat`, поэтому
+    вердикт не разъедется со счётчиком (тот же закон, что в ssl_cert_report).
+    """
+    stat = parse_port_stat(out2)
+    lines = []
+    if shown:
+        lines.append(shown)
+    if stat is None:
+        lines.append("❓ Состояние проб неизвестно: команда не вернула счётчик "
+                     "(нет bash/timeout или обрыв соединения) — это "
+                     "«не проверено», а не «порты закрыты». Повторите проверку.")
+        return lines
+
+    total = stat['total']
+    opened, refused, noreply = stat['open'], stat['refused'], stat['noreply']
+    if opened == 0 and refused == total:
+        lines.append(f"❌ Порты закрыты: {refused} из {total} соединений "
+                     f"отклонены (RST) — хост жив и ОТВЕЧАЕТ, службы не "
+                     f"слушают. Смотри вывод ss выше: поднимай нужные службы, "
+                     f"перезагрузка сервера здесь не при чём.")
+    elif noreply == total:
+        lines.append(f"⚠️ Порты не видно: {noreply} из {total} молчат — пакеты "
+                     f"дрейфуют. Хост недоступен ИЛИ путь фильтруют (firewall, "
+                     f"cloud security group, ваш IP). Это НЕ «порты закрыты»: "
+                     f"службы могут работать.")
+    elif noreply:
+        lines.append(f"⚠️ Ответили не на всё: из {total} молчат {noreply} "
+                     f"(похоже на фильтр — firewall / cloud security group), "
+                     f"отклонены (RST) {refused}, отвечают {opened}. Про "
+                     f"«порты закрыты» говорить нельзя: молчащие мы не видели.")
+    else:
+        lines.append(f"✅ Все {total} из {total} соединений отвечают "
+                     f"(открыто {opened}, отклонено RST {refused}).")
+
+    if noreply:
+        # Решающая связка: ss ЗДЕСЬ показывает LISTEN, а снаружи порт молчит.
+        # Это не упавшая служба, это фильтрация пути. Данные уже в прогоне —
+        # второй сетевой запрос не нужен.
+        outside = set(int(p) for p in _OPEN_LINE_RE.findall(shown))
+        silent = sorted(p for p in listening
+                        if p in (ports or COMMON_PORTS) and p not in outside)
+        if silent:
+            shown_list = ', '.join(str(p) for p in silent[:8])
+            lines.append(f"ℹ️ Порт(а) {shown_list} слушают на самом сервере "
+                         f"(ss их показывает), но снаружи молчат — это "
+                         f"фильтрация пути, а не упавшая служба: проверяйте "
+                         f"firewall, cloud security group и свой IP.")
+    return lines
+
+
 def port_scan_report(checker, host=None):
     """Сканирование слушающих портов + проверка типовых портов (аналог nmap -T4)."""
     lines = ["=== СКАНИРОВАНИЕ ПОРТОВ ==="]
     out, _, _ = checker.run('ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null')
+    listening = parse_listening_ports(out)
     if out.strip():
         lines.append("Слушающие порты (ss/netstat):")
         lines.append(out.strip())
     else:
         lines.append("(ss/netstat недоступны)")
 
-    # Быстрая проверка типовых открытых портов извне (connect через /dev/tcp)
-    common_ports = [21, 22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995,
-                    3306, 5432, 6379, 8080, 8443, 27017]
     target = host or "127.0.0.1"
-    checks = "; ".join(
-        f"timeout 1 bash -c '</dev/tcp/{target}/{p}' 2>/dev/null && echo '  {p} открыт'"
-        for p in common_ports
-    )
-    out2, _, _ = checker.run(checks + " 2>/dev/null")
+    out2, _, _ = checker.run(port_probe_cmd(target, COMMON_PORTS))
+    # PORTSTAT — служебная строка НАШЕЙ команды: к выводу утилит она отношения
+    # не имеет, и оператор принял бы её за результат сканирования.
+    shown = '\n'.join(l for l in out2.splitlines()
+                      if 'PORTSTAT' not in l).strip()
     lines.append(f"\nТиповые порты на {target}:")
-    lines.append(out2.strip() if out2.strip() else "  (ни один из типовых портов не ответил)")
+    lines.extend(port_scan_verdict(out2, listening, shown, COMMON_PORTS))
     return "\n".join(lines)
 
 
