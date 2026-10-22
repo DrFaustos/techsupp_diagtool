@@ -2,7 +2,44 @@
 import re
 
 from common import q
+from discovery import (CERT_STATE_ICON, cert_days_label, cert_state,
+                       parse_cert_days)
 from logs import find_logs, get_domains
+
+
+def ssl_cert_days_cmd(domain, port=443):
+    """Одна сетевая команда: данные сертификата + остаток в днях на сервере.
+
+    Не было второго хендшейка: срок проверялся ОТДЕЛЬНОЙ командой
+    (`openssl x509 -checkend 0`), а её код возврата был выброшен — `timeout`,
+    отсутствие openssl или разорванное соединение давали пустой вывод, «VALID»
+    в нём не было, и отчёт печатал «❌ Сертификат ИСТЁК». Ложная беда дороже
+    честного «не видно»: оператор ехал перевыпускать сертификат.
+
+    `notAfter` уже лежит в выводе `-dates`, поэтому остаток добирается локальной
+    `date` на сервере, а не новым сетевым запросом. Дни считаем ИМЕННО там: дата
+    машины оператора к выпуску сертификата отношения не имеет (то же правило,
+    что в `discovery.site_status_command`). Не удалось посчитать — `CERT=none`,
+    и это «не определено», а не «истёк».
+
+    Проверка `[ -n "$END" ]` обязательна и это не перестраховка: пустая строка
+    для GNU `date -d` — НЕ ошибка, а «сейчас» (rc=0). Без guard'а закрытый порт
+    (не `notAfter`, пустая `END`) давал `CERT=0`, то есть «⚠️ SSL осталось 0 дн.»
+    про сертификат, которого там нет, — ту самую ложь, ради которой правка.
+    """
+    d = q(domain)
+    return (
+        f'''CERT=$(echo | timeout 10 openssl s_client -servername {d}'''
+        f''' -connect {d}:{int(port)} 2>/dev/null'''
+        f''' | openssl x509 -noout -subject -issuer -dates'''
+        f''' -ext subjectAltName 2>/dev/null); '''
+        f'''printf '%s\n' "$CERT"; '''
+        f'''END=$(printf '%s\n' "$CERT" | sed -n 's/^notAfter=//p'); '''
+        f'''if [ -n "$END" ]; then EPOCH=$(date -d "$END" +%s 2>/dev/null); fi; '''
+        f'''NOW=$(date +%s); '''
+        f'''if [ -z "$EPOCH" ]; then printf 'CERT=none\n'; '''
+        f'''else printf 'CERT=%s\n' "$(( (EPOCH - NOW) / 86400 ))"; fi'''
+    )
 
 
 def ssl_cert_report(checker, domain, port=443):
@@ -12,34 +49,38 @@ def ssl_cert_report(checker, domain, port=443):
         lines.append("❌ Домен не задан")
         return "\n".join(lines)
 
-    cmd = (
-        f"echo | timeout 10 openssl s_client -servername {q(domain)} "
-        f"-connect {q(domain)}:{int(port)} 2>/dev/null "
-        f"| openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null"
-    )
-    out, _, rc = checker.run(cmd)
-    if not out.strip():
-        lines.append("❌ Не удалось получить сертификат (порт закрыт, нет openssl или домен недоступен)")
+    out, _, _ = checker.run(ssl_cert_days_cmd(domain, port))
+    # CERT= — служебная строка НАШЕЙ команды: к сертификату она отношения не
+    # имеет, и в «сыром выводе openssl» оператор принял бы её за его поле.
+    # Отфильтровываем ДО решения «получены ли данные»: иначе наша же строка
+    # CERT=... выглядела бы как ответ сервера и «не удалось получить» бы
+    # промолчало, уступив место вердикту о сроке несуществующего сертификата.
+    data = '\n'.join(l for l in out.splitlines()
+                     if not l.startswith('CERT=')).strip()
+    if not data:
+        # «Не получили ответ» ≠ «сертификат истёк» — ровно тот же закон, что
+        # заперт для dig и для почтового лога.
+        lines.append("❌ Не удалось получить сертификат (порт закрыт, нет "
+                     "openssl или домен недоступен): это «не проверено», "
+                     "а не «истёк».")
         return "\n".join(lines)
 
-    lines.append(out.strip())
+    lines.append(data)
 
-    # Проверка срока действия
-    not_after = None
-    for line in out.splitlines():
-        if line.lower().startswith('notafter'):
-            not_after = line.split('=', 1)[-1].strip()
-    if not_after:
-        cmd_days = (
-            f"echo | timeout 10 openssl s_client -servername {q(domain)} "
-            f"-connect {q(domain)}:{int(port)} 2>/dev/null "
-            f"| openssl x509 -noout -checkend 0 2>/dev/null && echo VALID || echo EXPIRED"
-        )
-        out_days, _, _ = checker.run(cmd_days)
-        if 'VALID' in out_days:
-            lines.append("✅ Сертификат действителен")
-        else:
-            lines.append("❌ Сертификат ИСТЁК")
+    days = parse_cert_days(out)
+    if days is None:
+        # Сертификат в руках, а срок посчитать не удалось (не GNU date, редкий
+        # формат notAfter). Ни зелёного, ни красного: любое из них было бы
+        # догадкой, а догадка про сертификат стоит оператору вечера работы.
+        lines.append("❓ SSL срок действия не определён: сервер не посчитал "
+                     "остаток по notAfter (проверьте GNU date). Проверьте срок "
+                     "вручную — командой ниже.")
+    else:
+        # Подпись — та же, что в сводке доступности и в «Досье домена»
+        # (discovery.cert_days_label): две формулировки одной беды однажды
+        # разъехались бы, и оператор не узнал бы свою беду в другом отчёте.
+        lines.append(f"{CERT_STATE_ICON[cert_state(days)]} SSL "
+                     f"{cert_days_label(days)}")
     return "\n".join(lines)
 
 
