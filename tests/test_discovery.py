@@ -1181,28 +1181,37 @@ class TestMailAuthLines:
     def test_five_queries_per_domain_when_address_is_known(self):
         c = FakeSSH(routes=[('dig +short A', '93.184.216.34'),
                             ('dig +short -x', 'mail.ex.com.')])
-        verdict, _lines, ip = dc.mail_auth_lines(c, 'ex.com')
+        verdict, _lines, ip, _state = dc.mail_auth_lines(c, 'ex.com')
         assert ip == '93.184.216.34'
         assert c.count('dig ') == 5          # A, SPF, DMARC, DKIM, PTR
         assert verdict in dc.AUTH_SEVERITY
 
     def test_no_ptr_query_without_an_address(self):
         c = FakeSSH()
-        _v, _l, ip = dc.mail_auth_lines(c, 'ex.com')
+        _v, _l, ip, _state = dc.mail_auth_lines(c, 'ex.com')
         assert ip == '' and c.count('dig +short -x') == 0
 
     def test_header_can_be_hidden_for_embedded_use(self):
         # В «Досье домена» домен уже написан в шапке отчёта — строку со статусами
         # того же домена дублировать не нужно
-        _v, with_header, _ip = dc.mail_auth_lines(FakeSSH(), 'ex.com')
-        _v, no_header, _ip = dc.mail_auth_lines(FakeSSH(), 'ex.com', header=False)
+        _v, with_header, _ip, _s = dc.mail_auth_lines(FakeSSH(), 'ex.com')
+        _v, no_header, _ip, _s = dc.mail_auth_lines(FakeSSH(), 'ex.com',
+                                                    header=False)
         assert len(no_header) < len(with_header)
         assert any(l.lstrip().startswith('ex.com') for l in with_header)
         assert not any(l.lstrip().startswith('ex.com') for l in no_header)
 
     def test_note_is_printed_once(self):
-        _v, lines, _ip = dc.mail_auth_lines(FakeSSH(), 'ex.com', note='ЗОНА ЛОКАЛЬНАЯ')
+        _v, lines, _ip, _s = dc.mail_auth_lines(FakeSSH(), 'ex.com',
+                                                note='ЗОНА ЛОКАЛЬНАЯ')
         assert sum(1 for l in lines if 'ЗОНА ЛОКАЛЬНАЯ' in l) == 1
+
+    def test_verify_state_is_not_claimed_without_a_check(self):
+        # Сверки не было (резолвера не передавали) — состояние пустое. Если бы
+        # здесь вернулся 'same', сводка написала бы «расхождений нет» про домен,
+        # который никто с интернетом не сверял.
+        _v, _l, _ip, state = dc.mail_auth_lines(FakeSSH(), 'ex.com')
+        assert state == ''
 
 
 class TestSpfSuggestionBasis:
@@ -1399,8 +1408,11 @@ class TestMailAuthFixes:
 
 class TestMailAuthHintsInReports:
     def test_hints_are_printed_after_checks_and_only_where_broken(self):
-        _v, lines = dc.summarize_mail_auth('bad.ru', '', '', '', '',
-                                           ip='93.184.216.34')
+        # Третье поле — состояние сверки; здесь его не проверяют (сверки нет),
+        # но распаковка обязана соответствовать возврату, иначе тест упадёт на
+        # «too many values», а не на смысле.
+        _v, lines, _state = dc.summarize_mail_auth('bad.ru', '', '', '', '',
+                                                  ip='93.184.216.34')
         # Ищем именно строку диагноза PTR, а не заголовок со статусами (в нём
         # «PTR» тоже есть, и первое вхождение было бы тривиально верным).
         ptr_line = next(i for i, l in enumerate(lines)
@@ -1413,7 +1425,7 @@ class TestMailAuthHintsInReports:
 
     def test_configured_domain_prints_no_hints(self):
         good = 'v=DKIM1; k=rsa; p=' + 'A' * 216
-        _v, lines = dc.summarize_mail_auth(
+        _v, lines, _state = dc.summarize_mail_auth(
             'good.ru', '"v=spf1 ip4:1.2.3.4 -all"',
             '"v=DMARC1; p=reject; rua=mailto:p@good.ru"',
             'dkim._domainkey.good.ru|' + good + '\n',
@@ -1424,7 +1436,7 @@ class TestMailAuthHintsInReports:
         # Подсказки строятся из уже полученных ответов (в т.ч. из A-записи):
         # совет, который стоит ещё одного запроса на домен, удвоил бы цену прогона.
         c = FakeSSH(routes=[('dig +short A', '93.184.216.34')])
-        _v, lines, _ip = dc.mail_auth_lines(c, 'ex.com')
+        _v, lines, _ip, _state = dc.mail_auth_lines(c, 'ex.com')
         assert any(l.lstrip().startswith('→') for l in lines)
         # A, SPF, DMARC, DKIM, PTR — ровно те же пять, что и без подсказок
         assert c.count('dig ') == 5
@@ -1610,7 +1622,15 @@ class TestExternalVerification:
         out = dc.mail_auth_report(c, 'ispmanager')
         assert 'Провалено: 1, с замечаниями: 0' in out
         assert '[извне]' in out
-        assert len(_diff_lines(out)) == 4              # SPF, DKIM, DMARC, PTR
+        # Пересчёт гарда осознанный: сверху добавилась групповая сводка, и она
+        # тоже начинается с «🌐». Оставить «== 4» означало бы, что сводка
+        # пришла бы как «позеленевший» тест; ослабить хелпер — потерять смысл.
+        # Поэтому считаем раздельно: одна сводка сверху и ровно по одной
+        # телесной строке на каждую из четырёх проверок.
+        diffs = _diff_lines(out)
+        assert len(diffs) == 5
+        assert sum(1 for l in diffs if l.startswith('🌐 Расходится')) == 1
+        assert sum(1 for l in diffs if 'извне' in l) == 4   # SPF, DKIM, DMARC, PTR
         assert 'TXT-записей у домена нет вообще' in out
 
     def test_local_lines_stay_printed(self):
@@ -1663,6 +1683,11 @@ class TestExternalVerification:
         out = dc.mail_auth_report(c, 'ispmanager')
         assert 'публичные записи совпадают' in out
         assert len(_diff_lines(out)) == 1              # ровно одно сообщение
+        # Держим гард словами: групповая фраза «расхождений нет» запрещена,
+        # потому что то же самое уже напечатано в теле (и там назван резолвер).
+        # Повтор оператор читает как невнимательность и перестаёт доверять.
+        assert 'Расходится с публичной зоной' not in out
+        assert 'Расхождений с публичной зоной нет' not in out
         assert 'Провалено: 0, с замечаниями: 0' in out
 
     def test_price_of_verification(self):
@@ -1677,6 +1702,93 @@ class TestExternalVerification:
         c = FakeSSH(routes=_verify_routes(rows=rows))
         dc.mail_auth_report(c, 'ispmanager')
         assert c.count('a.root-servers.net') == 1
+
+
+class TestVerifySummary:
+    """Масштаб беды — до чтения списка доменов.
+
+    При 25 доменах оператор обязан узнать «у 4 зона расходится с интернетом»
+    первой строкой: это ответ на решение «править зону централизованно» либо
+    «разбираться по доменам». Считается СОСТОЯНИЕМ сверки каждого домена, а не
+    символом «🌐» в тексте: этот символ печатается в трёх несходных случаях —
+    «разошлось», «совпало», «сверить не удалось» — и подсчёт по подстроке дал бы
+    число, которого нет.
+    """
+
+    # ---------- чистая функция: счётчик по состоянию ----------
+    def test_diverged_line_carries_the_verified_denominator(self):
+        # «4» без «из скольких сверено» было бы манипуляцией: 4 расхождения при
+        # одном сверенном домене и при двадцати — разный масштаб работ.
+        out = '\n'.join(dc.mail_auth_verify_lines(diverged=4, same=21))
+        assert 'Расходится с публичной зоной: 4 (сверено доменов: 25)' in out
+        assert 'по ПУБЛИЧНОЙ зоне' in out
+
+    def test_matches_get_no_summary_line(self):
+        # Ветка «совпало» запрещена запертым гардом «ровно одно сообщение»: в
+        # теле каждого домена уже напечатано «публичные записи совпадают» — там
+        # назван и резолвер. Повтор оператор читает как невнимательность.
+        assert dc.mail_auth_verify_lines(diverged=0, same=25) == []
+
+    def test_unverified_is_its_own_line_not_a_clean_verdict(self):
+        out = '\n'.join(dc.mail_auth_verify_lines(unverified=12))
+        assert 'Сверить с публичной зоной не удалось: 12' in out
+        assert 'по ЛОКАЛЬНЫМ данным' in out
+        # «не видно», а не «расхождений нет» — иначе сводка сама стала бы
+        # источником ложного «в порядке».
+        assert '«не видно»' in out
+        assert 'dig +short TXT' in out                   # чем проверить вручную
+
+    def test_no_check_at_all_is_silence_not_zero_divergences(self):
+        # Сверки не было ни у кого (зоны внешние): «расхождений нет» означало бы
+        # «мы проверили и всё чисто», чего мы не проверяли.
+        assert dc.mail_auth_verify_lines() == []
+
+    def test_diverged_and_unverified_printed_separately(self):
+        out = '\n'.join(dc.mail_auth_verify_lines(diverged=2, same=3,
+                                                  unverified=20))
+        assert 'Расходится с публичной зоной: 2 (сверено доменов: 5)' in out
+        assert 'Сверить с публичной зоной не удалось: 20' in out
+        # Числа не складываются: 2 беды и 20 «не видно» — разные решения.
+        assert 'не удалось: 22' not in out
+
+    # ---------- интеграция в отчёт ----------
+    def test_summary_names_the_scale_above_the_domain_list(self):
+        c = FakeSSH(routes=_verify_routes())
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert '🌐 Расходится с публичной зоной: 1 (сверено доменов: 1)' in out
+        lines = out.splitlines()
+        head = next(i for i, l in enumerate(lines) if 'Расходится' in l)
+        body = next(i for i, l in enumerate(lines)
+                    if l.startswith('lie.ru'))
+        assert head < body                   # масштаб — ДО списка, а не после
+
+    def test_summary_counts_only_checked_domains(self):
+        # Проверены первые `limit` из большего списка: приписать счётчику
+        # домены, которые не проверялись, — соврать про масштаб беды. За limit
+        # обязан уйти zzz.ru: фикстура _verify_routes заточена под lie.ru
+        # (иглы содержат его имя), а домен с пустой зоной с обеих сторон
+        # расхождения не даёт — с «aaa.ru» этот кейс молча проверял не то.
+        rows = 'name=lie.ru elid=1\nname=zzz.ru elid=2\n'
+        c = FakeSSH(routes=_verify_routes(rows=rows))
+        out = dc.mail_auth_report(c, 'ispmanager', limit=1)
+        assert 'Проверено доменов: 1 из 2' in out
+        assert 'Расходится с публичной зоной: 1 (сверено доменов: 1)' in out
+        assert 'сверено доменов: 2' not in out
+
+    def test_unverified_count_is_reported_in_the_header(self):
+        c = FakeSSH(routes=_verify_routes(
+            ext_rc='', ext_ip='', ext_spf='', ext_dmarc='', ext_ptr=''))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'Сверить с публичной зоной не удалось: 1' in out
+        assert 'Расходится с публичной зоной' not in out
+
+    def test_summary_costs_no_extra_dns_queries(self):
+        # Сводка считается из уже полученных ответов (11 = probe + 5 локальных
+        # + 5 внешних, как до появления сводки). Строка, которая стоит ещё
+        # одного запроса, удвоила бы цену прогона.
+        c = FakeSSH(routes=_verify_routes())
+        dc.mail_auth_report(c, 'ispmanager')
+        assert c.count('dig ') == 11
 
 
 class TestUnverifiedIsNotClean:
