@@ -1556,6 +1556,23 @@ def summarize_mail_auth(domain, spf_out, dmarc_out, dkim_out, ptr_out,
                      f'данным, проверьте вручную: '
                      f'dig +short TXT {domain} @1.1.1.1')
 
+    # Состояние сверки — наружу, ТЕМ ЖЕ кодом, что напечатал строки «🌐».
+    # Сводка обязана считать именно его, а не искать «🌐» в готовом тексте:
+    # этот символ означает ТРИ разные вещи — «зона разошлась», «публичные
+    # записи совпали», «сверить не удалось». Подсчёт по подстроке смешал бы
+    # беду с «не проверено» (а у пометки «см. строки «🌐»» символ вовсе
+    # служебный), и оператор получил бы число, которого не существует.
+    if verified:
+        diff_state = 'diverged' if diffs else 'same'
+    elif ext is not None or verify_wanted:
+        # Сверить хотели и не смогли: резолвер жив, но по домену не ответил,
+        # либо публичных резолверов не нашлось вовсе.
+        diff_state = 'unverified'
+    else:
+        # Сверять было нечего: зона не локальная и резолвер внешний — локальные
+        # ответы и есть ответы интернета. Про сверку тогда не пишем ничего.
+        diff_state = ''
+
     # Подсказки — только там, где чинить есть что: у настроенного домена список
     # пуст, и дописывать «всё хорошо» некуда (вердикт ok это уже сказал).
     # Строим их по ПУБЛИЧНОЙ картине: чинить надо то, что видит приёмник.
@@ -1565,7 +1582,10 @@ def summarize_mail_auth(domain, spf_out, dmarc_out, dkim_out, ptr_out,
         lines.append(f'{pad}→ {fix}')
     if note:
         lines.append(f'{pad}⚠️ {note}')
-    return verdict, lines
+    # Третье поле — состояние сверки ('diverged' / 'same' / 'unverified' / '').
+    # Оно нужно вызывающему, чтобы посчитать масштаб беды ДО чтения списка
+    # доменов, и взято из тех же переменных, что напечатали строки «🌐».
+    return verdict, lines, diff_state
 
 
 def mail_auth_lines(checker, domain, note='', header=True, resolver='',
@@ -1584,9 +1604,14 @@ def mail_auth_lines(checker, domain, note='', header=True, resolver='',
 
     verify_wanted — «сверка была нужна, но резолвера не нашлось»: без него
     домен с локально-зелёной зоной выглядел бы проверенным.
+
+    Четвёртый элемент — состояние сверки ('diverged' / 'same' /
+    'unverified' / ''), чтобы сводка считала масштаб беды из факта, а не из
+    текста. Порядок первых трёх (вердикт, строки, ip) не менялся: ip был
+    добавлен тем же способом.
     """
     ip = first_ipv4(checker.exec_command(a_query_command(domain))[0])
-    return summarize_mail_auth(
+    verdict, lines, diff_state = summarize_mail_auth(
         domain,
         checker.exec_command(spf_query_command(domain))[0],
         checker.exec_command(dmarc_query_command(domain))[0],
@@ -1594,7 +1619,8 @@ def mail_auth_lines(checker, domain, note='', header=True, resolver='',
         checker.exec_command(ptr_query_command(ip))[0] if ip else '',
         ip=ip, note=note, header=header,
         ext=external_auth_answers(checker, domain, resolver) if resolver else None,
-        resolver=resolver, verify_wanted=verify_wanted) + (ip,)
+        resolver=resolver, verify_wanted=verify_wanted)
+    return verdict, lines, ip, diff_state
 
 
 MAIL_AUTH_FIX_HINT = (
@@ -1604,6 +1630,49 @@ MAIL_AUTH_FIX_HINT = (
     "сочиняют свою. DKIM — исключение: там запись берут из ключа MTA или "
     "включают подпись в панели (см. «→ DKIM»). PTR настраивает владелец "
     "IP-адреса (хостер), а не панель.")
+
+
+def mail_auth_verify_lines(diverged=0, same=0, unverified=0):
+    """Сколько доменов расходится с публичной зоной — строки в шапку отчёта.
+
+    Считается по СОСТОЯНИЮ сверки каждого домена, а не по символу «🌐» в
+    готовом тексте. Этот символ печатается в трёх несходных случаях — «зона
+    разошлась», «публичные записи совпали с локальными», «сверить не удалось»,
+    — и подсчёт по подстроке дал бы число, которого нет: оператор прочитал бы
+    «расходится: 7» там, где семь доменов просто не удалось проверить. Смешать
+    беду с «не проверено» — тот же грех, что и «не проверено» → «в порядке».
+
+    Здесь же причина, по которой молчание — правильный ответ: если сверки не
+    было ни у одного домена (зоны внешние, смотреть нечего), печатать «расхождений
+    нет» нельзя. Не проверяли — это не «в порядке».
+    """
+    if not (diverged or same or unverified):
+        return []
+    lines = []
+    if diverged:
+        # Число без «из скольких сверено» было бы манипуляцией: «4» при одном
+        # сверенном домене и «4» при двадцати — разный масштаб работ.
+        lines.append(f"🌐 Расходится с публичной зоной: {diverged} "
+                     f"(сверено доменов: {diverged + same}) — вердикты и "
+                     f"строки «→» ниже показаны по ПУБЛИЧНОЙ зоне: письмо "
+                     f"судит приёмник,")
+        lines.append("   который видит DNS интернета, а не файл локальной "
+                     "зоны. Править надо там, где зона живёт для всех.")
+    # Ветки «совпало» здесь нет намеренно, и поймал это запертый тест
+    # «ровно одно сообщение»: в теле каждого домена уже напечатано
+    # «🌐 сверка через {resolver}: публичные записи совпадают», то есть
+    # назван даже резолвер. Вторая строка сверху ничего не добавляла бы, а
+    # оператор прочитал бы одно и то же дважды и перестал бы доверять выводу.
+    # Чинить при совпадении нечего — группировать нечего.
+    if unverified:
+        # Отдельная строка, а не плюс к предыдущей: «не сверено» не обязано
+        # выглядеть как «в порядке» и не обязано прятаться за «расхождений нет».
+        lines.append(f"🌐 Сверить с публичной зоной не удалось: {unverified} — "
+                     f"их вердикты получены по ЛОКАЛЬНЫМ данным и помечены "
+                     f"«[не сверено]». Это «не видно»,")
+        lines.append("   а не «расхождений нет»: проверить вручную — "
+                     "dig +short TXT <домен> @1.1.1.1")
+    return lines
 
 
 def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
@@ -1638,25 +1707,33 @@ def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
     resolver = public_resolver(checker) if any(need.values()) else ''
     checked = []
     for dom in domains[:limit]:
-        verdict, detail, _ip = mail_auth_lines(
+        verdict, detail, _ip, diff_state = mail_auth_lines(
             checker, dom, resolver=resolver if need[dom] else '',
             # Нужна, но не сделана (резолверов не нашлось) — вердикт по
             # локальным данным, и он не имеет права печататься как проверенный.
             verify_wanted=bool(need[dom]) and not resolver,
             note=zone_view_note(dom, zones, resolver_note,
                                 verified=bool(resolver) and bool(need[dom])))
-        checked.append((AUTH_SEVERITY[verdict], dom, detail))
+        checked.append((AUTH_SEVERITY[verdict], dom, detail, diff_state))
 
     # Худшие сверху; порядок внутри одной беды — алфавитный, иначе список
     # менялся бы от прогона к прогону и оператор не узнал бы свой домен.
     checked.sort(key=lambda item: (-item[0], item[1]))
-    bad = sum(1 for sev, _d, _l in checked if sev == AUTH_SEVERITY['bad'])
-    warn = sum(1 for sev, _d, _l in checked if sev == AUTH_SEVERITY['warn'])
+    bad = sum(1 for item in checked if item[0] == AUTH_SEVERITY['bad'])
+    warn = sum(1 for item in checked if item[0] == AUTH_SEVERITY['warn'])
     lines.append(f"Проверено доменов: {len(checked)} из {len(domains)}. "
                  f"Провалено: {bad}, с замечаниями: {warn}.")
+    # Масштаб беды — до чтения списка. При 25 доменах оператор обязан узнать
+    # «у 4 зона расходится с интернетом» в первой строке, а не досчитывая 🌐
+    # глазами: счётчик ведёт к решению «править зону централизованно» либо
+    # «разбираться по доменам».
+    lines.extend(mail_auth_verify_lines(
+        diverged=sum(1 for item in checked if item[3] == 'diverged'),
+        same=sum(1 for item in checked if item[3] == 'same'),
+        unverified=sum(1 for item in checked if item[3] == 'unverified')))
     lines.append("Худшие сверху: в спам письмо кладёт одна проваленная "
                  "проверка, а не средняя.")
-    for _sev, _dom, detail in checked:
+    for _sev, _dom, detail, _state in checked:
         lines.append('')
         lines.extend(detail)
 
@@ -1763,7 +1840,7 @@ def domain_detail_report(checker, domain, panel_type=None):
         # разъехались бы, и домен остался бы с локальной правкой без проверки.
         need = zone_is_local_view(dom, zones, resolver_note)
         resolver = public_resolver(checker) if need else ''
-        _verdict, auth_lines, _ip = mail_auth_lines(
+        _verdict, auth_lines, _ip, _state = mail_auth_lines(
             checker, dom, header=False, resolver=resolver,
             verify_wanted=bool(need) and not resolver,
             note=zone_view_note(dom, zones, resolver_note,
