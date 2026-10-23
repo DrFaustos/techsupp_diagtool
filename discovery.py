@@ -15,7 +15,12 @@ postfix-карты), — чистые функции: проверяются т�
 import re
 import shlex
 
-from common import (q, find_files_info, read_file_content, read_file_info,
+# read_file_content отсюда убран в 1.26.0: после перевода /etc/resolv.conf и
+# /etc/hosts на read_file_info реальных вызовов в файле не осталось (проверено
+# ast, не глазами). Держать импорт функции, которую файл не зовёт, — врать о
+# зависимости: следующий читатель решит, что «читать без состояния» тут ещё
+# можно, и вернёт ту же ложь.
+from common import (q, find_files_info, read_file_info,
                     write_remote_file, prepare_secret_file, remove_remote_path)
 from logs import (find_logs, mail_log_snapshot_lines,
                   mail_delivery_digest_lines)
@@ -349,6 +354,34 @@ def hosts_le_blockers(text, domain):
             if any(p.lower() == dom for p in parts[1:]):
                 hits.append(line)
     return hits
+
+
+HOSTS_UNKNOWN_NOTE = ("⚠️ {path} не прочитан: {reason}. Проверка «домен привязан "
+                      "к loopback — выпуск Let's Encrypt будет падать» НЕ "
+                      "выполнена: отсутствия привязки в отчёте по этому файлу "
+                      "сказать нельзя")
+
+
+def hosts_le_blockers_info(checker, domain, path='/etc/hosts'):
+    """(blockers, unknown): привязки к loopback и признание «файл не читали».
+
+    Прежний вызов был `hosts_le_blockers(read_file_content(...) or '', dom)`, и
+    замер живьём (uid=1000, /bin/bash, настоящие файлы) дал:
+
+        hosts с '127.0.0.1 site.ru'  ->  ['127.0.0.1   site.ru', '::1 site.ru']
+        hosts закрыт (0000)          ->  []   <- ЛОЖЬ: файла мы не видели
+        hosts пустой (прочитан)      ->  []   <- честный ответ: привязок нет
+
+    Пустой список здесь — не нейтрален: оператор по нему решает, выпускать
+    сертификат или нет, и «блокеров нет» там, где файла не касались, стоит
+    сорванного выпуска LE. Пустой ПРОЧИТАННЫЙ файл жалобы не даёт: «привязок
+    нет» — ответ, а не пробел (то же решение, что в 1.24.0/1.25.0).
+    """
+    read = read_file_info(checker, path)
+    if read['content'] is None:
+        return [], HOSTS_UNKNOWN_NOTE.format(path=path,
+                                             reason=read['reason'] or '')
+    return hosts_le_blockers(read['content'], domain), ''
 
 
 # ==================== SSL: ТОЧНЫЙ ОСТАТОК СЕРТИФИКАТА ====================
@@ -1626,18 +1659,54 @@ def auth_differs(before, after):
 
 
 # ---------- откуда видно записи (без этого вывод был бы ложью) ----------
-def resolver_view_note(checker):
-    """Предупреждение, если сервер резолвит сам себя: видны локальные зоны."""
-    content = read_file_content(checker, '/etc/resolv.conf') or ''
-    for line in content.splitlines():
+RESOLVER_UNKNOWN_NOTE = ("⚠️ /etc/resolv.conf не прочитан: {reason}. Чем резолвит "
+                         "сервер — неизвестно: пометку «dig показывает локальную "
+                         "зону» проверить нельзя, но и утверждать, что видно "
+                         "интернет, нельзя тоже")
+
+
+def resolver_view_info(checker):
+    """(note, unknown): «вид локальный» и отдельно — «resolv.conf не читали».
+
+    Замер живьём (uid=1000, /bin/bash, настоящие файлы против discovery):
+
+        nameserver 127.0.0.53  ->  note про локальные зоны
+        nameserver 1.1.1.1     ->  ('', '')      <- прочитали: видно интернет
+        пустой (прочитан)      ->  ('', '')      <- прочитали: nameserver нет
+        закрыт (0000)          ->  ('', '')      <- ЛОЖЬ: мы не посмотрели
+
+    Прежний вид был `read_file_content(...) or ''`, и None (состояние знает
+    read_file_info: 'unreadable', 'нет прав') гасился в пустой текст, который
+    отчёт читал как «всё чисто».
+
+    Два канала, а не один — принципиально. `note` является УСЛОВИЕМ внешней
+    сверки (zone_is_local_view): непустая строка = «показано локальное
+    содержимое» = платить 5 dig на каждый домен. Причина «файл не прочитан»
+    локальность не доказывает, поэтому в note не попадает: подмешать её туда
+    значило бы начать внешние запросы там, где беда не доказана. Незнание
+    честнее и отчёту, и цене прогона — но обязан быть назван.
+    """
+    read = read_file_info(checker, '/etc/resolv.conf')
+    if read['content'] is None:
+        return '', RESOLVER_UNKNOWN_NOTE.format(reason=read['reason'] or '')
+    for line in read['content'].splitlines():
         parts = line.split()
         if len(parts) >= 2 and parts[0] == 'nameserver':
             ns = parts[1]
             if ns.startswith('127.') or ns == '::1' or _is_private_ip(ns):
                 return (f'резолвер сервера — {ns}, видны записи локальных зон, '
-                        f'а не интернета')
-            return ''
-    return ''
+                        f'а не интернета'), ''
+            return '', ''
+    return '', ''
+
+
+def resolver_view_note(checker):
+    """Пометка «вид локальный» — прежняя форма без канала о незнании.
+
+    '' здесь значит «нет пометки», а НЕ «всё чисто»: непрочитанный
+    resolv.conf даёт ровно ''. Отчёты обязаны звать resolver_view_info.
+    """
+    return resolver_view_info(checker)[0]
 
 
 def _is_private_ip(ip):
@@ -2098,7 +2167,7 @@ def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
         return "\n".join(lines)
 
     zones = {z['domain'] for z in discover_dns_zones(checker, panel_type)}
-    resolver_note = resolver_view_note(checker)
+    resolver_note, resolver_unknown = resolver_view_info(checker)
     # Условие и текст пометки берём из одной функции (zone_is_local_view),
     # иначе «где сверять» и «где написано, что надо сверять» разъехались бы.
     need = {dom: zone_is_local_view(dom, zones, resolver_note)
@@ -2122,6 +2191,13 @@ def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
     checked.sort(key=lambda item: (-item[0], item[1]))
     bad = sum(1 for item in checked if item[0] == AUTH_SEVERITY['bad'])
     warn = sum(1 for item in checked if item[0] == AUTH_SEVERITY['warn'])
+    if resolver_unknown:
+        # Признание печатается ОДИН раз на прогон и ДО списка доменов: note про
+        # локальную зону — единственное основание писать «dig показывает локальную
+        # зону, а не интернет». Не прочитав resolv.conf, отчёт не имеет права
+        # подразумевать и обратное («видно интернет») — вердикты SPF/DKIM
+        # напечатаны по данным, источник которых не подтверждён.
+        lines.append(resolver_unknown)
     lines.append(f"Проверено доменов: {len(checked)} из {len(domains)}. "
                  f"Провалено: {bad}, с замечаниями: {warn}.")
     # Масштаб беды — до чтения списка. При 25 доменах оператор обязан узнать
@@ -2251,7 +2327,7 @@ def domain_detail_report(checker, domain, panel_type=None):
         # диагнозом. Две дополнительные команды (resolv.conf и список зон) идут
         # ради честной пометки «dig показывает локальную зону, а не интернет».
         zones = {z['domain'] for z in discover_dns_zones(checker, panel_type)}
-        resolver_note = resolver_view_note(checker)
+        resolver_note, resolver_unknown = resolver_view_info(checker)
         # Условие внешней сверки берём из той же функции, что и текст пометки:
         # иначе «где сверять» и «где написано, что сверять надо» однажды
         # разъехались бы, и домен остался бы с локальной правкой без проверки.
@@ -2264,15 +2340,21 @@ def domain_detail_report(checker, domain, panel_type=None):
                                 verified=bool(resolver)))
         lines.append("\nDNS-аутентификация отправки (SPF/DKIM/DMARC/PTR):")
         lines.extend(auth_lines)
+        if resolver_unknown:
+            lines.append(resolver_unknown)
     else:
         lines.append("\nДомен не заявлен как почтовый на этом сервере.")
 
-    hosts = read_file_content(checker, '/etc/hosts') or ''
-    blockers = hosts_le_blockers(hosts, dom)
+    blockers, hosts_unknown = hosts_le_blockers_info(checker, dom)
     if blockers:
         lines.append("\n⚠️ Домен привязан к loopback в /etc/hosts — выпуск "
                      "Let's Encrypt будет падать (KB FASTPANEL):")
         lines.extend(f"  {line}" for line in blockers)
+    if hosts_unknown:
+        # Молчание здесь стоило сорванного сертификата: «блокеров нет» и «мы не
+        # посмотрели» печатались одинаково, а решение об выпуске LE оператор
+        # принимает именно по этому блоку досье.
+        lines.append("\n" + hosts_unknown)
     return "\n".join(lines)
 
 
