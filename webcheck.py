@@ -383,33 +383,194 @@ def port_scan_report(checker, host=None):
     return "\n".join(lines)
 
 
+# Состояния, которые команда greпа сообщает маркером LOGSTATE. Пустой вывод без
+# маркера — это «ответ не дошёл» (обрыв, отмена), а не «совпадений нет».
+LOG_STATE_TEXT = {
+    'badpattern': ("❌ Шаблон не разобран — файл даже не читался. Пока шаблон "
+                   "неверен, «совпадений нет» про лог сказать нельзя: проверьте "
+                   "регэксп (у grep -E свои правила)"),
+    'missing': ("❌ Файл лога исчез между поиском и чтением — обычно так делает "
+                "logrotate в момент прогона. Это НЕ «в логе нет ошибок»: "
+                "повторите проверку после ротации"),
+    'unreadable': ("❌ Файл лога не читается: не хватает прав (логи часто "
+                   "640 root:adm). Это «мы ничего не увидели», а не «ошибок "
+                   "нет» — прогоните отчётом под root или добавьте оператора в "
+                   "группу"),
+}
+
+# awk-буфер: считает ВСЕ совпадения и хранит только последние L строк. Нужен
+# именно он, а не `tail -n`: в конвейере с tail код возврата конвейера равен rc
+# tail (всегда 0), а «Всего строк» считалось по показанному хвосту — при 4
+# совпадениях и лимите 2 отчёт писал «Всего строк: 2» (замерено).
+#
+# M — фильтр «что считать совпадением». Он нужен, когда greп запущен с -C/-n:
+# там совпавшая строка помечена номером («12:...»), а строка контекста — «12-».
+# Без фильтра awk посчитал бы контекст как совпадения — завышение того же класса,
+# что хвост (проверено живьём: 2 совпадения + контекст давали больше).
+_LOG_AWK = ('{k++;buf[(k-1)%L]=$0; if(M==""||$0~M)n++}'
+            ' END{printf "LOGTOTAL %d\\n", n;'
+            ' s=(k>L)?k-L+1:1; for(i=s;i<=k;i++) print buf[(i-1)%L]}')
+
+
+def log_reader(path):
+    """Читатель лога: `zcat` для ротированных .gz, иначе `cat`.
+
+    Одно место на весь отчёт: его зовёт и команда, и разбор ответа. Когда он был
+    записан дважды, отчёт мог назвать отсутствующей не ту утилиту, которую звал
+    (ровно та грабля, что лечили в v1.18 с «запись есть»).
+    """
+    return 'zcat' if str(path).endswith('.gz') else 'cat'
+
+
+def grep_log_command(filepath, pattern, context=0, limit=200):
+    """Одна POSIX-команда: состояние файла + точный итог + хвост совпадений.
+
+    Порядок веток важнее всего, что в ней есть: шаблон проверяется ПЕРВЫМ, до
+    чтения файла. Замерено живьём (bash и dash): `grep -E "$P" /dev/null` даёт
+    rc=1 для валидного шаблона и rc=2 для разбитого (`5[0-9`, `[a-`, `(`).
+    Именно без конвейера: в конвейере rc принадлежит последней команде, а
+    проверка вида `printf '' | grep -E "$P"` битый шаблон НЕ отличает — у greпа
+    на пустом входе rc=1 по любой причине (проверено). Оператор вводит шаблон в
+    GUI свободно, поэтому опечатка раньше превращалась в «Совпадений не
+    найдено», то есть в «проблем в логе нет».
+
+    Readability решается ветками `[ ! -e ]` / `[ ! -r ]`, а не `${PIPESTATUS}`:
+    под dash (обычный /bin/sh в Debian/Ubuntu) PIPESTATUS даёт «Bad
+    substitution» — проверка живьём.
+
+    stderr читателя НЕ глушится: `gzip: not in gzip format` приходит SSH-каналом
+    и показывает, что ротированный .gz битый, — прежний `2>/dev/null` прятал это
+    и печатал «Совпадений не найдено» по всем архивам сразу.
+    """
+    reader = log_reader(filepath)
+    # -n добавляется только вместе с -C и только ради честного счёта: он даёт
+    # префикс «номер:» на совпавших строках, по которому awk отличает совпадение
+    # от строки контекста. Один проход по файлу — никакой второй цены.
+    flags = f"-C {int(context)} -n " if context else ""
+    awk_m = '^[0-9]+:' if context else ''
+    return (
+        f'F={q(str(filepath))}; P={q(pattern)}; L={max(1, int(limit))}; '
+        f'grep -E "$P" /dev/null >/dev/null 2>&1; rc=$?; '
+        f'if [ "$rc" -ge 2 ]; then echo LOGSTATE badpattern; '
+        f'elif [ ! -e "$F" ]; then echo LOGSTATE missing; '
+        f'elif [ ! -r "$F" ]; then echo LOGSTATE unreadable; '
+        f'elif ! command -v {reader} >/dev/null 2>&1; '
+        f'then echo "LOGSTATE notool {reader}"; '
+        f'elif ! command -v awk >/dev/null 2>&1; '
+        f'then echo "LOGSTATE notool awk"; '
+        f'else {reader} "$F" | grep {flags}-E "$P" '
+        f'| awk -v L="$L" -v M="{awk_m}" \'{_LOG_AWK}\'; fi'
+    )
+
+
+def parse_grep_answer(out):
+    """(state, total, строки) из ответа команды. total=None — ответа не было.
+
+    state ставится только на честном маркере LOGSTATE; отсутствие и маркера, и
+    LOGTOTAL означает «данных нет» (обрыв/отмена), и это НЕ право сказать
+    «совпадений нет» — тот же закон, что в v1.16 и v1.17.
+    """
+    state = None
+    total = None
+    lines = []
+    for line in (out or '').splitlines():
+        if line.startswith('LOGSTATE '):
+            state = line.split(' ', 1)[1].strip()
+        elif line.startswith('LOGTOTAL ') or line.startswith('LOGCOUNT '):
+            try:
+                total = int(line.split(' ', 1)[1].strip())
+            except ValueError:
+                total = None
+        else:
+            lines.append(line)
+    return state, total, lines
+
+
 def grep_logs_report(checker, panel_type, domain, pattern, context=0, limit=200):
-    """Массовый grep по логам домена (например, все 5xx или 404)."""
+    """Массовый grep по логам домена (например, все 5xx или 404).
+
+    «Совпадений нет» печатается ТОЛЬКО когда хотя бы один лог действительно
+    прочитан и ни один не отвалился. Раньше `out, _, _ = checker.run(...)`
+    выбрасывал код возврата, а `tail` в конце конвейера сделал бы его бесполезным
+    и для того, кто захотел бы его взять (rc конвейера = rc tail = 0).
+    """
     lines = [f"=== GREP ЛОГОВ: {domain} / '{pattern}' ==="]
     log_files = find_logs(checker, panel_type, domain, 'access')
     log_files += find_logs(checker, panel_type, domain, 'error')
     log_files = [f for f in log_files if not f.startswith('⚠️')]
+    # Без дедупликации один и тот же файл попадал в поиск дважды (маски access и
+    # error пересекаются), и «Всего строк» удваивалось: масштаб беды завышался
+    # тем же способом, что раньше занижался хвостом.
+    log_files = list(dict.fromkeys(log_files))
     if not log_files:
         lines.append("❌ Логи для домена не найдены")
         return "\n".join(lines)
 
-    ctx = f"-C {int(context)} " if context else ""
     total = 0
+    shown = 0
+    read_files = 0
+    unseen = []  # (файл, причина) — то, о чём мы НЕ имеем права судить
     for lf in log_files:
-        if lf.endswith('.gz'):
-            base = f"zcat {q(lf)}"
-        else:
-            base = f"cat {q(lf)}"
-        cmd = f"{base} 2>/dev/null | grep {ctx}-E {q(pattern)} | tail -n {int(limit)}"
-        out, _, _ = checker.run(cmd)
-        if out.strip():
+        out, err, rc = checker.run(grep_log_command(lf, pattern, context, limit))
+        state, file_total, matches = parse_grep_answer(out)
+        if state:
+            if state.startswith('notool'):
+                # Маркер несёт имя утилиты («notool zcat»): без него отчёт сказал бы
+                # «нет утилиты» и заставил бы оператора гадать, какой именно. Если
+                # имя всё же не дошло (обрыв), берём того читателя, которого сами
+                # и попросили проверять, — мы знаем его по расширению файла.
+                name = state.split(' ', 1)[1].strip() if ' ' in state else ''
+                name = name or log_reader(lf)
+                unseen.append((lf, f"на сервере нет {name}: файл не прочитан — "
+                                   f"это «не проверено», а не «совпадений нет»"))
+            else:
+                unseen.append((lf, LOG_STATE_TEXT.get(state, state)))
+            continue
+        if file_total is None:
+            reason = (err or '').strip().splitlines()
+            unseen.append((lf, "Сервер не вернул ни состояния, ни итога — "
+                               f"состояние не проверено"
+                               f"{' (' + reason[0][:120] + ')' if reason else ''}"))
+            continue
+        if (err or '').strip():
+            # Читатель (cat/zcat) ругался: файл прочитан не полностью, и его
+            # нулевой итог — не «ошибок нет», а «мы не сумели прочитать».
+            reason = (err or '').strip().splitlines()[0][:160]
+            unseen.append((lf, f"читатель сообщил об ошибке: {reason} — вывод "
+                               f"неполон, «совпадений нет» по этому файлу "
+                               f"сказать нельзя"))
+            if not matches:
+                continue
+        read_files += 1
+        total += file_total
+        shown += len(matches)
+        if matches:
             lines.append(f"\n--- {lf} ---")
-            lines.append(out.strip())
-            total += len(out.strip().splitlines())
-    if total == 0:
-        lines.append("Совпадений не найдено.")
+            lines.append("\n".join(matches))
+
+    for lf, reason in unseen:
+        lines.append(f"\n⚠️ {lf}\n   {reason}")
+
+    if not read_files:
+        lines.append("\n❓ Ни один лог не прочитан — по этому домену состояние "
+                     "не проверено: утверждать «совпадений нет» не на чём.")
+        return "\n".join(lines)
+
+    hidden = len(unseen)
+    if total == 0 and hidden:
+        lines.append(f"\n⚠️ Прочитано {read_files} из {read_files + hidden} "
+                     f"файлов, в прочитанных совпадений 0. Про «совпадений нет» "
+                     f"речи нет: {hidden} файл(ов) мы не видели (выше).")
+    elif total == 0:
+        lines.append("\nСовпадений нет.")
+    elif shown < total:
+        lines.append(f"\nВсего совпадений: {total} (показаны последние {shown} "
+                     f"из {total}; лимит на файл {int(limit)})")
     else:
-        lines.append(f"\nВсего строк: {total}")
+        lines.append(f"\nВсего совпадений: {total} (показаны все)")
+    if hidden and total:
+        lines.append(f"⚠️ При этом {hidden} файл(ов) не прочитаны — итог может "
+                     f"быть меньше реального (причины выше).")
     return "\n".join(lines)
 
 
