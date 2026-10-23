@@ -141,27 +141,132 @@ class TestSslCertReport:
 
 
 class TestWhoisReport:
+    """Причина пустого whois-ответа — четыре разных диагноза, а не одна фраза.
+
+    Прежний код: `out, _, rc = checker.run(f"timeout 15 whois ... 2>/dev/null")`.
+    Во-первых, `rc` был ПРИНЯТ и НЕ ИСПОЛЬЗОВАН; во-вторых, `2>/dev/null` глушил
+    ровно ту строку, которая объясняет причину. Проверено живьём на машине без
+    whois: rc=127 и stderr «timeout: failed to run command 'whois': No such file
+    or directory». Замер семантики timeout: 124 — убит по таймауту, 127 —
+    бинарника нет, 1 — команда упала.
+
+    И главное: «домена нет» — это НЕ пустой вывод. Живой запрос к реестрам через
+    TCP/43 (утилиты whois здесь как раз нет):
+      * whois.verisign-grs.com  -> `No match for "ZZQQXX-...COM".`
+      * whois.tcinet.ru / nic.ru -> `No entries found for the selected source(s).`
+    То есть прежняя подпись «whois не установлен или домен не найден» выбирала
+    между «поставь утилиту» и «домена не существует» наугад, а третьих и четвёртых
+    случаев (таймаут, пустой успешный вывод) не различала вообще.
+    """
+
+    RAW_OK = ('Domain Name: EXAMPLE.COM\n'
+              'Registrar: RESOLVER WEBSITE INC.\n'
+              'Creation Date: 2001-09-15T04:00:00Z\n'
+              'не значимая строка\n'
+              'Name Server: NS1.EXAMPLE.NET\n')
+
+    def _report(self, res):
+        return webcheck_mod.whois_report(
+            FakeSSH(routes=[('whois', res)]), 'example.com')
+
     def test_key_lines_extracted(self):
-        raw = ('Domain Name: EXAMPLE.COM\n'
-               'Registrar: RESOLVER WEBSITE INC.\n'
-               'Creation Date: 2001-09-15T04:00:00Z\n'
-               'не значимая строка\n'
-               'Name Server: NS1.EXAMPLE.NET\n')
-        c = FakeSSH(routes=[('whois', raw)])
-        out = webcheck_mod.whois_report(c, 'example.com')
+        out = self._report(self.RAW_OK)
         assert 'Registrar:' in out
         assert 'Creation Date:' in out
         assert 'Name Server:' in out
         assert 'не значимая строка' not in out
 
     def test_unknown_format_falls_back_to_raw(self):
-        c = FakeSSH(routes=[('whois', 'какой-то редкий вывод без ключей\n')])
-        out = webcheck_mod.whois_report(c, 'example.com')
+        # Вывод без ключей и без признанной фразы «нет» остаётся сырым: выдумывать
+        # за реестр вердикт мы не вправе.
+        out = self._report('какой-то редкий вывод без ключей\n')
         assert 'какой-то редкий вывод' in out
 
-    def test_empty_whois_error(self):
-        out = webcheck_mod.whois_report(FakeSSH(), 'example.com')
-        assert '❌ whois не установлен или домен не найден' in out
+    def test_missing_binary_is_not_reported_as_missing_domain(self):
+        # rc=127 замерен живьём на машине без whois.
+        out = self._report(('', "timeout: failed to run command 'whois': "
+                               "No such file or directory", 127))
+        assert 'не установлен' in out
+        assert 'домен не найден' not in out     # вот это и было ложью
+        assert 'домен не зарегистрирован' not in out
+        assert 'apt install whois' in out        # чем чинится
+
+    def test_timeout_is_not_reported_as_missing_domain(self):
+        # rc=124 — это `timeout 15` убил процесс: домен мог быть сколько угодно
+        # зарегистрирован, мы просто не дождались ответа.
+        out = self._report(('', '', 124))
+        assert 'не успел' in out
+        assert 'домен не найден' not in out
+        assert 'не установлен' not in out        # утилита-то как раз есть
+
+    def test_failure_reason_from_stderr_is_shown(self):
+        # Единственный источник причины — stderr; прежняя команда глушила его.
+        out = self._report(('', 'connect: Network is unreachable', 1))
+        assert 'Network is unreachable' in out
+        assert 'домен не найден' not in out
+
+    def test_empty_output_with_success_is_not_verified(self):
+        # rc=0 и пусто (проверено живьём: возможно). Никакого права говорить про
+        # домен у такого ответа нет.
+        out = self._report(('', '', 0))
+        assert 'не проверено' in out
+        assert 'домен не найден' not in out
+        assert 'не установлен' not in out
+
+    def test_unregistered_domain_is_named_from_the_registry_words(self):
+        # Дословный ответ Verisign, снятый живьём через TCP/43.
+        out = self._report('No match for "EXAMPLE.COM".\n')
+        assert 'не зарегистрирован' in out
+        assert 'No match for' in out             # слова реестра, а не наши
+        assert 'не установлен' not in out        # утилита работала
+
+    def test_ru_registry_phrase_is_recognized(self):
+        # Дословный ответ whois.tcinet.ru и whois.nic.ru, снятый живьём.
+        out = self._report('No entries found for the selected source(s).\n')
+        assert 'не зарегистрирован' in out
+
+    def test_nic_me_phrase_is_recognized(self):
+        # Снято живьём: whois.nic.me отвечает коротко, без «No match».
+        out = self._report('Domain not found.\n'
+                           '>>> Last update of WHOIS database: 2026-10-23 <<<\n')
+        assert 'не зарегистрирован' in out
+        assert 'Domain not found.' in out
+
+    def test_nominet_two_line_answer_is_recognized(self):
+        # Снято живьём: whois.nic.uk даёт 'No match for ...' и ниже
+        # 'This domain name has not been registered.' — обе строки настоящие.
+        out = self._report('    No match for "ZZQQXX-91827364.CO.UK".\n'
+                           '    This domain name has not been registered.\n')
+        assert 'не зарегистрирован' in out
+
+    def test_arin_terms_of_use_boilerplate_is_not_a_verdict(self):
+        # Снято живьём: ARIN на незарегистрированный домен вернул почти пустой
+        # ответ из служебных строк Terms of Use. Ни «свободен», ни «нет утилиты»
+        # там выдумывать нельзя — вывод остаётся как есть.
+        raw = ('#\n'
+               '# ARIN WHOIS data and services are subject to the Terms of Use\n'
+               '# available at: https://www.arin.net/resources/registry/whois/tou/\n')
+        out = self._report(raw)
+        assert 'не зарегистрирован' not in out
+        assert 'Terms of Use' in out
+
+    def test_free_domain_is_not_reported_when_keys_present(self):
+        # Защита от ложного «свободен»: в выводе зарегистрированного домена
+        # попадается служебное «NOT FOUND» (например, по contact-записи).
+        raw = self.RAW_OK + 'Admin ID: NOT FOUND\n'
+        out = self._report(raw)
+        assert 'не зарегистрирован' not in out
+        assert 'Registrar:' in out
+
+    def test_stderr_is_not_thrown_away_by_the_command(self):
+        # Поведенческий замок: прежнее `2>/dev/null` теряло причину. Проверяем не
+        # текст комментария, а отправленную команду.
+        c = FakeSSH(routes=[('whois', ('', '', 127))])
+        webcheck_mod.whois_report(c, 'example.com')
+        cmd = c.find('whois')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd
+        assert c.count('whois') == 1             # цену прогона не поднимаем
 
 
 class TestPortScanReport:
