@@ -84,30 +84,142 @@ def ssl_cert_report(checker, domain, port=443):
     return "\n".join(lines)
 
 
+# Сколько секунд жнём ответ реестра. Замер `timeout`: убил по таймауту -> rc=124,
+# бинарника нет -> rc=127 (проверено живьём, а не по мануалу).
+WHOIS_TIMEOUT = 15
+
+# Фразы, которыми реестры ОТВЕЧАЮТ «такого домена нет». Сняты живьём через TCP/43
+# (утилиты whois на машине как раз не было — об этом и правка), а не выдуманы:
+#   whois.verisign-grs.com  -> 'No match for "ZZQQXX-...COM".'
+#   whois.tcinet.ru / nic.ru -> 'No entries found for the selected source(s).'
+# Справочник RU-TLD добавляет 'DOMAIN NOT FOUND' (centralnic), 'NOT FOUND' (.pro),
+# 'No entries found' (nic.re/pm/tf/wf); живые запросы дали ещё 'Domain not found.'
+# (whois.nic.me) и 'This domain name has not been registered.' (whois.nic.uk).
+# ВАЖНО: «домена нет» — это НЕ пустой вывод, поэтому прежняя подпись «whois не
+# установлен или домен не найден» выбирала между «поставь утилиту» и «домена не
+# существует» наугад.
+WHOIS_ABSENT_PHRASES = ('no match for', 'no entries found', 'no data found',
+                        'no object found', 'no such domain', 'no such object',
+                        'has not been registered', 'not found')
+
+# Поля, наличие которых означает: запись есть, домен зарегистрирован. Их же роль —
+# защита от ложного «свободен»: служебное NOT FOUND в contact-строке реестра не
+# должно перевести зарегистрированный домен в «не зарегистрирован».
+WHOIS_RECORD_KEYS = ('registrar:', 'creation date:', 'created:', 'updated date:',
+                     'expiry date:', 'expiration date:', 'registry expiry date:',
+                     'registrant organization:', 'name server:', 'nserver:',
+                     'status:', 'domain name:', 'domain:', 'paid-till:', 'state:')
+
+
+def whois_first_line(text, limit=160):
+    """Первая непустая строка — ровно столько причины, сколько нужно прочитать."""
+    for line in (text or '').splitlines():
+        if line.strip():
+            return line.strip()[:limit]
+    return ''
+
+
+def whois_no_data_lines(err, rc, seconds=WHOIS_TIMEOUT):
+    """Почему вывода нет — РАЗНЫЕ диагнозы вместо одной фразы-гадалки.
+
+    Прежний код принимал rc и не использовал его, а `2>/dev/null` глушил ровно
+    ту строку, где написана причина. Замерено живьём на машине без whois:
+    rc=127 и stderr «timeout: failed to run command 'whois': No such file or
+    directory». Лечить rc=127 и rc=124 нужно противоположным: в одном ставить
+    утилиту, в другом — понимать, что реестр просто молчит дольше 15 секунд.
+    """
+    reason = whois_first_line(err)
+    if rc == 127:
+        return ["❌ whois на сервере не установлен (rc=127): запрос НЕ выполнялся. "
+                "Поставьте утилиту: apt install whois (Debian/Ubuntu) или "
+                "yum install whois / dnf install whois.",
+                f"   Ответ системы: {reason}" if reason else
+                "   Ответ системы: (stderr пуст — проверьте, что PATH не срезан)"]
+    if rc == 124:
+        return [f"⚠️ whois не успел ответить за {seconds} сек (rc=124): реестр "
+                f"отвечал дольше. Про домен ничего неизвестно — он может быть "
+                f"сколько угодно зарегистрирован. Повторите проверку или "
+                f"проверьте исходящий порт 43 (его часто блокируют).",
+                f"   Ответ системы: {reason}" if reason else
+                "   Ответ системы: (реестр молчал до таймаута)"]
+    if rc:
+        return [f"⚠️ Запрос whois не выполнен (rc={rc}) — это «не проверено». "
+                "Повторите проверку с другого сервера.",
+                f"   Ответ системы: {reason}" if reason else
+                "   Ответ системы: (stderr пуст — причины нет, а догадываться "
+                "про домен мы не будем)"]
+    return ["❓ Ответ реестра пуст без ошибки (rc=0) — состояние не проверено: "
+            "домен может быть и занят, и свободен. Проверьте другим способом "
+            "(RDAP, другой сервер)."]
+
+
+def whois_record_lines(out):
+    """Строки-поля регистрационной записи (пусто — записи в выводе нет).
+
+    ЕДИНСТВЕННОЕ место, где решается «запись есть». Раньше этот признак считался
+    дважды — здесь для вывода и заново внутри `whois_absent_line`, — и это ровно
+    тот разъезд, который лечат последние релизы: сводка однажды начала бы
+    утверждать «не зарегистрирован» над уже напечатанным полем `registrar:`.
+    """
+    found = []
+    for line in out.splitlines():
+        low = line.strip().lower()
+        if any(low.startswith(k) for k in WHOIS_RECORD_KEYS):
+            found.append(line.strip())
+    return found
+
+
+def whois_absent_line(out, record_lines=None):
+    """Строка реестра «домена нет» — но только если записи в выводе нет вовсе.
+
+    Иначе служебное «NOT FOUND» внутри записи зарегистрированного домена
+    (например, в contact-строке) дало бы оператору ложный «свободен».
+    """
+    if record_lines is None:
+        record_lines = whois_record_lines(out)
+    if record_lines:
+        return None
+    for line in out.splitlines():
+        low = line.strip().lower()
+        if any(p in low for p in WHOIS_ABSENT_PHRASES):
+            return line.strip()
+    return None
+
+
 def whois_report(checker, domain):
-    """WHOIS-запрос для домена: даты, NS, регистратор."""
+    """WHOIS-запрос для домена: даты, NS, регистратор.
+
+    Причина пустого ответа читается из rc И stderr: один пустой stdout дают "
+    «утилиты нет», «реестр молчит», «запрос упал» и «регистратор ответил пусто»,
+    а лечатся они по-разному.
+    """
     lines = [f"=== WHOIS ДЛЯ {domain} ==="]
     if not domain:
         lines.append("❌ Домен не задан")
         return "\n".join(lines)
 
-    out, _, rc = checker.run(f"timeout 15 whois {q(domain)} 2>/dev/null")
+    # Без `2>/dev/null`: именно в stderr лежит ответ на вопрос «почему пусто».
+    out, err, rc = checker.run(f"timeout {WHOIS_TIMEOUT} whois {q(domain)}")
     if not out.strip():
-        lines.append("❌ whois не установлен или домен не найден")
+        lines.extend(whois_no_data_lines(err, rc))
         return "\n".join(lines)
 
-    keys = ('registrar:', 'creation date:', 'created:', 'updated date:',
-            'expiry date:', 'expiration date:', 'registry expiry date:',
-            'registrant organization:', 'name server:', 'nserver:', 'status:')
-    found = []
-    for line in out.splitlines():
-        low = line.strip().lower()
-        if any(low.startswith(k) for k in keys):
-            found.append(line.strip())
+    found = whois_record_lines(out)
     if found:
         lines.extend(found)
-    else:
-        lines.append(out.strip()[:2000])
+        return "\n".join(lines)
+
+    absent = whois_absent_line(out, found)
+    if absent:
+        # Слова реестра, а не наша догадка: оператор должен видеть, чем именно
+        # реестр подтверждает ответ.
+        lines.append("ℹ️ Домен не зарегистрирован — так ответил реестр (его "
+                     "слова, а не наша догадка):")
+        lines.append(f"   «{absent}»")
+        return "\n".join(lines)
+
+    # Ключей нет, признанной фразы «нет» тоже: за реестр вердикт не выдумываем.
+    lines.append(out.strip()[:2000])
     return "\n".join(lines)
 
 
