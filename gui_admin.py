@@ -153,6 +153,18 @@ class AdminMixin:
             text_editor.config(state=tk.DISABLED)
             editor_dialog.update()
             content = read_file(self.checker, filepath)
+            if isinstance(content, str) and content.startswith("❌"):
+                # Отказ чтения — НЕ содержимое файла. Прежний код вставлял его в
+                # окно безусловно: оператор видел вместо конфига текст ошибки, а
+                # «Сохранить» (guard'а не было; в gui_files такой guard есть)
+                # записывал эту строку на сервер по пути конфига. Замер живьём:
+                # четыре разных отказа давали идентичный '❌ Ошибка чтения файла
+                # (rc=1): ' с пустым хвостом — причину глушил 2>/dev/null в самой
+                # команде чтения. Прежнее прочитанное остаётся в окне, причина —
+                # в диалоге.
+                text_editor.config(state=tk.NORMAL)
+                messagebox.showerror("Ошибка", content, parent=editor_dialog)
+                return
             text_editor.delete(1.0, tk.END)
             text_editor.insert(tk.END, content)
             text_editor.config(state=tk.NORMAL)
@@ -180,13 +192,26 @@ class AdminMixin:
                 messagebox.showwarning("Внимание", "Сначала загрузите файл")
                 return
             content = text_editor.get(1.0, tk.END)
+            # get(1.0, END) добавляет к тексту окна РОВНО один '\n' — снимается
+            # именно он. Прежний вариант писал get() как есть, и «открыл →
+            # Сохранить» без единой правки ДОПИСЫВАЛО в конфиг пустую строку
+            # (gui_files, наоборот, резал rstrip'ом все хвостовые переводы).
+            if content.endswith("\n"):
+                content = content[:-1]
             if messagebox.askyesno("Подтверждение", f"Сохранить изменения в {filepath}?", parent=editor_dialog):
                 text_editor.config(state=tk.DISABLED)
                 editor_dialog.update()
                 result = write_file(self.checker, filepath, content)
                 self._display_result(result)
                 text_editor.config(state=tk.NORMAL)
-                original_content[0] = content
+                if isinstance(result, str) and result.startswith("❌"):
+                    # Отказ SFTP: прежний код тут же рапортовал «Успех — Файл
+                    # сохранён». Отчёт files.write_file сам начинается с ❌.
+                    messagebox.showerror("Ошибка", result, parent=editor_dialog)
+                    return
+                # эталон «нет несохранённого» хранится в той же форме, что
+                # возвращает get(), иначе закрытие спрашивало бы лишний раз
+                original_content[0] = text_editor.get(1.0, tk.END)
                 messagebox.showinfo("Успех", "Файл сохранён", parent=editor_dialog)
 
         def reload_file():
@@ -197,6 +222,11 @@ class AdminMixin:
             _load(filepath)
 
         def close_editor():
+            if not current_filepath[0]:
+                # Ни один файл так и не был прочитан (чтение отказало): терять
+                # нечего, вопроса про «несохранённые изменения» быть не должно.
+                editor_dialog.destroy()
+                return
             if text_editor.get(1.0, tk.END) != original_content[0]:
                 if messagebox.askyesno("Подтверждение", "Закрыть редактор без сохранения изменений?", parent=editor_dialog):
                     editor_dialog.destroy()

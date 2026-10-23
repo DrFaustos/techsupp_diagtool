@@ -2,7 +2,8 @@
 import ipaddress
 from datetime import datetime
 
-from common import BACKUP_SUBDIRS, q, ensure_backup_dir, create_backup, write_remote_file
+from common import (BACKUP_SUBDIRS, q, ensure_backup_dir, create_backup,
+                    write_remote_file, RF_TEXT, read_file_info)
 
 
 # ==================== РАБОТА С ФАЙЛАМИ (С БЭКАПАМИ) ====================
@@ -27,10 +28,37 @@ def write_file(checker, filepath, content):
 
 
 def read_file(checker, filepath):
-    out, err, rc = checker.run(f'cat {q(filepath)} 2>/dev/null')
-    if rc != 0:
-        return f"❌ Ошибка чтения файла (rc={rc}): {err.strip()}"
-    return out
+    """Читает файл для редактора: строка с ❌ — только настоящая неудача.
+
+    Прежний вид:
+
+        out, err, rc = checker.run(f'cat {q(filepath)} 2>/dev/null')
+        if rc != 0:
+            return f"❌ Ошибка чтения файла (rc={rc}): {err.strip()}"
+
+    Сообщение обещало причину ПОСЛЕ двоеточия, а та же команда (`2>/dev/null`)
+    её же и заглушала. Замер живьём (uid=1000, /bin/bash) — четыре разных
+    состояния под одной подписью с ПУСТЫМ хвостом:
+
+        locked.conf    rc=1 stdout=0 stderr=''  -> '❌ Ошибка чтения файла (rc=1): '
+        nope.conf      rc=1 stdout=0 stderr=''  -> '❌ Ошибка чтения файла (rc=1): '
+        lockd/x.conf   rc=1 stdout=0 stderr=''  -> '❌ Ошибка чтения файла (rc=1): '
+        каталог        rc=1 stdout=0 stderr=''  -> '❌ Ошибка чтения файла (rc=1): '
+
+    Хуже подписи другое: вызывающий код (`gui_admin._load`) вставляет
+    возвращённое в редактор и не различает текст ошибки и содержимое, поэтому
+    «Сохранить» записывало строку ошибки на сервер по пути конфига. Отсюда
+    правила: неудача ОБЯЗАНА начинаться с ❌ (по этому её распознаёт
+    `gui_files`), обязана называть состояние словами (`rc=1` — не диагноз, он
+    сливает права и отсутствие) и обязана содержать «не прочитан», чтобы не
+    походить на содержимое. Успех возвращается байт в байт: завершающий перевод
+    строки — часть файла, редактор вернёт его на сервер.
+    """
+    info = read_file_info(checker, filepath)
+    if info['content'] is not None:
+        return info['content']
+    reason = info['reason'] or RF_TEXT['unchecked']
+    return f"❌ Файл {filepath} не прочитан: {reason}"
 
 
 def get_config_files(checker, panel_type):

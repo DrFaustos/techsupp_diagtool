@@ -227,7 +227,14 @@ class FilesMixin:
             body.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
             def save():
-                text = body.get('1.0', tk.END).rstrip('\n')
+                # get('1.0', END) добавляет к тексту окна РОВНО один '\n' —
+                # снимается именно он. Прежний rstrip('\n') резал ВСЕ хвостовые
+                # переводы: файл 'a\n\n' (пустая строка в конце — часть файла)
+                # уходил на сервер как 'a'. Тихая порча без единой правки:
+                # «открыл → Сохранить».
+                text = body.get('1.0', tk.END)
+                if text.endswith('\n'):
+                    text = text[:-1]
                 if not messagebox.askyesno(
                     "Сохранение",
                     f"Записать {editing[0]} ?\nРезервная копия создаётся автоматически.",
@@ -235,8 +242,16 @@ class FilesMixin:
                     return
 
                 def done(result):
-                    if editor_alive[0]:
-                        messagebox.showinfo("Готово", str(result), parent=ed)
+                    if not editor_alive[0]:
+                        return
+                    text = str(result)
+                    if text.startswith("❌"):
+                        # files.write_file начинает отказ («❌ Ошибка записи:
+                        # …») с того же знака. Прежний done рапортовал «Готово»
+                        # на ЛЮБОЙ результат, то есть врал о записи конфига.
+                        messagebox.showerror("Ошибка", text, parent=ed)
+                        return
+                    messagebox.showinfo("Готово", text, parent=ed)
 
                 self._run_simple(remote_write, None, done, self.checker, editing[0], text)
 

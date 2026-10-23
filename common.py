@@ -467,11 +467,29 @@ def read_file_cmd(path, reader=None):
 
 
 def parse_read_answer(out, err):
-    """(state, content) из ответа read_file_cmd; state=None — маркера не было."""
-    lines = (out or '').splitlines()
-    if lines and lines[0].startswith(_RF_MARK):
-        return (lines[0][len(_RF_MARK):].strip() or None,
-                '\n'.join(lines[1:]))
+    """(state, content) из ответа read_file_cmd; state=None — маркера не было.
+
+    Тело отдаётся БАЙТ В БАЙТ. Прежний вариант собирал его как
+    `'\\n'.join(splitlines()[1:])`, а splitlines() отбрасывает завершающий
+    перевод строки и режет по '\\r\\n', выбрасывая сам '\\r'. Замер живьём
+    (read_file_info против НАСТОЯЩИХ файлов, /bin/bash, uid=1000) — 4 из 6
+    форматов возвращались укороченными:
+
+        'worker 4;\\n'       -> 'worker 4;'      <<< потеря
+        'a;\\nb;\\n'           -> 'a;\\nb;'           <<< потеря
+        'a;\\n\\n\\n'            -> 'a;\\n\\n'          <<< потеря
+        'a;\\r\\nb;\\r\\n'       -> 'a;\\nb;'           <<< потеря (и \\r тоже)
+
+    Для лога это безразлично (его всё равно считают splitlines'ом), для
+    редактора конфига — тихая порча данных: `gui_files` при сохранении делает
+    rstrip('\\n'), поэтому «открыл → Сохранить» без единой правки переписывал
+    конфиг без завершающей строки. Различить «не прочитал» и «прочитал иначе»
+    мало: нельзя ещё и соврать в самом прочитанном. Отсюда partition('\\n') —
+    он снимает ровно служебную первую строку и больше ничего не трогает.
+    """
+    head, _sep, body = (out or '').partition('\n')
+    if head.startswith(_RF_MARK):
+        return (head[len(_RF_MARK):].strip() or None, body)
     return None, None
 
 
