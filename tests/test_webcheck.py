@@ -383,33 +383,151 @@ class TestPortScanReport:
 
 
 class TestGrepLogsReport:
-    LOG_FILE = '/var/log/nginx/example.com.access.log\n'
+    """«Совпадений нет» говорится только когда лог действительно прочитан.
+
+    Прежний код: `out, _, _ = checker.run(f"{base} 2>/dev/null | grep ... | tail
+    -n N")`. Три слоя лжи в одной строке:
+
+    (1) Код возврата выброшен, а `grep` РАЗЛИЧАЕТ 1 («совпадений правда нет») и
+        2 («файл не открылся: права / SELinux») — замерено живьём.
+    (2) Хуже того: rc конвейера — это rc ПОСЛЕДНЕЙ команды, то есть `tail`, а она
+        всегда 0. Забрать rc greпа из такой команды невозможно даже тому, кто
+        захочет: проверено живьём (`LOGSTAT grep_rc=1 rdr_rc=1 tail_rc=0`).
+    (3) `2>/dev/null` глушил читателя: `.gz`, который не gzip (ротация оставила
+        битый файл), даёт `gzip: not in gzip format` -> пустой вывод -> «Совпадений
+        не найдено» по ВСЕМ ротированным логам.
+
+    Плюс масштаб: `Всего строк: N` считалось по ПОКАЗАННЫМ строкам, а `tail -n`
+    съедает остальные. Живой замер: 4 совпадения при limit=2 -> «Всего строк: 2».
+    Для тикета «ошибок в логе нет» это противоположные ответы: «проблемы нет» и
+    «мы ничего не увидели, поднимите права».
+
+    Различение делаем POSIX-ветками ДО запуска greпа (`[ ! -e ]` / `[ ! -r ]`), а
+    НЕ `${PIPESTATUS}`: под dash последний даёт «Bad substitution» (проверено
+    живьём — Ubuntu часто и есть dash). Точный total — awk-буфером за один проход,
+    без второго чтения диска и без конвейера, съедающего rc.
+    """
+
+    LOG_FILE = '/var/log/nginx/example.com.access.log'
+
+    @staticmethod
+    def _read(total, *lines):
+        """Ответ сервера для ПРОЧИТАННОГО лога: маркер + совпавшие строки."""
+        return '\n'.join((f'LOGTOTAL {total}',) + lines) + '\n'
+
+    def _report(self, answer, log_file=None, **kw):
+        lf = log_file or self.LOG_FILE
+        c = FakeSSH(routes=[('ls -1', lf + '\n'), ('grep', answer)])
+        return webcheck_mod.grep_logs_report(c, 'none', 'example.com',
+                                             '500', **kw), c
 
     def test_matches_with_total(self):
-        c = FakeSSH(routes=[('ls -1', self.LOG_FILE),
-                             ('| grep', 'line A\nline B\n')])
-        out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', r'" 5\d\d ')
+        # Прежний guard «не выдумывать совпадения» сохранён: показаны ровно строки,
+        # вернувшиеся с сервера, а итог берётся из маркера, а не из хвоста.
+        out, _ = self._report(self._read(2, 'line A', 'line B'))
         assert 'line A' in out
-        assert 'Всего строк:' in out
+        assert '2' in out
+
+    def test_total_counts_all_matches_not_only_shown(self):
+        # Живой замер: 4 совпадения при limit=2. `tail` показывал 2, и отчёт писал
+        # «Всего строк: 2» — масштаб беды занижен вдвое тем, что его не видно.
+        out, _ = self._report(self._read(4, 'c 500 3', 'd 500 4'), limit=2)
+        assert '4' in out
+        assert 'показаны последние 2' in out
+
+    def test_read_but_no_matches_is_the_only_honest_empty(self):
+        out, _ = self._report(self._read(0))
+        assert 'Совпадений нет' in out
+
+    def test_no_server_answer_at_all_is_not_reported_as_no_matches(self):
+        # Команда не выполнилась / соединение оборвалось: маркера нет. Это
+        # «не проверено», а не «в логе нет 5xx» (тот же закон, v1.16/v1.17).
+        out, _ = self._report('')
+        assert 'не проверено' in out
+        assert 'Совпадений нет' not in out
+
+    def test_unreadable_is_not_reported_as_no_matches(self):
+        out, _ = self._report('LOGSTATE unreadable\n')
+        assert 'не читается' in out
+        assert 'Совпадений нет' not in out       # вот это и было ложью
+        assert 'прав' in out                     # чем чинится
+
+    def test_missing_file_is_not_reported_as_no_matches(self):
+        # logrotate убирает файл в середине прогона: «его нет» ≠ «в нём нет 5xx».
+        out, _ = self._report('LOGSTATE missing\n')
+        assert 'исчез' in out or 'не найден' in out
+        assert 'Совпадений нет' not in out
+
+    def test_missing_zcat_is_not_reported_as_no_matches(self):
+        out, _ = self._report('LOGSTATE notool\n', log_file=self.LOG_FILE + '.gz')
+        assert 'zcat' in out
+        assert 'Совпадений нет' not in out
+
+    def test_reader_error_is_shown_and_not_called_empty(self):
+        # .gz, который не gzip (ротация оставила битый файл): прежнее `2>/dev/null`
+        # глушило stderr читателя, и отчёт печатал «Совпадений не найдено» по всем
+        # ротированным логам сразу. Причина приходит SSH-каналом stderr — её надо
+        # показать, а не прятать (урок v1.18 про whois).
+        c = FakeSSH(routes=[('ls -1', self.LOG_FILE + '.gz\n'),
+                            ('grep', ('LOGTOTAL 0\n',
+                                      'gzip: not in gzip format', 0))])
+        out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', '500')
+        assert 'not in gzip format' in out
+        assert 'Совпадений нет' not in out
+
+    def test_partially_unreadable_blocks_the_empty_verdict(self):
+        # Решающая связка: один лог прочитан (0 совпадений), второй не открылся.
+        # «Совпадений нет» было бы утверждением о файле, которого мы не видели.
+        c = FakeSSH(routes=[
+            ('ls -1', self.LOG_FILE + '\n' + self.LOG_FILE + '.1\n'),
+            ('grep', ['LOGSTATE unreadable\n', self._read(0)]),
+        ])
+        out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', '500')
+        assert 'не читается' in out
+        assert 'Совпадений нет' not in out
+
+    def test_service_markers_are_not_shown_to_the_operator(self):
+        out, _ = self._report(self._read(2, 'line A', 'line B'))
+        for marker in ('LOGTOTAL', 'LOGSTATE'):
+            assert marker not in out
+
+    def test_bad_pattern_is_not_reported_as_no_matches(self):
+        # GUI принимает regex ОТ ОПЕРАТОРА. При опечатке (`5[0-9`) grep роняет rc=2
+        # и молчит — прежний отчёт сказал бы «Совпадений нет», то есть «проблем в
+        # логе нет» из-за неверного шаблона. Синтаксис шаблона проверяется ДО
+        # чтения файла, поэтому цена ошибки — ноль прочитанных логов.
+        out, _ = self._report('LOGSTATE badpattern\n')
+        assert 'шаблон' in out
+        assert 'Совпадений нет' not in out
 
     def test_gz_logs_use_zcat(self):
-        c = FakeSSH(routes=[('ls -1', '/var/log/nginx/example.com.access.log.gz\n'),
-                             ('zcat', 'gz match\n')])
-        out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', '500')
-        assert 'gz match' in out
-        assert c.find('zcat') is not None
+        _, c = self._report(self._read(1, 'gz match'),
+                            log_file=self.LOG_FILE + '.gz')
+        cmd = c.find('zcat')
+        assert cmd is not None
+        assert 'LOGTOTAL' in cmd                 # та же форма, другой читатель
 
     def test_context_flag_when_requested(self):
-        c = FakeSSH(routes=[('ls -1', self.LOG_FILE)])
-        webcheck_mod.grep_logs_report(c, 'none', 'example.com', '500', context=3)
-        # флаг контекста вставляется ДО -E: команда выглядит как 'grep -C 3 -E ...'
+        # Прежний замок сохраняю: флаг контекста стоит ДО -E ('grep -C 3 -E ...').
+        _, c = self._report(self._read(0), context=3)
         cmd = c.find('grep -C 3')
         assert cmd is not None and '-E' in cmd
 
-    def test_no_matches_message(self):
-        c = FakeSSH(routes=[('ls -1', self.LOG_FILE)])
-        out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', '500')
-        assert 'Совпадений не найдено.' in out
+    def test_reader_stderr_is_not_thrown_away(self):
+        # Поведенческий замок по ОТПРАВЛЕННОЙ команде (не по исходнику — урок
+        # v1.16): прежнее `2>/dev/null` теряло причину, а `tail` в конце конвейера
+        # делал rc конвейера бесполезным (rc tail == 0 всегда).
+        _, c = self._report(self._read(0))
+        cmd = c.find('grep')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd
+        assert 'tail -n' not in cmd              # масштаб не режется хвостом
+
+    def test_price_is_one_grep_per_log_file(self):
+        # Цена не растёт: состояние, точный total и хвост снимаются ОДНИМ прогоном
+        # на файл — никаких вторых чтений диска.
+        _, c = self._report(self._read(1, 'x'))
+        assert c.count('grep') == 1
 
 
 class TestListCommonReports:
