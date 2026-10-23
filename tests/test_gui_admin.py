@@ -505,7 +505,8 @@ def ed(monkeypatch):
 
     def fake_files(c, panel):
         reads_panel.append((c, panel))
-        return [CONF]
+        # Новый контракт (1.27.0): файлы И причины, почему чего-то нет.
+        return [CONF], []
 
     def fake_read(c, path):
         reads.append((c, path))
@@ -521,7 +522,7 @@ def ed(monkeypatch):
     monkeypatch.setattr(ga, 'ttk', bundle)
     monkeypatch.setattr(ga, 'scrolledtext', bundle)
     monkeypatch.setattr(ga, 'messagebox', msg)
-    monkeypatch.setattr(ga, 'get_config_files', fake_files)
+    monkeypatch.setattr(ga, 'get_config_files_info', fake_files)
     monkeypatch.setattr(ga, 'read_file', fake_read)
     monkeypatch.setattr(ga, 'write_file', fake_write)
     host.run_config_editor()
@@ -534,21 +535,61 @@ def ed(monkeypatch):
 class TestConfigEditor:
     def test_silent_without_checker(self, monkeypatch):
         called = []
-        monkeypatch.setattr(ga, 'get_config_files',
-                            lambda c, p: called.append(1) or [])
+        monkeypatch.setattr(ga, 'get_config_files_info',
+                            lambda c, p: called.append(1) or ([], []))
         host = _Host(checker=None)
         host.run_config_editor()
         assert called == []
 
     def test_no_files_shows_info(self, monkeypatch):
+        # Молчание «не найдено» допустимо ровно там, где поиск был выполнен:
+        # причины пустоты у него есть, и ниже они требуют другого диалога.
         bundle = _TkBundle()
         msg = _Msg()
         monkeypatch.setattr(ga, 'messagebox', msg)
-        monkeypatch.setattr(ga, 'get_config_files', lambda c, p: [])
+        monkeypatch.setattr(ga, 'get_config_files_info',
+                            lambda c, p: ([], []))
         host = _Host(FakeSSH())
         host.run_config_editor()
         assert msg.events[0][0] == 'info'
         assert bundle.by_kind('Toplevel') == []
+
+    def test_unreadable_paths_are_not_reported_as_absent(self, monkeypatch):
+        # Прежний текст «Конфигурационные файлы не найдены» на сервере без
+        # прав — ложь: файлы есть, мы их не увидели. Оператор по такому
+        # диалогу решает, что конфигить нечего, и уходит искать не туда.
+        bundle = _TkBundle()
+        msg = _Msg()
+        monkeypatch.setattr(ga, 'messagebox', msg)
+        monkeypatch.setattr(ga, 'get_config_files_info', lambda c, p: (
+            [], ['⚠️ Каталог /etc/nginx/conf.d не читается под этим '
+                 'пользователем: нет прав на каталог (нужны r-x)']))
+        host = _Host(FakeSSH())
+        host.run_config_editor()
+        assert msg.events[0][0] == 'warning'
+        assert '/etc/nginx/conf.d' in msg.events[0][2]
+        assert 'прав' in msg.events[0][2]
+        assert 'не найдены' not in msg.events[0][2]
+        assert bundle.by_kind('Toplevel') == []
+
+    def test_partial_list_opens_and_still_shows_the_gaps(self, monkeypatch):
+        # Найденное терять нельзя: редактор открывается, но пробел обязан быть
+        # назван, иначе список из двух файлов из двадцати читается как полный.
+        bundle = _TkBundle()
+        msg = _Msg()
+        monkeypatch.setattr(ga, 'messagebox', msg)
+        monkeypatch.setattr(ga, 'messagebox', msg)
+        monkeypatch.setattr(ga, 'tk', bundle)
+        monkeypatch.setattr(ga, 'tb', bundle)
+        monkeypatch.setattr(ga, 'ttk', bundle)
+        monkeypatch.setattr(ga, 'scrolledtext', bundle)
+        monkeypatch.setattr(ga, 'get_config_files_info', lambda c, p: (
+            [CONF], ['⚠️ Каталог /etc/nginx/conf.d не читается: нет прав']))
+        monkeypatch.setattr(ga, 'read_file', lambda c, p: CONTENT)
+        monkeypatch.setattr(ga, 'write_file', lambda c, p, x: 'REZULTAT')
+        _Host(FakeSSH()).run_config_editor()
+        assert bundle.by_kind('Toplevel')          # редактор открыт
+        assert any('/etc/nginx/conf.d' in e[2] for e in msg.events)
 
     def test_panel_type_reaches_file_list(self, ed):
         assert ed.reads_panel == [(ed.checker, 'PANEL')]
@@ -661,7 +702,8 @@ class TestConfigEditor:
         monkeypatch.setattr(ga, 'ttk', bundle)
         monkeypatch.setattr(ga, 'scrolledtext', bundle)
         monkeypatch.setattr(ga, 'messagebox', msg)
-        monkeypatch.setattr(ga, 'get_config_files', lambda c, p: [CONF])
+        monkeypatch.setattr(ga, 'get_config_files_info',
+                            lambda c, p: ([CONF], []))
         monkeypatch.setattr(ga, 'read_file', fake_read)
         monkeypatch.setattr(ga, 'write_file',
                             lambda c, p, x: writes.append((c, p, x)) or write_result)

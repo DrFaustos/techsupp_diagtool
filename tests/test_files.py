@@ -136,15 +136,41 @@ class TestReadFile:
         assert len(c.commands) == 1
 
 
+def _ff(paths, dirs=(), total=None):
+    """Ответ примитива find_files_cmd (v1.20): пути + FFCOUNT + FFDIR.
+
+    Двойник обязан говорить то, что говорит настоящий сервер. Прежний маршрут
+    `('ls -d', 'exists\\n')` возвращал ответ, которого `ls` не выдаёт НИКОГДА:
+    `ls -d ПУТЬ` печатает сам путь, а `echo exists` идёт отдельной строкой.
+    Живой замер (uid=1000, /bin/bash):
+
+        out=$(ls -d /etc/hosts 2>/dev/null && echo "exists")   -> "/etc/hosts\\nexists"
+        [ "$out" = exists ]                                    -> ложь всегда
+
+    Из-за нереалистичного двойника тесты проходили над мёртвой функцией.
+    """
+    out = [f'FFDIR {st} {p}' for st, p in dirs] + list(paths)
+    out.append(f'FFCOUNT {total if total is not None else len(paths)}')
+    return '\n'.join(out) + '\n'
+
+
+# «Всё просмотрено, файлов нет» — базовый ответ для путей, которых тест не
+# касается: иначе в notes лезут признания о непросмотренных путях, и проверка
+# конкретной причины становится неточной.
+NOTHING = [('FFCOUNT', 'FFCOUNT 0\n')]
+
+
 class TestGetConfigFiles:
-    ROUTES = [('ls -d', 'exists\n'),
-              ('ls -1', 'nginx.conf\n'),
-              ('find ', '/usr/local/fastpanel/etc/nginx/sites/default.conf\n')]
+    # Реалистичные ответы: `ls -1 <glob>` печатает ПОЛНЫЕ пути, а не имена.
+    ROUTES = [('/etc/nginx/nginx.conf', _ff(['/etc/nginx/nginx.conf'])),
+              ('/etc/nginx/sites-available',
+               _ff(['/etc/nginx/sites-available/nginx.conf'])),
+              ('/usr/local/fastpanel/etc/nginx',
+               _ff(['/usr/local/fastpanel/etc/nginx/sites/default.conf']))]
 
     def test_common_paths_collected(self):
         files = files_mod.get_config_files(FakeSSH(routes=self.ROUTES), 'none')
         assert '/etc/nginx/nginx.conf' in files
-        # путь с '/' на конце -> к имени из ls приклеивается сам каталог
         assert '/etc/nginx/sites-available/nginx.conf' in files
         assert files == sorted(files)
         assert len(files) <= 50
@@ -158,13 +184,133 @@ class TestGetConfigFiles:
     def test_no_existing_paths_returns_empty(self):
         assert files_mod.get_config_files(FakeSSH(), 'none') == []
 
-    def test_existing_path_with_empty_listing_appends_itself(self):
-        # ls -d нашёл путь, ls -1 пуст -> в список попадает сам путь: иначе
-        # одиночные конфиги (nginx.conf, my.cnf) терялись бы из редактора
-        c = FakeSSH(routes=[('ls -d', 'exists\n'), ('ls -1', '')])
-        files = files_mod.get_config_files(c, 'none')
-        assert '/etc/nginx/nginx.conf' in files
-        assert '/etc/mysql/my.cnf' in files
+
+class TestConfigFileSearchExplainsGaps:
+    """Редактор обязан называть ПРИЧИНУ пустого списка, а не «файлы не найдены».
+
+    Корневая причина найдена живьём, а не по чтению кода: условие
+    `out.strip() == 'exists'` не истина никогда, поэтому на реальном сервере
+    get_config_files возвращал [] ВСЕГДА — не только без прав. GUI честно
+    рапортовал «Конфигурационные файлы не найдены» там, где все конфиги есть.
+    """
+
+    def test_existing_config_reaches_the_list(self):
+        # Тот самый кейс, который на живом сервере не работал никогда.
+        c = FakeSSH(routes=[('/etc/nginx/nginx.conf',
+                             _ff(['/etc/nginx/nginx.conf']))] + NOTHING)
+        files, notes = files_mod.get_config_files_info(c, 'none')
+        assert '/etc/nginx/nginx.conf' in files and notes == []
+
+    def test_closed_directory_names_the_reason(self):
+        c = FakeSSH(routes=[('conf.d',
+                             _ff([], dirs=[('noperm', '/etc/nginx/conf.d')]))]
+                    + NOTHING)
+        files, notes = files_mod.get_config_files_info(c, 'none')
+        assert '/etc/nginx/conf.d' not in files
+        assert any('conf.d' in n and 'прав' in n for n in notes)
+
+    def test_closed_directory_is_not_called_absent(self):
+        # Диагнозы противоположны и лечатся по-разному: «подними права» против
+        # «проверь раскладку». Смешать их — отправить оператора не туда.
+        c = FakeSSH(routes=[('conf.d',
+                             _ff([], dirs=[('noperm', '/etc/nginx/conf.d')]))]
+                    + NOTHING)
+        _files, notes = files_mod.get_config_files_info(c, 'none')
+        note = ' '.join(notes)
+        assert 'нет на сервере' not in note
+
+    def test_missing_directory_is_called_missing(self):
+        c = FakeSSH(routes=[('conf.d',
+                             _ff([], dirs=[('missing', '/etc/nginx/conf.d')]))]
+                    + NOTHING)
+        _files, notes = files_mod.get_config_files_info(c, 'none')
+        assert any('conf.d' in n and 'нет на сервере' in n for n in notes)
+
+    def test_readable_empty_directory_makes_no_complaint(self):
+        # Каталог прочитан, файлов нет — честный ответ. Жалоба на него
+        # обесценила бы настоящие предупреждения (то же решение, 1.24–1.26).
+        c = FakeSSH(routes=[('conf.d',
+                             _ff([], dirs=[('ok', '/etc/nginx/conf.d')]))])
+        files, notes = files_mod.get_config_files_info(c, 'none')
+        assert files == [] and notes == []
+
+    def test_empty_directory_is_not_offered_as_a_file(self):
+        # Прежний код добавлял в список сам путь каталога («иначе потеряются
+        # одиночные конфиги») — а одиночный конфиг находится веткой файла и
+        # так. Каталог в списке «файлов» = редактор открывает каталог как
+        # файл, ровно isdir из v1.21.0.
+        c = FakeSSH(routes=[('conf.d',
+                             _ff([], dirs=[('ok', '/etc/nginx/conf.d')]))])
+        files, _notes = files_mod.get_config_files_info(c, 'none')
+        assert not [f for f in files if 'conf.d' in f]
+
+    def test_closed_panel_directory_names_the_reason(self):
+        c = FakeSSH(
+            routes=[('/usr/local/mgr5/etc/nginx',
+                     ('', "find: ‘/usr/local/mgr5/etc/nginx’: "
+                      "Permission denied", 1))] + NOTHING)
+        files, notes = files_mod.get_config_files_info(c, 'ispmanager')
+        assert not [f for f in files if 'mgr5' in f]
+        assert any('mgr5' in n and 'прав' in n for n in notes)
+
+    def test_panel_files_are_listed_without_complaint(self):
+        c = FakeSSH(
+            routes=[('/usr/local/mgr5/etc/nginx',
+                     '/usr/local/mgr5/etc/nginx/mgr.conf\n')] + NOTHING)
+        files, notes = files_mod.get_config_files_info(c, 'ispmanager')
+        assert '/usr/local/mgr5/etc/nginx/mgr.conf' in files and notes == []
+
+    def test_missing_panel_directory_is_called_missing(self):
+        c = FakeSSH(
+            routes=[('/usr/local/mgr5/etc/nginx',
+                     ('', "find: ‘/usr/local/mgr5/etc/nginx’: "
+                      "No such file or directory", 1))] + NOTHING)
+        _files, notes = files_mod.get_config_files_info(c, 'ispmanager')
+        note = ' '.join(notes)
+        assert 'mgr5' in note and 'нет на сервере' in note and 'прав' not in note
+
+    def test_glob_paths_reach_the_shell_unquoted(self):
+        # '/etc/php/*/php.ini' в кавычках q() — ls ищет файл со звездой в
+        # имени и, естественно, не находит: php.ini терялся из редактора.
+        c = FakeSSH(routes=NOTHING)
+        files_mod.get_config_files_info(c, 'none')
+        assert c.find('ls -1 /etc/php/*/php.ini') is not None
+
+    def test_no_command_blinds_stderr(self):
+        # В stderr лежит ровно та строка, где написана причина пустоты.
+        c = FakeSSH(routes=NOTHING)
+        files_mod.get_config_files_info(c, 'none')
+        assert not [cmd for cmd in c.commands if '2>/dev/null' in cmd]
+
+    def test_search_costs_one_command_per_path(self):
+        # Различение состояний не имеет права дорожать: примитив v1.20 делает
+        # состояние каталога и список ОДНОЙ командой, прежний код тратил две
+        # слепые на каждый путь.
+        c = FakeSSH(routes=NOTHING)
+        files_mod.get_config_files_info(c, 'none')
+        assert len(c.commands) == len(files_mod.CONFIG_PATHS)
+
+    def test_wrapper_keeps_plain_list(self):
+        # Совместимость: внешние потребители (diagnostic, старые тесты) ждут
+        # список, а не кортеж.
+        c = FakeSSH(routes=[('/etc/nginx/nginx.conf',
+                             _ff(['/etc/nginx/nginx.conf']))] + NOTHING)
+        assert files_mod.get_config_files(c, 'none') == ['/etc/nginx/nginx.conf']
+
+    def test_unconfirmed_search_is_confessed(self):
+        # Сервер не вернул ни FFDIR, ни FFCOUNT (обрыв, чужой ls): «пусто» по
+        # такому прогону сказать нельзя — это «не проверено» (тот же закон,
+        # что unchecked в read_file_info).
+        c = FakeSSH()
+        files, notes = files_mod.get_config_files_info(c, 'none')
+        assert files == [] and notes
+
+    def test_unconfirmed_paths_are_named_once(self):
+        # Заметка — про сбой поиска, а не про каждый из 16 путей: 16 строк
+        # в диалоге оператор не прочитает, а причину потеряет.
+        c = FakeSSH()
+        _files, notes = files_mod.get_config_files_info(c, 'none')
+        assert len(notes) == 1
 
 
 class TestReplaceIpv4ErrorBranch:
