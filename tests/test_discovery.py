@@ -657,6 +657,10 @@ def _mail_routes(closed=None, **overrides):
 
 NO_PERM = ('RFSTATE unreadable', 'cat: Permission denied', 1)
 BLANK = 'RFSTATE readable\n'
+# Третья правда о файле: «смотрели — его нет». Отличается от «нет прав»
+# и диагнозом, и лечением, поэтому разведена своей константой (как
+# RF_TEXT в common.py).
+MISSING = ('RFSTATE missing', 'cat: No such file or directory', 1)
 
 
 class TestMailInventoryExplainsGaps:
@@ -1666,6 +1670,204 @@ class TestMailAuthHelpers:
             ['v=spf1 ip4:1.2.3.4 -all']
         assert dc.parse_dns_txt('a\n\n  \nb\n') == ['a', 'b']
         assert dc.parse_dns_txt('') == []
+
+
+class TestResolverViewExplainsIgnorance:
+    """«Не прочитали resolv.conf» не имеет права печататься как «всё чисто».
+
+    Замер живьём (uid=1000, /bin/bash, настоящие файлы против discovery):
+
+        nameserver 127.0.0.53  ->  note «резолвер — 127.0.0.53, видны локальные зоны»
+        nameserver 1.1.1.1     ->  note ''   <- прочитали: резолвер внешний, чисто
+        пустой (прочитан)      ->  note ''   <- прочитали: nameserver нет
+        закрыт (0000)          ->  note ''   <- ЛОЖЬ: мы не посмотрели
+
+    Третий и четвёртый случай — противоположные утверждения («резолвер не
+    локальный, видит интернет» против «не знаем, чем он резолвит»), а продукт
+    отдавал их побайтово одинаково: `read_file_content(...) or ''` гасил None
+    в пустой текст. read_file_info (1.21.0) в это же время знал правду:
+    state='unreadable'.
+    """
+
+    def _closed(self):
+        return FakeSSH(routes=[('cat /etc/resolv.conf', NO_PERM)])
+
+    def test_unreadable_resolv_conf_is_not_silence(self):
+        c = self._closed()
+        note, unknown = dc.resolver_view_info(c)
+        # Не выдумываем: раз не читали, сказать «резолвер локальный» нельзя.
+        assert note == ''
+        assert unknown and '/etc/resolv.conf' in unknown and 'прав' in unknown
+
+    def test_public_resolver_leaves_no_complaint(self):
+        # Прочитали и увидели внешний резолвер — «всё чисто» здесь честный
+        # ответ, и жалоба на него обесценила бы настоящие предупреждения.
+        c = FakeSSH(routes=[('cat /etc/resolv.conf', 'nameserver 1.1.1.1\n')])
+        note, unknown = dc.resolver_view_info(c)
+        assert note == '' and unknown == ''
+
+    def test_empty_resolv_conf_is_an_honest_answer(self):
+        c = FakeSSH(routes=[('cat /etc/resolv.conf', BLANK)])
+        note, unknown = dc.resolver_view_info(c)
+        assert note == '' and unknown == ''
+
+    def test_missing_resolv_conf_names_its_reason(self):
+        # Отсутствующий resolv.conf — тоже «не знаем, чем резолвит», но лечится
+        # он не правами, поэтому причина обязана быть названа своей словом.
+        c = FakeSSH(routes=[('cat /etc/resolv.conf', MISSING)])
+        note, unknown = dc.resolver_view_info(c)
+        assert note == '' and unknown and 'нет на сервере' in unknown
+
+    def test_note_wrapper_keeps_its_old_contract(self):
+        # Совместимость: старая функция обязана оставаться строкой-пометкой.
+        # Именно поэтому она НЕ годится для отчёта — и отчёты обязаны звать
+        # resolver_view_info: здесь '' означает «нет пометки», а не «всё чисто».
+        assert dc.resolver_view_note(self._closed()) == ''
+        c = FakeSSH(routes=[('cat /etc/resolv.conf', 'nameserver 127.0.0.53\n')])
+        assert '127.0.0.53' in dc.resolver_view_note(c)
+
+    def test_ignorance_is_not_an_account_for_local_view(self):
+        # Ключевой разделитель этого слайса. resolver_note — Условие внешней
+        # сверки (zone_is_local_view): непустая строка = «показано локальное
+        # содержимое» = платить 5 dig на каждый домен. Причина «файл не
+        # прочитан» не доказывает локальность, поэтому обязана идти ОТДЕЛЬНЫМ
+        # каналом, а не подмешиваться в note.
+        c = self._closed()
+        note, unknown = dc.resolver_view_info(c)
+        assert unknown                          # причину мы всё равно знаем
+        assert dc.zone_is_local_view('ex.com', set(), note) == []
+
+    def test_distinguishing_the_state_costs_one_command(self):
+        # Различение состояний не имеет права дорожать: то же одно cat.
+        c = self._closed()
+        dc.resolver_view_info(c)
+        reads = [cmd for cmd in c.commands if 'resolv.conf' in cmd]
+        assert len(reads) == 1
+        assert not [cmd for cmd in reads if '2>/dev/null' in cmd]
+
+    def test_answer_without_marker_is_still_parsed(self):
+        # Граница, зафиксированная ОСОЗНАННО (то же решение, что 1.21.0/1.23.0):
+        # ответ без маркера RFSTATE — прежняя/чужая команда либо обрыв на
+        # полпути. Содержимое отдаётся как есть и ЖАЛОБЫ нет: иначе 27+
+        # существующих тестов, роутирующих простой `cat /etc/resolv.conf`,
+        # вспыхнули бы ложным «не прочитано». Здесь локальность доказана самим
+        # текстом ответа, поэтому основание для внешней сверки честно.
+        c = FakeSSH(routes=[('cat /etc/resolv.conf', 'nameserver 127.0.0.53')])
+        note, unknown = dc.resolver_view_info(c)
+        assert '127.0.0.53' in note and unknown == ''
+        assert dc.zone_is_local_view('ex.com', set(), note)
+
+    def test_empty_answer_without_marker_is_confessed(self):
+        # А вот ПУСТОЙ ответ без маркера — это уже не «прочитали пусто», а
+        # «сервер ничего не подтвердил» (unchecked). Молчать в этом случае
+        # значит соврать, что резолвер не локальный.
+        note, unknown = dc.resolver_view_info(FakeSSH())
+        assert note == '' and unknown and 'не подтвердил' in unknown
+
+
+class TestHostsBlockersExplainsIgnorance:
+    """Блок «домен на loopback ломает Let's Encrypt» обязан быть проверен.
+
+    Замер живьём: закрытый /etc/hosts (0000) и прочитанный hosts без привязки
+    давали одинаковый blockers=[] — то есть «блокеров нет» там, где файла мы не
+    видели. Для оператора это решение выпускать сертификат или нет.
+    """
+
+    def test_closed_hosts_is_not_no_blockers(self):
+        c = FakeSSH(routes=[('cat /etc/hosts', NO_PERM)])
+        blockers, unknown = dc.hosts_le_blockers_info(c, 'site.ru')
+        assert blockers == []                   # выдумывать привязку нельзя
+        assert unknown and '/etc/hosts' in unknown and 'прав' in unknown
+        # Название беды обязательно: оператор читает досье ради Let's Encrypt,
+        # а не ради абстрактного «что-то не прочитано».
+        assert "Let's Encrypt" in unknown
+
+    def test_readable_hosts_without_binding_is_an_honest_answer(self):
+        c = FakeSSH(routes=[('cat /etc/hosts',
+                             'RFSTATE readable\n127.0.0.1 localhost\n')])
+        blockers, unknown = dc.hosts_le_blockers_info(c, 'site.ru')
+        assert blockers == [] and unknown == ''
+
+    def test_binding_is_still_reported(self):
+        c = FakeSSH(routes=[('cat /etc/hosts',
+                             'RFSTATE readable\n127.0.0.1 site.ru\n')])
+        blockers, unknown = dc.hosts_le_blockers_info(c, 'site.ru')
+        assert blockers == ['127.0.0.1 site.ru'] and unknown == ''
+
+    def test_missing_hosts_names_missing_not_no_privileges(self):
+        c = FakeSSH(routes=[('cat /etc/hosts', MISSING)])
+        _blockers, unknown = dc.hosts_le_blockers_info(c, 'site.ru')
+        assert unknown and 'нет на сервере' in unknown
+
+    def test_detail_report_says_the_check_was_not_done(self):
+        c = FakeSSH(routes=[('cat /etc/hosts', NO_PERM)])
+        out = dc.domain_detail_report(c, 'site.ru', 'none')
+        assert 'не прочитан' in out and "Let's Encrypt" in out
+        assert '/etc/hosts' in out
+
+    def test_detail_report_stays_quiet_when_hosts_was_read(self):
+        # Молчание допустимо ровно там, где проверка реально выполнена.
+        c = FakeSSH(routes=[('cat /etc/hosts',
+                             'RFSTATE readable\n127.0.0.1 localhost\n')])
+        out = dc.domain_detail_report(c, 'site.ru', 'none')
+        assert 'не прочитан' not in out
+
+    def test_detail_report_still_prints_real_binding(self):
+        c = FakeSSH(routes=[('cat /etc/hosts',
+                             'RFSTATE readable\n127.0.0.1 site.ru\n')])
+        out = dc.domain_detail_report(c, 'site.ru', 'none')
+        assert 'привязан к loopback' in out
+        assert 'не прочитан' not in out
+
+    def test_distinguishing_the_state_costs_one_command(self):
+        c = FakeSSH(routes=[('cat /etc/hosts', NO_PERM)])
+        dc.hosts_le_blockers_info(c, 'site.ru')
+        reads = [cmd for cmd in c.commands if '/etc/hosts' in cmd]
+        assert len(reads) == 1
+        assert not [cmd for cmd in reads if '2>/dev/null' in cmd]
+
+
+class TestMailAuthDisclosesUnknownResolver:
+    """SPF-отчёт обязан признаться, что не знает, чем сервер резолвит.
+
+    note про локальную зону — единственное основание печатать «dig показывает
+    локальную зону». Если resolv.conf не читался, основания нет, но и вывод
+    «видно интернет» немотивирован: вердикт напечатан без оговорки был бы
+    ложью. Лечим признанием, а не лишними запросами.
+    """
+
+    ROUTES = [('mgrctl -m ispmgr maildomain', 'name=lie.ru elid=1\n'),
+              ('cat /etc/resolv.conf', NO_PERM)] + AUTH_ROUTES[1:]
+
+    def test_report_names_the_unreadable_resolv_conf(self):
+        c = FakeSSH(routes=list(self.ROUTES))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert '/etc/resolv.conf' in out and 'резолв' in out
+
+    def test_report_does_not_claim_the_view_is_public(self):
+        # «виден интернет» — именно то, что отчёт не имеет права утверждать,
+        # не прочитав resolv.conf.
+        c = FakeSSH(routes=list(self.ROUTES))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'а не интернета' not in out
+
+    def test_read_resolv_conf_adds_no_confession(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             'name=lie.ru elid=1\n'),
+                            ('cat /etc/resolv.conf', 'nameserver 1.1.1.1\n')]
+                   + AUTH_ROUTES[1:])
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'не прочитан' not in out
+
+    def test_confession_prints_once_per_report(self):
+        # Пометка про резолвер — про сервер, а не про домен: при 25 доменах
+        # она не должна превращаться в 25 одинаковых строк.
+        rows = 'name=lie.ru elid=1\nname=two.ru elid=2\n'
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain', rows),
+                            ('cat /etc/resolv.conf', NO_PERM)]
+                   + AUTH_ROUTES[1:])
+        out = dc.mail_auth_report(c, 'ispmanager', limit=2)
+        assert out.count('/etc/resolv.conf') == 1
 
 
 class TestWhereTheRecordsAreSeen:
