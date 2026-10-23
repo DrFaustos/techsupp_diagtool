@@ -2,7 +2,8 @@
 import re
 from collections import Counter
 
-from common import DOMAIN_PATHS, q, find_files, read_file_content, get_domain_from_config
+from common import (DOMAIN_PATHS, q, find_files, find_files_info,
+                    read_file_content, get_domain_from_config)
 from metrics import detect_panel  # noqa: F401 (реэкспорт для удобства)
 
 
@@ -12,37 +13,63 @@ def _safe_name(name):
 
 
 # ==================== ПОИСК ЛОГОВ ====================
-def find_logs(checker, panel_type, domain, log_type='error'):
-    """Находит логи для домена (унифицированная функция)"""
-    log_files = []
-    limit = 20
-    safe_domain = _safe_name(domain)
-
+# Перечень паттернов живёт в ОДНОЙ функции: его зовут и find_logs, и
+# find_logs_info. Две копии перечня разъезжаются незаметно — тогда на одном и том
+# же сервере в одном отчёте логи «есть», а в другом «их нет». Ровно та грабля,
+# что уже лечили: cert_state (1.16.0), whois_record_lines (1.18.0), log_reader
+# (1.19.0).
+def _log_patterns(panel_type, safe_domain, log_type):
+    """Каталоги/маски логов домена для панели (панель может быть не определена)."""
     if panel_type == 'fastpanel':
-        patterns = [
+        return [
             f'/var/www/*/data/logs/*{safe_domain}*.{log_type}.log',
             f'/home/*/logs/*{safe_domain}*.{log_type}.log'
         ]
-        for pattern in patterns:
-            log_files.extend(find_files(checker, pattern, limit))
-    elif panel_type == 'ispmanager':
-        patterns = [
+    if panel_type == 'ispmanager':
+        return [
             f'/var/www/*/{safe_domain}/data/logs/{log_type}.log',
             f'/var/www/*/{safe_domain}/logs/{log_type}.log',
             f'/var/www/httpd-logs/{safe_domain}.{log_type}.log'
         ]
-        for pattern in patterns:
-            log_files.extend(find_files(checker, pattern, limit))
-    else:
-        patterns = [
-            f'/var/log/nginx/{safe_domain}.{log_type}.log',
-            f'/var/log/apache2/{safe_domain}-{log_type}.log',
-            f'/var/log/httpd/{safe_domain}-{log_type}_log'
-        ]
-        for pattern in patterns:
-            log_files.extend(find_files(checker, pattern, limit))
+    return [
+        f'/var/log/nginx/{safe_domain}.{log_type}.log',
+        f'/var/log/apache2/{safe_domain}-{log_type}.log',
+        f'/var/log/httpd/{safe_domain}-{log_type}_log'
+    ]
 
-    return list(set(log_files))
+
+def find_logs_info(checker, panel_type, domain, log_type='error', limit=20):
+    """Логи домена и ЧЕМ объясняется пустота: {'paths', 'notes', 'checked'}.
+
+    checked=False — сервер не подтвердил просмотр ни одного каталога (в ответе не
+    было ни FFDIR, ни FFCOUNT): это «не проверено». Раньше такой ответ печатался
+    как «Не найден … лог», т.е. «не проверено» было подписано как «логов нет».
+    notes — готовые оператору строки про закрытые/отсутствующие каталоги.
+    """
+    paths, notes, checked = [], [], False
+    for pattern in _log_patterns(panel_type, _safe_name(domain), log_type):
+        info = find_files_info(checker, pattern, limit)
+        if info['dirs'] or info['total'] is not None:
+            checked = True
+        for p in info['paths']:
+            if p not in paths:
+                paths.append(p)
+        for n in info['notes']:
+            if n not in notes:
+                notes.append(n)
+    return {'paths': paths, 'notes': notes, 'checked': checked}
+
+
+def find_logs(checker, panel_type, domain, log_type='error'):
+    """Находит логи для домена (унифицированная функция).
+
+    Совместимость сохранена: предупреждения идут тем же списком отдельными
+    ⚠️-строками, а потребители (discovery, panels, GUI) фильтруют их как не-пути.
+    Отчёту, который обязан объяснить пустоту, нужен find_logs_info — иначе причина
+    отфильтруется и на выходе снова встанет «не найдено».
+    """
+    info = find_logs_info(checker, panel_type, domain, log_type)
+    return info['paths'] + info['notes']
 
 
 # ==================== ПОЧТОВЫЙ ЛОГ (одна реализация на весь проект) ==========
@@ -775,8 +802,17 @@ def filter_by_date(entry, year=None, month=None, day=None):
 # ==================== АНАЛИЗ ЛОГОВ ДОСТУПА ====================
 def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=None, day=None):
     """Анализирует access-логи"""
-    log_files = find_logs(checker, panel_type, domain, 'access')
+    info = find_logs_info(checker, panel_type, domain, 'access')
+    log_files = info['paths']
     if not log_files:
+        # Пустота бывает трёх родов; «логов нет» — только третий.
+        if info['notes']:
+            return "\n".join([f"❌ Access-лог домена {domain} не просмотрен:"]
+                             + info['notes'])
+        if not info['checked']:
+            return (f"❓ Access-лог домена {domain}: состояние не проверено — "
+                    f"сервер не подтвердил просмотр ни одного каталога. "
+                    f"Повторите проверку: прошлая могла оборваться.")
         return f"❌ Не найден access-лог для домена {domain}"
 
     ip_counter = Counter()

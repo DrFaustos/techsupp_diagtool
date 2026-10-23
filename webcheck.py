@@ -4,7 +4,7 @@ import re
 from common import q
 from discovery import (CERT_STATE_ICON, cert_days_label, cert_state,
                        parse_cert_days)
-from logs import find_logs, get_domains
+from logs import find_logs, find_logs_info, get_domains
 
 
 def ssl_cert_days_cmd(domain, port=443):
@@ -495,15 +495,27 @@ def grep_logs_report(checker, panel_type, domain, pattern, context=0, limit=200)
     и для того, кто захотел бы его взять (rc конвейера = rc tail = 0).
     """
     lines = [f"=== GREP ЛОГОВ: {domain} / '{pattern}' ==="]
-    log_files = find_logs(checker, panel_type, domain, 'access')
-    log_files += find_logs(checker, panel_type, domain, 'error')
-    log_files = [f for f in log_files if not f.startswith('⚠️')]
+    acc = find_logs_info(checker, panel_type, domain, 'access')
+    err = find_logs_info(checker, panel_type, domain, 'error')
     # Без дедупликации один и тот же файл попадал в поиск дважды (маски access и
     # error пересекаются), и «Всего строк» удваивалось: масштаб беды завышался
     # тем же способом, что раньше занижался хвостом.
-    log_files = list(dict.fromkeys(log_files))
+    log_files = list(dict.fromkeys(acc['paths'] + err['paths']))
+    notes = list(dict.fromkeys(acc['notes'] + err['notes']))
     if not log_files:
-        lines.append("❌ Логи для домена не найдены")
+        # «Не найдены» — только когда каталоги действительно просмотрены. Роды
+        # пустоты лечатся по-разному: закрытый каталог — это права, отсутствующий
+        # — раскладка/тип панели, а неподтверждённый ответ не лечится ничем, кроме
+        # повтора. Подпись «не найдены» отправляла оператора не туда.
+        if notes:
+            lines.append("❌ Логи домена не просмотрены:")
+            lines.extend(f"   {n}" for n in notes)
+        elif not (acc['checked'] or err['checked']):
+            lines.append("❓ Логи домена: состояние не проверено — сервер не "
+                         "подтвердил просмотр ни одного каталога. Повторите "
+                         "проверку.")
+        else:
+            lines.append("❌ Логи для домена не найдены")
         return "\n".join(lines)
 
     total = 0

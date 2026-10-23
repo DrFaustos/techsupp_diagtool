@@ -18,8 +18,8 @@
 from common import (  # noqa: F401
     BACKUP_DIR, BACKUP_SUBDIRS, LOG_PATHS, DOMAIN_PATHS,
     q, ensure_backup_dir, create_backup, save_crontab_backup,
-    write_remote_file, find_files, find_file, read_file_content,
-    get_domain_from_config,
+    write_remote_file, find_files, find_files_info, find_file,
+    read_file_content, get_domain_from_config,
 )
 
 # --- metrics ---
@@ -32,7 +32,7 @@ from metrics import (  # noqa: F401
 
 # --- logs ---
 from logs import (  # noqa: F401
-    find_logs, parse_access_log_line, filter_by_date,
+    find_logs, find_logs_info, parse_access_log_line, filter_by_date,
     analyze_access_log, get_domains, check_site_logs, site_logs_report,
     search_oom_logs,
 )
@@ -102,12 +102,12 @@ from fmanager import (  # noqa: F401
 __all__ = [
     'BACKUP_DIR', 'BACKUP_SUBDIRS', 'LOG_PATHS', 'DOMAIN_PATHS',
     'q', 'ensure_backup_dir', 'create_backup', 'save_crontab_backup',
-    'write_remote_file', 'find_files', 'find_file', 'read_file_content',
-    'get_domain_from_config',
+    'write_remote_file', 'find_files', 'find_files_info', 'find_file',
+    'read_file_content', 'get_domain_from_config',
     'detect_panel', 'get_metrics',
     'disk_memory_report', 'network_report', 'check_web_config',
     'metrics_report', 'firewall_report', 'web_config_report',
-    'find_logs', 'parse_access_log_line', 'filter_by_date',
+    'find_logs', 'find_logs_info', 'parse_access_log_line', 'filter_by_date',
     'analyze_access_log', 'get_domains', 'check_site_logs', 'site_logs_report',
     'search_oom_logs',
     'dns_report_local', 'dns_report', 'dns_resolvers_report',

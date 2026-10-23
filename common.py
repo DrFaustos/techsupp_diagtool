@@ -210,18 +210,168 @@ def remove_remote_path(checker, path, recursive=True):
     return True, None
 
 
+# Состояние каталога, которое команда спрашивает ДО ls. Пустой вывод `ls` дают
+# четыре разных ситуации, и две из них для оператора означают противоположные
+# действия (менять параметры поиска против поднимать права).
+FF_DIR_TEXT = {
+    'missing': ("⚠️ Каталога {path} нет на сервере — искать в нём негде: "
+                "проверьте раскладку и тип панели"),
+    'noperm': ("⚠️ Каталог {path} не читается под этим пользователем: нет прав "
+               "на каталог (нужны r-x). Файлы могут быть — это «мы не увидели», "
+               "а не «файлов нет»: прогоните под root или добавьте оператора в "
+               "группу"),
+    'blocked': ("⚠️ Путь {path} недоступен под этим пользователем — ответ "
+                "системы: «{why}». Проверить содержимое нельзя, поэтому о файлах "
+                "ничего не известно: это «не проверено», а не «файлов нет». "
+                "Прогоните под root или дайте оператору доступ (обычно группа adm)"),
+}
+
+# awk вместо `head`: считает ВСЕ файлы и печатает только первые L. `head -N`
+# резал список молча — оператор не знал, сколько логов не участвовало в отчёте.
+_FF_AWK = '{k++; if(k<=L) print} END{printf "FFCOUNT %d\\n", k}'
+
+
+def find_files_cmd(pattern, limit=20):
+    """Одна POSIX-команда: состояние каталога + список + честное число файлов.
+
+    Строится так, потому что код возврата тут бесполезен. Замерено живьём:
+    `ls -1 GLOB` даёт rc=2 и для «файлов нет», и для «каталога нет», и для «нет
+    прав» (текст stderr различает, rc — нет). Строить на rc, как в 1.18.0 и
+    1.19.0, здесь нельзя; различает только ветки `[ ! -d ]` / `[ ! -r ]`
+    / `[ ! -x ]` по каталогу, поэтому они стоят ДО ls.
+
+    `${PIPESTATUS}` не используем: под dash (обычный /bin/sh в Debian/Ubuntu) он
+    «Bad substitution», а после присваивания `o=$(…|…)` относится не к конвейеру
+    (обе грабли замерены живьём на прошлых слайсах).
+
+    Какие каталоги спрашивать — считает python, а не shell. В паттернах панелей
+    `*` стоит в середине пути ('/var/www/*/data/logs/*.log'), поэтому одного
+    dirname мало: берём (а) префикс до первого `*` — он никогда не содержит
+    glob, его можно спросить напрямую, и (б) dirname целиком — он ловит закрытый
+    каталог ГЛУБИЕ первого `*`. Без пункта (а) кейс «нет прав» врал: при закрытом
+    /var/www глоб не раскрывается, dirname остаётся со звёздочкой, `[ ! -d ]`
+    отвечает «нет каталога» — и оператор вместо «подними права» идёт искать
+    другой домен (замерено живьём на первой версии формы).
+
+    Раскрытие — `set --` + `for d in "$@"`, а не `for d in $D`: pathname
+    expansion не бьёт имена по пробелам (у панелей бывают '/var/www/my site/…'),
+    а нераскрывшийся кандидант остаётся с `*` и честно пропускается — выдумывать
+    про него «каталога нет» нельзя. `$(dirname …)` не используем вообще: во-первых
+    `${PIPESTATUS}`/подстановки ломаются о dash, во-вторых команда с `$( )`
+    перестала бы быть читаемой как `ls -1 <glob>` буквально.
+
+    `stderr` не глушится: `2>/dev/null` терял ровно ту строку
+    (`Permission denied` / `No such file or directory`), где написана причина
+    пустоты.
+
+    ВНИМАНИЕ: pattern — shell-glob, он НЕ экранируется через q() намеренно и
+    уходит в `ls -1` буквально: в кавычках ls искал бы файл с `*` в имени.
+    """
+    n = max(1, int(limit))
+    prefix = pattern.split('*', 1)[0]
+    prefix = prefix[:prefix.rfind('/') + 1]
+    parent = pattern[:pattern.rfind('/')] if '/' in pattern else ''
+    cands = []
+    for cand in (prefix, parent):
+        cand = cand.rstrip('/')
+        if cand and cand not in cands:
+            cands.append(cand)
+    return (
+        f'set -- {" ".join(cands)}; '
+        'for d in "$@"; do '
+        'case "$d" in *"*"*) continue;; esac; '
+        'if [ ! -d "$d" ]; then echo "FFDIR missing $d"; '
+        'elif [ ! -r "$d" ] || [ ! -x "$d" ]; then echo "FFDIR noperm $d"; '
+        'else echo "FFDIR ok $d"; fi; '
+        'done; '
+        f'ls -1 {pattern} | awk -v L="{n}" \'{_FF_AWK}\''
+    )
+
+
+def parse_find_answer(out):
+    """(пути, состояния каталогов, total) из ответа команды.
+
+    total=None — маркера FFCOUNT не было (обрыв, чужая реализация): выдумывать
+    число не имеем права. Пустой список каталогов — то же самое: мы не знаем,
+    читали ли каталог.
+    """
+    paths, dirs, total = [], [], None
+    for line in (out or '').splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith('FFCOUNT '):
+            try:
+                total = int(s.split(' ', 1)[1].strip())
+            except ValueError:
+                total = None
+        elif s.startswith('FFDIR '):
+            parts = s.split(' ', 2)
+            dirs.append((parts[1] if len(parts) > 1 else '',
+                         parts[2] if len(parts) > 2 else ''))
+        else:
+            paths.append(s)
+    return paths, dirs, total
+
+
+def find_files_info(checker, pattern, limit=20):
+    """Ищет файлы и возвращает, ЧЕМЫ объясняется пустота.
+
+    dict(paths, dirs, total, notes). notes — готовые оператору строки про
+    закрытые/отсутствующие каталоги и про срезку лимитом; они начинаются с
+    «⚠️», поэтому уже написанные потребители (logs, discovery, webcheck)
+    отфильтруют их как не-пути, ничего в себе не меняя.
+    """
+    out, err, _rc = checker.run(find_files_cmd(pattern, limit))
+    paths, dirs, total = parse_find_answer(out)
+    # Приоритет у ответа системы, а не у `[ ! -d ]`. Замерено живьём: когда закрыт
+    # РОДИТЕЛЬСКИЙ каталог, `[ ! -d ]` отвечает «нет каталога» — он физически не
+    # может отличить «его нет» от «его не видно» (нужен x на каждый сегмент выше).
+    # Строка `Permission denied` в stderr различает, а `2>/dev/null` в прежней
+    # команде выбрасывал именно её. Пока система говорит про права, утверждать
+    # «каталога нет, проверьте раскладку» нельзя: это отправит оператора чинить не
+    # то (первое поколение этой правки врал ровно так — поймано живым прогоном).
+    if 'permission denied' in (err or '').lower() and not paths:
+        dirs = [('blocked' if st == 'missing' else st, p) for st, p in dirs]
+        if not dirs:
+            parent = pattern[:pattern.rfind('/')] or pattern
+            dirs = [('blocked', parent)]
+    why = ''
+    for line in (err or '').splitlines():
+        if line.strip():
+            why = line.strip()[:160]
+            break
+    # Один и тот же каталог приходит дважды (префикс до `*` и dirname от него же:
+    # '/var/log/nginx/' и '/var/log/nginx'). Дедуп здесь, а не в команде: решение
+    # «что показывать оператору» должно жить в одном месте (грабель v1.18 —
+    # признак, посчитанный дважды, однажды разъезжается).
+    seen = set()
+    uniq = []
+    for state, path in dirs:
+        key = (state, path.rstrip('/'))
+        if key not in seen:
+            seen.add(key)
+            uniq.append((state, path.rstrip('/')))
+    dirs = uniq
+    notes = []
+    for state, path in dirs:
+        text = FF_DIR_TEXT.get(state)
+        if text:
+            notes.append(text.format(path=path, why=why))
+    if total is not None and total > len(paths):
+        notes.append(f"⚠️ Показаны первые {len(paths)} файлов из {total}: "
+                     f"остальные в этом отчёте не участвовали")
+    return {'paths': paths, 'dirs': dirs, 'total': total, 'notes': notes}
+
+
 def find_files(checker, pattern, limit=20):
-    """Находит файлы по паттерну и возвращает список с предупреждением об ограничении.
+    """Находит файлы по паттерну; предупреждения — отдельными ⚠️-строками.
 
     ВНИМАНИЕ: pattern — это shell-glob (напр. '/var/log/nginx/*.log'),
     поэтому он НЕ экранируется через q() намеренно.
     """
-    cmd = f"ls -1 {pattern} 2>/dev/null | head -{limit}"
-    out, _, _ = checker.run(cmd)
-    files = [f.strip() for f in out.split('\n') if f.strip()]
-    if len(files) >= limit:
-        files.append(f"⚠️ (показаны первые {limit} файлов)")
-    return files
+    info = find_files_info(checker, pattern, limit)
+    return info['paths'] + info['notes']
 
 
 def find_file(checker, patterns):
