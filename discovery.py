@@ -571,11 +571,67 @@ def discover_sites(checker, panel_type=None):
 
 
 # ==================== ИНВЕНТАРЬ: ПОЧТА ====================
-def discover_mail_domains(checker, panel_type=None):
-    """{домен: [источники]} — панель, postfix-карты, dovecot, main.cf."""
+# Тот же закон, что в 1.24.0 для сайтов и зон, но здесь у лжи две особенности,
+# и обе хуже. Первая: почтовый отчёт печатает ЧИСЛО («Почтовых доменов: 2»),
+# которое при недоступной карте становится неверным утверждением, а не
+# отсутствием ответа. Замер живьём (uid=1000, настоящие файлы против
+# discovery): контроль давал 3 домена, а закрытый /etc/postfix/virtual (0600
+# root), пустая карта и отсутствующая карта — побайтово одинаковые
+# «Почтовых доменов: 2». Вторая: этот же инвентарь стоит шлюзом к ОПЕРАЦИИ
+# (mailbox_guard) и по нечитаемой карте отказывал текстом «Сначала добавьте
+# домен в панель» — то есть отправлял оператора менять конфигурацию почтового
+# сервера по признаку «мы не посмотрели». Корректный образец лежит рядом, в
+# этом же файле: known_mailbox_addresses возвращает (множество, ok) и прямо
+# пишет, что по неполученному списку нельзя ни разрешать, ни запрещать.
+# Состояния, при которых нам НЕЧЕГО сказать об источнике — «мы не посмотрели».
+# Отсутствующий файл — другое дело: на него смотрели, его нет (на сервере без
+# postfix это норма), и вывод «домена из него нет» по нему законен.
+MAIL_BLOCKING_STATES = ('unreadable', 'readerr', 'unchecked', 'isdir')
+
+
+def _read_mail_source(checker, source, path, notes, blocked):
+    """Читает источник почты; '' если прочитать не удалось (и пишет причину).
+
+    Пустой ПРОЧИТАННЫЙ файл даёт '' без жалобы: «карта пустая» — честный
+    ответ, а жалоба на него обесценила бы настоящие предупреждения (то же
+    решение, что в 1.24.0 для vhost'ов).
+
+    В `blocked` попадает только то, где чтение было НЕВОЗМОЖНО (права, обрыв,
+    каталог вместо файла): по такому источнику нельзя ни разрешать, ни
+    запрещать операцию — тот же закон, что уже реализован у
+    known_mailbox_addresses в этом же файле («список не получен»).
+    """
+    read = read_file_info(checker, path)
+    if read['content'] is None:
+        notes.append(MAIL_SOURCE_GAP_NOTE.format(source=source, path=path,
+                                                 reason=read['reason'] or ''))
+        if read['state'] in MAIL_BLOCKING_STATES:
+            blocked.append(path)
+        return ''
+    return read['content']
+
+
+MAIL_SOURCE_GAP_NOTE = ("⚠️ Почтовый источник {source} ({path}) не прочитан: "
+                        "{reason}. Домены и ящики из него в списке не "
+                        "участвовали — «доменов нет» по этому источнику "
+                        "сказать нельзя")
+
+MAIL_GAP_TITLE = "Почтовый инвентарь неполон: часть источников не просмотрена"
+
+
+def discover_mail_domains_info(checker, panel_type=None):
+    """({домен: [источники]}, notes, blocked) — панель, карты, dovecot, main.cf.
+
+    notes — готовые оператору ⚠️-строки о непросмотренных источниках: без них
+    сокращённый список читается как полный ответ. blocked — пути, которые не
+    удалось прочесть (права, обрыв): по ним запрещены и утверждения отчётов, и
+    операции. Отсутствующий файл в blocked НЕ попадает — его смотрели.
+    """
     if panel_type is None:
         panel_type = detect_panel(checker)
     found = {}
+    notes = []
+    blocked = []
 
     def add(domain, source):
         dom = (domain or '').strip().lower()
@@ -589,30 +645,50 @@ def discover_mail_domains(checker, panel_type=None):
         for row in fp_mail_domains(checker):
             add(row.get('NAME'), 'mogwai emails domains')
 
+    # Прежний вид был `content = read_file_content(...)` и `if content:` —
+    # None (не прочитали) и '' (карта пустая) сливались в одно «доменов нет».
     for source, path in MAIL_MAPS:
-        content = read_file_content(checker, path)
+        content = _read_mail_source(checker, source, path, notes, blocked)
         if content:
             for dom in parse_postfix_map(content)[1]:
                 add(dom, source)
 
-    dovecot = read_file_content(checker, DOVECOT_USERS)
+    dovecot = _read_mail_source(checker, 'dovecot users', DOVECOT_USERS,
+                                notes, blocked)
     if dovecot:
         for addr in parse_dovecot_users(dovecot):
             add(addr.split('@', 1)[1], 'dovecot users')
 
-    main_cf = read_file_content(checker, POSTFIX_MAIN_CF)
+    main_cf = _read_mail_source(checker, 'postfix main.cf', POSTFIX_MAIN_CF,
+                                notes, blocked)
     if main_cf:
         for dom in parse_main_cf_domains(main_cf):
             add(dom, 'postfix main.cf')
 
-    return found
+    return found, _uniq_notes(notes), blocked
 
 
-def discover_mailboxes(checker, panel_type=None, domain=None):
-    """Список ящиков (addr, источник). domain — фильтр по домену."""
+def discover_mail_domains(checker, panel_type=None):
+    """{домен: [источники]} — прежняя форма без заметок.
+
+    Чем объяснены дыры в чтении — в discover_mail_domains_info; отчёты и
+    guard обязаны звать её, иначе «не прочитали» снова станет «доменов нет».
+    """
+    return discover_mail_domains_info(checker, panel_type)[0]
+
+
+def discover_mailboxes_info(checker, panel_type=None, domain=None):
+    """(список ящиков (addr, источник), notes, blocked). domain — фильтр.
+
+    notes — чем объяснены пропавшие ящики: печатается в отчёте и не даёт
+    «ящиков: 0» выглядеть ответом. blocked — источники, которые не удалось
+    прочесть (см. discover_mail_domains_info).
+    """
     if panel_type is None:
         panel_type = detect_panel(checker)
     boxes = []
+    notes = []
+    blocked = []
 
     if panel_type == 'fastpanel':
         for row in fp_mail_boxes(checker, domain):
@@ -621,12 +697,13 @@ def discover_mailboxes(checker, panel_type=None, domain=None):
                 boxes.append((addr, 'mogwai emails boxes'))
 
     for source, path in MAIL_MAPS:
-        content = read_file_content(checker, path)
+        content = _read_mail_source(checker, source, path, notes, blocked)
         if content:
             boxes.extend((addr, source)
                          for addr in parse_postfix_map(content)[0])
 
-    dovecot = read_file_content(checker, DOVECOT_USERS)
+    dovecot = _read_mail_source(checker, 'dovecot users', DOVECOT_USERS,
+                                notes, blocked)
     if dovecot:
         boxes.extend((addr, 'dovecot users')
                      for addr in parse_dovecot_users(dovecot))
@@ -641,7 +718,12 @@ def discover_mailboxes(checker, panel_type=None, domain=None):
         if addr not in seen:
             seen.add(addr)
             out.append((addr, source))
-    return sorted(out)
+    return sorted(out), _uniq_notes(notes), blocked
+
+
+def discover_mailboxes(checker, panel_type=None, domain=None):
+    """Список ящиков (addr, источник) — прежняя форма без заметок."""
+    return discover_mailboxes_info(checker, panel_type, domain)[0]
 
 
 # ==================== ИНВЕНТАРЬ: DNS-ЗОНЫ ====================
@@ -1018,7 +1100,7 @@ def mail_overview_report(checker, panel_type=None):
         panel_type = detect_panel(checker)
     lines = ["=== ПОЧТОВЫЙ СЕРВЕР: ИНВЕНТАРЬ ==="]
 
-    domains = discover_mail_domains(checker, panel_type)
+    domains, gaps, _blocked = discover_mail_domains_info(checker, panel_type)
     if domains:
         lines.append(f"Почтовых доменов: {len(domains)}")
         for dom in sorted(domains):
@@ -1030,6 +1112,12 @@ def mail_overview_report(checker, panel_type=None):
                 lines.append(f"      … ещё {len(boxes) - 15}")
     else:
         lines.append("Почтовые домены не найдены.")
+    # Число «Почтовых доменов: 2» при недоступной карте — неверное утверждение,
+    # а не ответ. Замер живьём (uid=1000, настоящие файлы): контроль давал 3
+    # домена, а закрытая (0600 root), пустая и отсутствующая карта давали
+    # побайтово одинаковый отчёт. Пустой список и урезанный печатались одними
+    # словами, поэтому пробел обязан быть назван рядом с итогом.
+    lines.extend(gap_notes_lines(gaps, MAIL_GAP_TITLE))
 
     out, _ = checker.exec_command('mailq 2>&1 | tail -1')
     queued = parse_mailq_count(out or '')
@@ -1996,8 +2084,16 @@ def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
     if panel_type is None:
         panel_type = detect_panel(checker)
     lines = ["=== ПОЧТА: SPF / DKIM / DMARC / PTR ==="]
-    domains = sorted(discover_mail_domains(checker, panel_type))
+    mail_map, gaps, _blocked = discover_mail_domains_info(checker, panel_type)
+    domains = sorted(mail_map)
     if not domains:
+        if gaps:
+            # «Проверять нечего» при непрочитанной карте закрыло бы тикет,
+            # которого отчёт не проверял: домены есть, мы их не увидели.
+            lines.append("Почтовые домены не найдены — но источники читались "
+                         "не полностью, вывод предварительный (ниже).")
+            lines.extend(gap_notes_lines(gaps, MAIL_GAP_TITLE))
+            return "\n".join(lines)
         lines.append("Почтовые домены не найдены — проверять нечего.")
         return "\n".join(lines)
 
@@ -2498,10 +2594,24 @@ def mailbox_guard(checker, address, panel_type=None, mode='create'):
     local, domain = parsed
     addr = f'{local}@{domain}'
 
-    mail_domains = {d.lower() for d in discover_mail_domains(checker,
-                                                             panel_type)}
+    mail_map, gaps, blocked = discover_mail_domains_info(checker, panel_type)
+    mail_domains = {d.lower() for d in mail_map}
     if domain not in mail_domains:
         shown = ', '.join(sorted(mail_domains)[:8]) or '—'
+        if blocked:
+            # Отказ остаётся — защиту не ослабляем: создавать ящик на
+            # неподтверждённом домене нельзя. Но прежняя формулировка «Сначала
+            # добавьте домен в панель» при нечитаемой карте отправляла оператора
+            # менять конфигурацию почтового сервера по признаку «мы не
+            # посмотрели». Теперь названа причина и то, что с ней делать.
+            # Заметку берём ту, что относится к заблокированному пути: в gaps
+            # рядом лежат и отсутствующие файлы, они к отказу не имеют
+            # отношения (на них смотрели).
+            why = next((note for note in gaps if blocked[0] in note), gaps[0])
+            return (f'Домен {domain} не подтверждён как почтовый домен этого '
+                    f'сервера — {why} Известные: {shown}. Операция '
+                    f'отменена: сначала дайте инструменту чтение источника '
+                    f'(обычно прогон под root).')
         return (f'Домен {domain} не является почтовым доменом этого сервера '
                 f'(известные: {shown}). Сначала добавьте домен в панель.')
 
