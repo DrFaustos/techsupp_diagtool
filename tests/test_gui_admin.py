@@ -575,9 +575,24 @@ class TestConfigEditor:
         assert ed.reads == [(ed.checker, CONF), (ed.checker, CONF)]
 
     def test_save_confirmed_writes_editor_content(self, ed):
+        # РЕФОРМУЛИРОВКА запертого guard'а (объявленно). Прежняя версия запирала
+        # `CONTENT + '\n'`: на сервер уходил Tk-довесок, то есть «открыл →
+        # Сохранить» без единой правки ДОПИСЫВАЛО в конфиг пустую строку. Это
+        # та же тихая порча, что срезанный хвост в read_file_info, только с
+        # другой стороны. Инвариант («уходит ровно то, что в окне») сохранён
+        # строго: срезается ровно один перевод, добавленный Tk, а не rstrip по
+        # всем хвостовым (пустая строка в конце файла — часть файла).
         ed.bundle.command('Сохранить')()
-        # Tk get(1.0, END) отдаёт текст с завершающим переводом строки
-        assert ed.writes == [(ed.checker, CONF, CONTENT + '\n')]
+        assert ed.writes == [(ed.checker, CONF, CONTENT)]
+        assert ed.msg.events[-1][0] == 'info'
+
+    def test_save_keeps_inner_and_extra_blank_lines(self, ed):
+        # Срез «rstrip('\n')» резал ВСЕ хвостовые переводы. Здесь в окне две
+        # пустые строки в конце — обе обязаны уйти на сервер.
+        text = ed.bundle.by_kind('ScrolledText')[0]
+        text.buf = CONTENT + '\n\n'
+        ed.bundle.command('Сохранить')()
+        assert ed.writes == [(ed.checker, CONF, CONTENT + '\n\n')]
         assert ed.host.shown == ['REZULTAT']
         assert ed.msg.events[-1][0] == 'info'
 
@@ -611,3 +626,112 @@ class TestConfigEditor:
         ed.bundle.command('Закрыть')()
         assert ed.msg.asks == []
         assert ed.bundle.dialog().destroyed == 1
+
+    # ---------- отказ чтения не должен становиться содержимым ----------
+    #
+    # Прежний _load делал безусловно:
+    #
+    #     content = read_file(self.checker, filepath)
+    #     text_editor.delete(1.0, tk.END)
+    #     text_editor.insert(tk.END, content)
+    #     original_content[0] = content
+    #
+    # При отказе read_file возвращает строку «❌ …», и она попадаала В РЕДАКТОР:
+    # оператор видел вместо конфига текст ошибки, а «Сохранить» (guard'а нет, в
+    # gui_files такой guard есть) заливал её на сервер по пути конфига. Замер
+    # живьём: четыре разных отказа дают идентичный '❌ Ошибка чтения файла
+    # (rc=1): ' с пустым хвостом — причину заглушил тот же 2>/dev/null.
+    ERR = '❌ Файл не прочитан: не читается под этим пользователем — нет прав'
+
+    def _editor(self, monkeypatch, answers, write_result='REZ'):
+        """Редактор, у которого read_file отдаёт `answers` по одному за вызов."""
+        checker = FakeSSH()
+        host = _Host(checker)
+        bundle = _TkBundle()
+        msg = _Msg()
+        reads, writes = [], []
+        queue = list(answers)
+
+        def fake_read(c, path):
+            reads.append((c, path))
+            return queue.pop(0) if queue else ''
+
+        monkeypatch.setattr(ga, 'tk', bundle)
+        monkeypatch.setattr(ga, 'tb', bundle)
+        monkeypatch.setattr(ga, 'ttk', bundle)
+        monkeypatch.setattr(ga, 'scrolledtext', bundle)
+        monkeypatch.setattr(ga, 'messagebox', msg)
+        monkeypatch.setattr(ga, 'get_config_files', lambda c, p: [CONF])
+        monkeypatch.setattr(ga, 'read_file', fake_read)
+        monkeypatch.setattr(ga, 'write_file',
+                            lambda c, p, x: writes.append((c, p, x)) or write_result)
+        host.run_config_editor()
+        import types
+        return types.SimpleNamespace(host=host, bundle=bundle, msg=msg,
+                                     reads=reads, writes=writes,
+                                     checker=checker)
+
+    def test_failed_load_does_not_fill_editor_with_error_text(self, monkeypatch):
+        e = self._editor(monkeypatch, [self.ERR])
+        text = e.bundle.by_kind('ScrolledText')[0]
+        assert text.buf == ''                       # текст ошибки — НЕ содержимое
+        assert e.msg.events and e.msg.events[0][0] == 'error'
+
+    def test_failed_load_shows_the_reason(self, monkeypatch):
+        e = self._editor(monkeypatch, [self.ERR])
+        shown = ' '.join(str(x) for ev in e.msg.events for x in ev)
+        assert 'прав' in shown
+
+    def test_save_after_failed_load_writes_nothing(self, monkeypatch):
+        e = self._editor(monkeypatch, [self.ERR])
+        e.msg.askyesno_ret = True                   # оператор подтвердил запись
+        e.bundle.command('Сохранить')()
+        assert e.writes == []                       # ❌ не уйдёт на сервер
+
+    def test_reload_failure_keeps_previous_content(self, monkeypatch):
+        e = self._editor(monkeypatch, [CONTENT, self.ERR])
+        text = e.bundle.by_kind('ScrolledText')[0]
+        assert text.buf == CONTENT
+        e.bundle.command('Перезагрузить')()
+        assert text.buf == CONTENT                  # прежнее не затёрто ошибкой
+        assert e.msg.events and e.msg.events[-1][0] == 'error'
+        assert e.reads == [(e.checker, CONF), (e.checker, CONF)]
+
+    def test_failed_load_close_does_not_claim_unsaved_changes(self, monkeypatch):
+        # original_content обязан остаться ПУСТЫМ, а не строкой ошибки: иначе
+        # «Закрыть» сравнит редактор с ❌-текстом и спросит про несохранённые
+        # изменения, которых не было.
+        e = self._editor(monkeypatch, [self.ERR])
+        e.msg.askyesno_ret = True
+        e.bundle.command('Закрыть')()
+        assert e.msg.asks == []
+        assert e.bundle.dialog().destroyed == 1
+
+    def test_success_load_still_editable(self, monkeypatch):
+        # Совместимость: обычный путь (прочитали → правим → пишем) не сломан.
+        # Контент уходит БЕЗ tk-довеска — тот же инвариант, что в
+        # test_save_confirmed_writes_editor_content.
+        e = self._editor(monkeypatch, [CONTENT])
+        text = e.bundle.by_kind('ScrolledText')[0]
+        assert text.buf == CONTENT
+        assert e.msg.events == []
+        e.bundle.command('Сохранить')()
+        assert e.writes == [(e.checker, CONF, CONTENT)]
+        assert e.msg.events[-1][0] == 'info'
+
+    def test_write_failure_is_not_reported_as_success(self, monkeypatch):
+        # files.write_file начинает отказ («❌ Ошибка записи: …») с того же
+        # знака. Прежний save_file показывал «Успех — Файл сохранён» ВСЕГДА,
+        # то есть врал о записи конфига, и ещё помечал файл сохранённым
+        # (original_content), из-за чего «Закрыть» молча теряло правки.
+        e = self._editor(monkeypatch, [CONTENT],
+                         write_result='❌ Ошибка записи: ssh channel closed')
+        e.msg.askyesno_ret = True
+        e.bundle.command('Сохранить')()
+        kinds = [ev[0] for ev in e.msg.events]
+        assert 'info' not in kinds, e.msg.events
+        assert 'error' in kinds
+        # запись не состоялась — эталон «нет несохранённого» обновляться не должен
+        e.msg.askyesno_ret = True
+        e.bundle.command('Закрыть')()
+        assert e.msg.asks

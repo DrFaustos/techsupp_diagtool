@@ -46,15 +46,94 @@ class TestWriteFile:
 
 
 class TestReadFile:
+    """read_file — то, что редактор вставляет в окно, а потом пишет на сервер.
+
+    Прежний вид (files.py):
+
+        out, err, rc = checker.run(f'cat {q(filepath)} 2>/dev/null')
+        if rc != 0:
+            return f"❌ Ошибка чтения файла (rc={rc}): {err.strip()}"
+        return out
+
+    Сообщение обещало причину ПОСЛЕ двоеточия, а та же команда (2>/dev/null) её
+    же и заглушала. Замер живьём (uid=1000, /bin/bash) — четыре разных
+    состояния под одной подписью с ПУСТЫМ хвостом:
+
+        locked.conf    rc=1 stdout=0 stderr=''  -> '❌ Ошибка чтения файла (rc=1): '
+        nope.conf      rc=1 stdout=0 stderr=''  -> '❌ Ошибка чтения файла (rc=1): '
+        lockd/x.conf   rc=1 stdout=0 stderr=''  -> '❌ Ошибка чтения файла (rc=1): '
+        каталог        rc=1 stdout=0 stderr=''  -> '❌ Ошибка чтения файла (rc=1): '
+
+    А вызывающий код (gui_admin._load) вставляет возвращённое в редактор и не
+    различает текст ошибки и содержимое — «Сохранить» записало бы строку
+    ошибки вместо конфига. Отсюда два замка: неудача ОБЯЗАНА начинаться с ❌
+    (по этому распознаёт gui_files) и обязан называть причину словами, а не
+    кодом возврата (rc=1 — не диагноз, он сливает права и отсутствие).
+    """
+
     def test_returns_content(self):
         c = FakeSSH(routes=[('cat ', 'hello\n')])
         assert files_mod.read_file(c, '/etc/hosts') == 'hello\n'
 
-    def test_error_rc_reported(self):
+    def test_returns_content_byte_exact(self):
+        # Завершающий '\\n' — часть файла: редактор вернёт его на сервер.
+        c = FakeSSH(routes=[('RFSTATE', ('RFSTATE readable\nworker 4;\n', '', 0))])
+        assert files_mod.read_file(c, '/etc/nginx/nginx.conf') == 'worker 4;\n'
+
+    def test_unreadable_names_rights_not_rc(self):
+        c = FakeSSH(routes=[('RFSTATE',
+                             ('RFSTATE unreadable', 'cat: Permission denied', 1))])
+        out = files_mod.read_file(c, '/etc/shadow')
+        assert out.startswith('❌')
+        assert 'прав' in out
+        assert 'rc=1' not in out          # код возврата — не диагноз
+        assert 'не прочитан' in out       # строка не похожа на содержимое
+
+    def test_missing_is_not_reported_as_no_rights(self):
+        c = FakeSSH(routes=[('RFSTATE',
+                             ('RFSTATE missing', 'cat: No such file or directory', 1))])
+        out = files_mod.read_file(c, '/etc/nope')
+        assert out.startswith('❌')
+        assert 'нет' in out
+        assert 'прав' not in out          # иначе оператор пойдёт менять chmod
+
+    def test_directory_is_told_as_directory(self):
+        c = FakeSSH(routes=[('RFSTATE',
+                             ('RFSTATE isdir', 'cat: Is a directory', 1))])
+        out = files_mod.read_file(c, '/etc/nginx')
+        assert out.startswith('❌')
+        assert 'каталог' in out
+
+    def test_unconfirmed_answer_is_not_called_empty_file(self):
+        # Ни маркера, ни содержимого: «я не узнал», а не «файл пустой».
+        c = FakeSSH(routes=[])
+        out = files_mod.read_file(c, '/etc/x')
+        assert out.startswith('❌')
+        assert 'не проверено' in out
+
+    def test_missing_is_not_reported_as_rc_only(self):
+        # РЕФОРМУЛИРОВКА запертого guard'а (объявленно). Прежняя версия
+        # `assert 'No such file' in out` проверяла mock: ровно эту строку
+        # продукт сам и глушил своим 2>/dev/null, в реальном ответе её не
+        # было (замер). Инвариант («отказ назван») сохранён строго, но
+        # проверяется состояние, а не цитата, которую продукт обязан был
+        # потерять.
         c = FakeSSH(routes=[('cat ', ('', 'No such file or directory', 1))])
         out = files_mod.read_file(c, '/etc/nope')
-        assert out.startswith('❌ Ошибка чтения файла (rc=1)')
-        assert 'No such file' in out
+        assert out.startswith('❌')
+        assert 'нет' in out
+        assert 'rc=1' not in out
+
+    def test_sent_command_keeps_stderr_and_price(self):
+        # Замок по ОТПРАВЛЕННОЙ команде (уроки 1.16–1.22): в 2>/dev/null
+        # лежала единственная причина, а цену поднимать нельзя.
+        c = FakeSSH(routes=[('RFSTATE', ('RFSTATE readable\nx\n', '', 0))])
+        files_mod.read_file(c, '/etc/nginx/nginx.conf')
+        cmd = c.find('RFSTATE')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd
+        assert 'head -' not in cmd
+        assert len(c.commands) == 1
 
 
 class TestGetConfigFiles:

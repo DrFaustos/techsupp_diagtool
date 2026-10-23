@@ -920,16 +920,40 @@ class TestEditor:
         assert len(mgr.host.simples) == 2  # list_dir + read
 
     def test_save_strips_trailing_newline_and_reports(self, mgr):
+        # РЕФОРМУЛИРОВКА запертого guard'а (объявленно). Прежняя версия проверяла
+        # тот же результат, что даёт `rstrip('\n')`, и тем самым запирала срезку
+        # ВСЕХ хвостовых переводов. Tk добавляет к буферу РОВНО один '\n' —
+        # инвариант («на сервер не уходит Tk-довесок») сохранён строго, но
+        # срезается ровно он, а не весь хвост (см. следующий тест).
         mgr.tree.selection_set('app.conf')
         mgr.bundle.command('✎ Править')()
         _finish(mgr.host, 'root:x:0:0')
         mgr.bundle.command('Сохранить')()
         fn, _btn, on_done, args = mgr.host.simples[-1]
         assert fn is gf.remote_write
-        # Tk отдаёт текст с завершающим \n — на сервер обязан уйти без него
         assert args == (mgr.checker, '/app.conf', 'root:x:0:0')
         _finish(mgr.host, '✅ сохранено')
         assert mgr.msg.events[-1] == ('info', 'Готово', '✅ сохранено')
+
+    def test_save_keeps_trailing_blank_lines_of_the_file(self, mgr):
+        # Пустая строка в конце файла — часть файла. Прежний rstrip('\n') на
+        # буфере 'a\n\n' (Tk отдаёт 'a\n\n\n') отправлял на сервер 'a'.
+        mgr.tree.selection_set('app.conf')
+        mgr.bundle.command('✎ Править')()
+        _finish(mgr.host, 'a\n\n')
+        mgr.bundle.command('Сохранить')()
+        _fn, _btn, _on_done, args = mgr.host.simples[-1]
+        assert args == (mgr.checker, '/app.conf', 'a\n\n')
+
+    def test_error_from_write_is_not_reported_as_success(self, mgr):
+        # Запись отказала (SFTP) — отчёт начинается с ❌; «Готово» тут враньё.
+        mgr.tree.selection_set('app.conf')
+        mgr.bundle.command('✎ Править')()
+        _finish(mgr.host, 'root:x:0:0')
+        mgr.bundle.command('Сохранить')()
+        _finish(mgr.host, '❌ Ошибка записи: ssh channel closed')
+        kinds = [e[0] for e in mgr.msg.events]
+        assert 'error' in kinds and 'info' not in kinds
 
     def test_done_after_editor_close_is_swallowed(self, mgr):
         # редактор закрыли, пока запись в SFTP — messagebox в мёртвое окно

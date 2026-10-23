@@ -443,6 +443,60 @@ class TestReadFileContent:
         assert info['content'] is None
 
 
+class TestReadAnswerIsByteExact:
+    """Содержимое файла возвращается БАЙТ В БАЙТ: завершающий перевод строки —
+    часть файла, а не оформление ответа.
+
+    Прежний парсер собирал тело как `'\\n'.join(splitlines()[1:])`. Замер
+    живьём (read_file_info против НАСТОЯЩИХ файлов, /bin/bash, uid=1000):
+    4 из 6 форматов вернулись укороченными —
+
+        'worker 4;\\n'      -> 'worker 4;'      <<< потеря
+        'a;\\nb;\\n'        -> 'a;\\nb;'         <<< потеря
+        'a;\\n\\n\\n'       -> 'a;\\n\\n'        <<< потеря
+        'a;\\r\\nb;\\r\\n'  -> 'a;\\nb;'         <<< потеря (и \\r тоже)
+
+    Для лога это безразлично (его считают splitlines'ом), для редактора конфига
+    — тихая порча данных: `gui_files` при сохранении делает rstrip('\\n'), так
+    что «открыл → Сохранить» без правок переписывает конфиг без завершающей
+    строки. Различать «не прочитал» и «прочитал иначе» мало — надо ещё не
+    соврать в самом прочитанном.
+    """
+
+    @staticmethod
+    def _read(body):
+        c = FakeSSH(routes=[('RFSTATE', ('RFSTATE readable\n' + body, '', 0))])
+        return common.read_file_info(c, '/etc/x')['content']
+
+    def test_trailing_newline_survives(self):
+        assert self._read('worker 4;\n') == 'worker 4;\n'
+
+    def test_several_trailing_newlines_survive(self):
+        assert self._read('a;\n\n\n') == 'a;\n\n\n'
+
+    def test_crlf_is_not_rewritten(self):
+        # splitlines() режет по \\r\\n и выбрасывает сам \\r: файл Windows-
+        #образца вернулся бы с изменёнными окончаниями строк.
+        assert self._read('a;\r\nb;\r\n') == 'a;\r\nb;\r\n'
+
+    def test_body_without_trailing_newline_is_unchanged(self):
+        assert self._read('worker 4;') == 'worker 4;'
+
+    def test_empty_body_is_empty_string(self):
+        assert self._read('') == ''
+
+    def test_answer_without_marker_is_passed_verbatim(self):
+        # Обрыв/чужая реализация: что пришло, то и содержимое — додумывать
+        # нельзя, в том числе отрезая у него конец.
+        c = FakeSSH(routes=[('cat ', 'hello\n')])
+        assert common.read_file_content(c, '/etc/x') == 'hello\n'
+
+    def test_marker_still_stripped_from_body(self):
+        # Фикс не должен вернуть маркер в содержимое: он служебный.
+        content = self._read('worker 4;\n')
+        assert 'RFSTATE' not in content
+
+
 class TestGetDomainFromConfig:
     RAW = ('server {\n'
            '    server_name example.com www.example.com;\n'
