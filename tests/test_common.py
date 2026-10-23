@@ -300,8 +300,55 @@ class TestFindFile:
         c = FakeSSH(routes=[('ls -1', '   \n')])
         assert common.find_file(c, ['/a', '/b']) is None
 
+    # --- почему None: «нет файла» и «нет прав» лечатся противоположно ---
+
+    def test_unreadable_dir_is_not_reported_as_absent_file(self):
+        # Конфиг есть, но оператор под своим UID его не увидит никогда. Прежний
+        # ответ был неотличим от «файла нет» — оператор шёл искать другой путь.
+        c = FakeSSH(routes=[('ls -1', 'FFDIR noperm /etc/nginx\nFFCOUNT 0\n')])
+        path, notes = common.find_file_info(c, ['/etc/nginx/nginx.conf'])
+        assert path is None
+        assert notes and 'прав' in notes[0]
+
+    def test_missing_dir_names_the_path(self):
+        c = FakeSSH(routes=[('ls -1', 'FFDIR missing /etc/httpd\nFFCOUNT 0\n')])
+        path, notes = common.find_file_info(c, ['/etc/httpd/conf/httpd.conf'])
+        assert path is None
+        assert notes and '/etc/httpd' in notes[0]
+
+    def test_found_path_has_no_invented_reason(self):
+        c = FakeSSH(routes=[('ls -1', '/etc/nginx/nginx.conf\nFFCOUNT 1\n')])
+        path, notes = common.find_file_info(c, ['/etc/nginx/nginx.conf'])
+        assert path == '/etc/nginx/nginx.conf'
+        assert notes == []
+
 
 class TestReadFileContent:
+    """«Прочитано пусто», «нет прав», «файла нет» — три разных ответа.
+
+    Прежний код: `out, _, rc = checker.run(f'cat {q(path)} 2>/dev/null')`;
+    `if rc != 0: return None`. Замерено живьём (uid=1000):
+
+      ok.conf          rc=0 stdout=18      empty.conf  rc=0 stdout=0
+      locked.conf      rc=1 stdout=0  stderr=cat: …: Permission denied
+      nope.conf        rc=1 stdout=0  stderr=cat: …: No such file or directory
+      locked_dir/x.conf rc=1 stdout=0 stderr=cat: …: Permission denied
+
+    То есть rc=1 сливает «нет прав» и «нет файла» в одно None, а 2>/dev/null
+    выбрасывал единственную строку, где написана причина. Потребители гасят
+    None в `or ''` (discovery.py), поэтому «конфиг пустой» и «я не имел права
+    его читать» для оператора неразличимы.
+
+    И та же грабля v1.20 на уровне ФАЙЛА: `[ ! -e ]` у файла внутри закрытого
+    каталога отвечает «нет файла» (stat невозможен без x на каталог), хотя
+    система говорит Permission denied. Поэтому cat вызывается ВСЕГДА — его
+    stderr свидетель, а python при Permission denied перекрывает missing.
+    """
+
+    @staticmethod
+    def _ans(state, body=''):
+        return f'RFSTATE {state}\n' + body
+
     def test_returns_text(self):
         c = FakeSSH(routes=[('cat ', 'hello\n')])
         assert common.read_file_content(c, '/etc/x') == 'hello\n'
@@ -314,6 +361,86 @@ class TestReadFileContent:
         c = FakeSSH(routes=[('cat ', '')])
         common.read_file_content(c, '/etc/my file')
         assert c.find("cat '/etc/my file'") is not None
+
+    def test_readed_empty_file_is_not_an_error(self):
+        # Пустой файл — прочитанный файл. Его нельзя записывать в «не удалось».
+        c = FakeSSH(routes=[('RFSTATE', (self._ans('readable'), '', 0))])
+        info = common.read_file_info(c, '/etc/empty')
+        assert info['state'] == 'readable'
+        assert info['content'] == ''
+        assert info['reason'] is None
+
+    def test_unreadable_is_not_missing(self):
+        c = FakeSSH(routes=[('RFSTATE',
+                             (self._ans('unreadable'), 'cat: Permission denied', 1))])
+        info = common.read_file_info(c, '/etc/shadow')
+        assert info['state'] == 'unreadable'
+        assert info['content'] is None
+        assert 'прав' in info['reason']
+
+    def test_missing_says_missing(self):
+        c = FakeSSH(routes=[('RFSTATE',
+                             (self._ans('missing'), 'cat: No such file', 1))])
+        info = common.read_file_info(c, '/etc/postfix/virtual')
+        assert info['state'] == 'missing'
+        assert info['content'] is None
+        assert 'нет' in info['reason']
+
+    def test_permission_denied_overrides_the_missing_test(self):
+        # РЕШАЮЩИЙ случай (замер живьём): у файла внутри закрытого каталога
+        # `[ -e ]` отвечает «нет файла», а система — «Permission denied».
+        # Верить тесту — значит отправить оператора проверять раскладку вместо
+        # прав. Тот же закон, что salv в 1.20.0, но уровнем ниже.
+        c = FakeSSH(routes=[('RFSTATE',
+                             (self._ans('missing'),
+                              'cat: /var/www/x/data/logs/e.log: Permission denied',
+                              1))])
+        info = common.read_file_info(c, '/var/www/x/data/logs/e.log')
+        assert info['state'] == 'unreadable'
+        assert 'прав' in info['reason']
+
+    def test_empty_answer_is_not_verified(self):
+        # Ни маркера, ни содержимого, ни stderr: не «файла нет», а «не проверено»
+        # (закон 1.16-1.20).
+        c = FakeSSH(routes=[])
+        info = common.read_file_info(c, '/etc/x')
+        assert info['content'] is None
+        assert info['state'] == 'unchecked'
+        assert 'не проверено' in info['reason']
+
+    def test_state_marker_is_the_first_line_so_content_cannot_spoof_it(self):
+        # Замер: файл, первая строка которого «RFSTATE readable», не должен
+        # выглядеть как служебный ответ — наш маркер стоит ПЕРВЫМ, контент со
+        # второй строки.
+        c = FakeSSH(routes=[('RFSTATE',
+                             ('RFSTATE readable\nRFSTATE readable\nданные', '', 0))])
+        info = common.read_file_info(c, '/etc/x')
+        assert info['content'] == 'RFSTATE readable\nданные'
+
+    def test_reader_stderr_is_not_thrown_away(self):
+        # Замок по ОТПРАВЛЕННОЙ команде (урок 1.16): 2>/dev/null терял причину.
+        c = FakeSSH(routes=[('RFSTATE', (self._ans('readable'), '', 0))])
+        common.read_file_info(c, '/etc/x')
+        cmd = c.find('cat ')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd
+
+    def test_cat_runs_even_when_state_test_failed(self):
+        # cat обязан вызываться и при unreadable/missing: его stderr — единственный
+        # свидетель, отличающий права от отсутствия.
+        c = FakeSSH(routes=[('RFSTATE', (self._ans('missing'), '', 1))])
+        common.read_file_info(c, '/etc/x')
+        cmd = c.find('cat ')
+        assert cmd is not None
+        assert 'RFSTATE' in cmd            # состояние и чтение — одна команда
+        assert len(c.commands) == 1         # цена не выросла
+
+    def test_directory_is_not_read_as_empty_file(self):
+        c = FakeSSH(routes=[('RFSTATE',
+                             (self._ans('isdir'), 'cat: Is a directory', 1))])
+        info = common.read_file_info(c, '/etc/nginx')
+        assert info['state'] == 'isdir'
+        assert info['content'] is None
 
 
 class TestGetDomainFromConfig:

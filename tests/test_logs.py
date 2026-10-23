@@ -191,15 +191,84 @@ class TestAnalyzeAccessLog:
         assert 'Всего запросов: 3' in out
         assert c.find('zcat') is not None
 
+    # ПЕРЕФОРМУЛИРОВАНО ОБЪЯВЛЕННО (тот же закон, что в 1.20.0). Инвариант
+    # заперт прежний и остаётся строгим: строка-предупреждение от find_files не
+    # должна уходить в `cat` и не должна появляться в выводе. Но fixture прежде
+    # отвечал на `ls -1` БЕЗ FFCOUNT, то есть записывал не подтверждённый
+    # сервером просмотр как штатный; теперь такие 20 логов честно получают
+    # «состояние не проверено» и отчёт обязан их показать. Поэтому каталог
+    # подтверждён (FFCOUNT), а проверка строки лимита осталась прежней.
     def test_limit_warning_line_is_not_read_as_file(self):
-        # find_files добавляет строку '⚠️ ...' — она не должна уходит в cat
         many = '\n'.join(f'/var/log/nginx/l{i}.log' for i in range(20)) + \
                '\n⚠️ (показаны первые 20 файлов)'
-        c = FakeSSH(routes=[('ls -1', many + '\n'), ('cat ', '')])
+        c = FakeSSH(routes=[('RFSTATE', ('RFSTATE readable\n', '', 0)),
+                            ('ls -1', many + '\nFFCOUNT 20\n')])
         out = logs_mod.analyze_access_log(c, 'none', 'example.com')
         assert '⚠️' not in out
-        assert c.find('cat') is not None
-        assert '⚠️' not in c.find('cat')
+        assert c.find('RFSTATE') is not None
+        assert '⚠️' not in c.find('RFSTATE')
+
+    # --- нечитаемый access-лог не имеет права называться «трафика не было» ---
+
+    def test_unreadable_access_log_is_not_called_no_records(self):
+        # Решающий случай: права 0600 root на access-лог. Прежний код делал
+        # `if not content: continue` и на нуле печатал «За указанный период
+        # записей не найдено» — оператор искал отсутствие посещений, а не права.
+        c = FakeSSH(routes=[
+            ('ls -1', '/var/log/nginx/example.com.access.log\nFFCOUNT 1\n'),
+            ('RFSTATE', ('RFSTATE unreadable\n', 'cat: Permission denied', 1)),
+        ])
+        out = logs_mod.analyze_access_log(c, 'none', 'example.com')
+        assert 'не просмотрен' in out
+        assert 'прав' in out
+        assert 'не найдено' not in out
+
+    def test_broken_gz_is_not_called_no_records(self):
+        # .gz читался как `zcat f 2>/dev/null`: «не gzip-архив» и «пустой архив»
+        # для отчёта были одно и то же. Ответ системы обязан дойти.
+        c = FakeSSH(routes=[
+            ('ls -1', '/var/log/nginx/example.com.access.log.gz\nFFCOUNT 1\n'),
+            ('zcat ', ('', 'gzip: stdin: not in gzip format', 1)),
+        ])
+        out = logs_mod.analyze_access_log(c, 'none', 'example.com')
+        assert 'gzip' in out
+        assert 'не найдено' not in out
+
+    def test_partially_read_still_counts_traffic_it_saw(self):
+        # Найденное терять нельзя: посчитанный трафик остаётся, но отчёт обязан
+        # сказать, что часть логов в нём не участвовала.
+        c = FakeSSH(routes=[
+            ('ls -1', '/var/log/nginx/a.access.log\n'
+                      '/var/log/nginx/b.access.log\nFFCOUNT 2\n'),
+            ('a.access.log', ('RFSTATE readable\n' + LOG_ALL, '', 0)),
+            ('RFSTATE', ('RFSTATE unreadable\n', 'cat: Permission denied', 1)),
+        ])
+        out = logs_mod.analyze_access_log(c, 'none', 'example.com')
+        assert 'Всего запросов:' in out
+        assert 'b.access.log' in out and 'не просмотрен' in out
+
+    def test_processed_files_count_is_honest(self):
+        # Прежняя строка «Обработано файлов: N» считала НАЙДЕННЫЕ файлы, а не
+        # прочитанные: при одном закрытом логе отчёт врал про полноту проверки.
+        c = FakeSSH(routes=[
+            ('ls -1', '/var/log/nginx/a.access.log\n'
+                      '/var/log/nginx/b.access.log\nFFCOUNT 2\n'),
+            ('a.access.log', ('RFSTATE readable\n' + LOG_ALL, '', 0)),
+            ('RFSTATE', ('RFSTATE unreadable\n', 'cat: Permission denied', 1)),
+        ])
+        out = logs_mod.analyze_access_log(c, 'none', 'example.com')
+        assert 'Обработано файлов: 1' in out
+        assert 'Обработано файлов: 2' not in out
+
+    def test_zcat_stderr_is_not_thrown_away(self):
+        # Замок по ОТПРАВЛЕННОЙ команде: 2>/dev/null терял «not in gzip format».
+        c = FakeSSH(routes=[
+            ('ls -1', '/var/log/nginx/x.access.log.gz\nFFCOUNT 1\n'),
+            ('zcat ', ('', 'x', 1)),
+        ])
+        logs_mod.analyze_access_log(c, 'none', 'example.com')
+        assert c.find('zcat') is not None
+        assert '2>/dev/null' not in c.find('zcat')
 
 
 # ==================== домены ====================
@@ -221,6 +290,58 @@ class TestGetDomains:
 
     def test_empty_when_nothing_found(self):
         assert logs_mod.get_domains(FakeSSH(), 'none') == []
+
+
+class TestGetDomainsReason:
+    """Почему доменов «нет»: прежний код `out, _ = checker.exec_command(
+    f'ls -1 {pattern} 2>/dev/null | head -10')` выбрасывал в `_` ровно ту строку,
+    где написана причина (нет прав на каталог vhost'ов / нет самого каталога).
+    Оператор получал «Не удалось определить домены для проверки логов» и шёл
+    искать другой домен, а не права.
+    """
+
+    def test_locked_conf_dir_is_not_reported_as_no_domains(self):
+        c = FakeSSH(routes=[('ls -1', 'FFDIR noperm /etc/nginx/vhosts\nFFCOUNT 0\n')])
+        info = logs_mod.get_domains_info(c, 'none')
+        assert info['domains'] == []
+        assert any('прав' in n for n in info['notes'])
+        assert info['checked'] is True
+
+    def test_missing_conf_dir_names_the_path(self):
+        c = FakeSSH(routes=[('ls -1', 'FFDIR missing /etc/nginx/vhosts\nFFCOUNT 0\n')])
+        info = logs_mod.get_domains_info(c, 'none')
+        assert any('/etc/nginx/vhosts' in n for n in info['notes'])
+
+    def test_verified_empty_dir_is_not_unchecked(self):
+        # Каталог просмотрен и пуст — «доменов нет» честно, никакого «не
+        # проверено» выдумывать нельзя.
+        c = FakeSSH(routes=[('ls -1',
+                             'FFDIR ok /etc/nginx/sites-enabled\nFFCOUNT 0\n')])
+        info = logs_mod.get_domains_info(c, 'none')
+        assert info['notes'] == [] and info['checked'] is True
+
+    def test_no_answer_at_all_is_unchecked(self):
+        info = logs_mod.get_domains_info(FakeSSH(), 'none')
+        assert info['domains'] == [] and info['checked'] is False
+
+    def test_get_domains_stays_compatible(self):
+        # Совместимость: публичная форма продолжает возвращать список доменов.
+        c = FakeSSH(routes=[('ls -1', '/etc/nginx/sites-enabled/example\nFFCOUNT 1\n'),
+                            ('grep -h', 'example.com\n')])
+        assert logs_mod.get_domains(c, 'none') == ['example.com']
+
+    def test_mgrctl_silence_is_told_not_hidden(self):
+        # Панельный источник молчит (mgrctl нет/упал) — это надо сказать: иначе
+        # «домены не найдены» означает «панель не ответила».
+        c = FakeSSH(routes=[('mgrctl', ('', 'bash: mgrctl: command not found', 127))])
+        info = logs_mod.get_domains_info(c, 'ispmanager')
+        assert any('mgrctl' in n for n in info['notes'])
+
+    def test_stderr_of_mgrctl_is_not_thrown_away(self):
+        c = FakeSSH(routes=[('mgrctl', ('', 'x', 1))])
+        logs_mod.get_domains_info(c, 'ispmanager')
+        assert c.find('mgrctl') is not None
+        assert '2>/dev/null' not in c.find('mgrctl')
 
 
 # ==================== ошибки в логах сайтов ====================
@@ -250,16 +371,80 @@ class TestSiteLogs:
         assert 'Найдены домены: example.com' in out
         assert '[error]' in out
 
+    # ПЕРЕФОРМУЛИРОВАНО ОБЪЯВЛЕННО (тот же закон, что в 1.20.0): прежний тест
+    # записывал «Не удалось определить домены» на ПУСТОЙ ответ сервера, т.е.
+    # «мы ничего не узнали» было заперто как «доменов нет». Теперь утверждение
+    # про отсутствие доменов заперто на ПРОСМОТРЕННОМ пустом каталоге, а
+    # неподтверждённый ответ — отдельным тестом ниже.
     def test_report_without_domains(self):
-        out = logs_mod.site_logs_report(FakeSSH(), 'none')
+        c = FakeSSH(routes=[('ls -1', 'FFDIR ok /etc/nginx/sites-enabled\nFFCOUNT 0\n')])
+        out = logs_mod.site_logs_report(c, 'none')
         assert 'Не удалось определить домены' in out
+        assert 'не проверено' not in out
 
+    def test_report_unconfirmed_dirs_is_not_no_domains(self):
+        out = logs_mod.site_logs_report(FakeSSH(), 'none')
+        assert 'не проверено' in out
+        assert 'Не удалось определить домены' not in out
+
+    # ПЕРЕФОРМУЛИРОВАНО ОБЪЯВЛЕННО: «Ошибок не обнаружено» было заперто на
+    # ответе, в котором каталог логов НЕ подтверждён (нет FFCOUNT/FFDIR) — т.е.
+    # «мы не смотрели» было заперто как «чисто». Ответ с подтверждённым
+    # просмотром остаётся запертым строго как раньше.
     def test_report_when_logs_clean(self):
-        c = FakeSSH(routes=[('ls -1', '/var/log/nginx/example.com.error.log\n'),
+        c = FakeSSH(routes=[('ls -1',
+                             '/var/log/nginx/example.com.error.log\nFFCOUNT 1\n'),
                             ('grep -h', 'example.com\n'),
                             ('cat ', 'everything is fine\n')])
         out = logs_mod.site_logs_report(c, 'none')
         assert 'Ошибок' in out and 'не обнаружено' in out
+        assert 'не просмотрена' not in out
+
+    # --- нечитаемый лог не имеет права называться «чисто» ---
+
+    # 'grep -h' — это чтение конфига в get_domains_info: без него домен не
+    # определился бы и отчёт встал бы на «домены не определены», не дойдя до
+    # логов (проверено прогоном: проверка «не просмотрен» тогда ничего не
+    # проверяла).
+    UNREADABLE = [('ls -1', '/var/log/nginx/example.com.error.log\nFFCOUNT 1\n'),
+                  ('grep -h', 'example.com\n'),
+                  ('RFSTATE', ('RFSTATE unreadable\n', 'cat: Permission denied', 1))]
+
+    def test_unreadable_logs_are_not_called_clean(self):
+        c = FakeSSH(routes=list(self.UNREADABLE))
+        info = logs_mod.check_site_logs_info(c, 'none', ['example.com'])
+        assert info['errors'] == {}
+        assert info['unread'] and 'example.com.error.log' in info['unread'][0]
+        assert 'прав' in info['unread'][0]
+
+    def test_check_site_logs_compat_stays_a_dict(self):
+        c = FakeSSH(routes=list(self.UNREADABLE))
+        assert logs_mod.check_site_logs(c, 'none', ['example.com']) == {}
+
+    def test_report_says_logs_were_not_viewed(self):
+        # Решающий случай слайса: раньше отчёт говорил «Ошибок в логах сайтов не
+        # обнаружено», хотя ни один лог не был прочитан.
+        c = FakeSSH(routes=list(self.UNREADABLE))
+        out = logs_mod.site_logs_report(c, 'none')
+        assert 'не просмотрен' in out
+        assert 'прав' in out
+        assert 'не обнаружено' not in out
+
+    def test_partially_read_logs_say_what_was_missed(self):
+        # Один лог прочитан, второй закрыт: найденное терять нельзя, но и
+        # объявлять проверку полной нельзя.
+        c = FakeSSH(routes=[('ls -1', '/var/log/nginx/a.error.log\n'
+                                      '/var/log/nginx/b.error.log\nFFCOUNT 2\n'),
+                            ('a.error.log', ('RFSTATE readable\nboom: fatal error\n',
+                                             '', 0)),
+                            ('b.error.log', ('RFSTATE unreadable\n',
+                                             'cat: Permission denied', 1)),
+                            ('RFSTATE', ('RFSTATE unreadable\n',
+                                         'cat: Permission denied', 1))])
+        info = logs_mod.check_site_logs_info(c, 'none', ['example.com'])
+        assert 'fatal error' in info['errors'].get('example.com', '')
+        assert info['unread'] and 'b.error.log' in info['unread'][0]
+        assert 'a.error.log' not in info['unread'][0]
 
 
 # ==================== OOM ====================
