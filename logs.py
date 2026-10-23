@@ -3,7 +3,8 @@ import re
 from collections import Counter
 
 from common import (DOMAIN_PATHS, q, find_files, find_files_info,
-                    read_file_content, get_domain_from_config)
+                    read_file_content, read_file_info,
+                    get_domain_from_config)
 from metrics import detect_panel  # noqa: F401 (реэкспорт для удобства)
 
 
@@ -821,13 +822,17 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
     total_requests = 0
     unique_ips = set()
 
+    unread = []
+    viewed = 0
     for log_file in log_files:
         if log_file.startswith('⚠️'):
             continue
-        if log_file.endswith('.gz'):
-            content, _ = checker.exec_command(f'zcat {q(log_file)} 2>/dev/null')
-        else:
-            content = read_file_content(checker, log_file)
+        read = read_file_info(checker, log_file)
+        if read['content'] is None:
+            unread.append(f"⚠️ Лог {log_file} не просмотрен: {read['reason']}")
+            continue
+        viewed += 1
+        content = read['content']
         if not content:
             continue
 
@@ -849,15 +854,31 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
             unique_ips.add(ip)
 
     if total_requests == 0:
+        # Ни одной записи мы не увидели ДВУМЯ разными способами: записей правда
+        # не было (файлы прочитаны) или файлы остались непрочитанными. Прежний код
+        # не различал: `if not content: continue` молча глотал лог с правами 0600,
+        # и отчёт говорил «записей не найдено» — оператор шёл искать отсутствие
+        # посещений, а не права (тот же закон, что 1.19.0/1.20.0).
+        if unread and viewed == 0:
+            return "\n".join([f"❌ Access-лог домена {domain} не просмотрен:"]
+                             + unread)
         filters = []
         if year: filters.append(f"год={year}")
         if month: filters.append(f"месяц={month}")
         if day: filters.append(f"день={day}")
-        return f"За указанный период ({' '.join(filters)}) записей не найдено."
+        tail = ("\n" + "\n".join(unread)) if unread else ""
+        return (f"За указанный период ({' '.join(filters)}) записей не найдено."
+                + tail)
 
     lines_out = []
     lines_out.append(f"=== АНАЛИЗ ПОСЕЩЕНИЙ ДЛЯ {domain} ===")
-    lines_out.append(f"Обработано файлов: {len(log_files)}")
+    # Прочитанные файлы, а не найденные: прежняя строка считала len(log_files) и
+    # при закрытом логе врала про полноту проверки («обработано 2» из прочитанного
+    # одного).
+    lines_out.append(f"Обработано файлов: {viewed}")
+    if unread:
+        lines_out.append("Часть логов не просмотрена:")
+        lines_out.extend(unread)
     filters = []
     if year: filters.append(f"год={year}")
     if month: filters.append(f"месяц={month}")
@@ -883,10 +904,32 @@ def analyze_access_log(checker, panel_type, domain, top_n=10, year=None, month=N
 
 
 # ==================== ПОИСК ДОМЕНОВ ====================
-def get_domains(checker, panel_type):
+def get_domains_info(checker, panel_type):
+    """Домены веб-сервера и ЧЕМ объясняется пустота: {'domains','notes','checked'}.
+
+    Прежний вид:
+
+        out, _ = checker.exec_command(f'ls -1 {pattern} 2>/dev/null | head -10')
+
+    Два вранья в одной строке. Во-первых, в `_` выбрасывался единственный
+    источник причины пустоты — «нет прав на каталог vhost'ов» и «каталога нет»
+    для оператора означали «доменов нет», хотя лечение противоположное (поднять
+    права против менять раскладку). Во-вторых, `head -10` резал список молча: на
+    сервере с 40 конфигами отчёт «смотрел» десять и называл это полным списком
+    доменов — теперь считает awk (FFCOUNT), и срезка видна.
+
+    checked=False — сервер не подтвердил просмотр ни одного каталога: это «не
+    проверено», а не «доменов нет» (тот же закон, что в 1.19.0 и 1.20.0).
+    """
     domains = []
+    notes = []
+    checked = False
+
     if panel_type == 'ispmanager':
-        out, _ = checker.exec_command('mgrctl -m webdomain list --output-format csv 2>/dev/null')
+        # `2>/dev/null` убирал ровно то, что случилось с панелью. `mgrctl:
+        # command not found` и «панель ответила пустым списком» — разные ответы:
+        # во втором случае доменов действительно нет, в первом — мы не узнали.
+        out, err, rc = checker.run('mgrctl -m webdomain list --output-format csv')
         if out.strip():
             for line in out.strip().split('\n')[1:]:
                 parts = line.split(',')
@@ -895,30 +938,78 @@ def get_domains(checker, panel_type):
                     if domain and domain not in domains:
                         domains.append(domain)
             if domains:
-                return list(set(domains))
+                return {'domains': list(set(domains)), 'notes': [],
+                        'checked': True}
+        if rc != 0 or (err or '').strip():
+            why = next((l.strip() for l in (err or '').splitlines() if l.strip()),
+                       f'код возврата {rc}')[:160]
+            notes.append(f"⚠️ Панель (mgrctl) не ответила про домены: «{why}». "
+                         f"Домены искались по конфигам веб-сервера — список может "
+                         f"быть неполным")
 
-    paths = DOMAIN_PATHS.get(panel_type, DOMAIN_PATHS['none'])
-    for pattern in paths:
-        out, _ = checker.exec_command(f'ls -1 {pattern} 2>/dev/null | head -10')
-        if out.strip():
-            for config_file in out.splitlines():
-                if config_file.strip():
-                    domains.extend(get_domain_from_config(checker, config_file.strip()))
-    return list(set(domains))
+    for pattern in DOMAIN_PATHS.get(panel_type, DOMAIN_PATHS['none']):
+        info = find_files_info(checker, pattern, 10)
+        if info['dirs'] or info['total'] is not None:
+            checked = True
+        for note in info['notes']:
+            if note not in notes:
+                notes.append(note)
+        for config_file in info['paths']:
+            domains.extend(get_domain_from_config(checker, config_file))
+
+    return {'domains': list(set(domains)), 'notes': notes, 'checked': checked}
+
+
+def get_domains(checker, panel_type):
+    """Список доменов веб-сервера (причины пустоты — в get_domains_info)."""
+    return get_domains_info(checker, panel_type)['domains']
 
 
 # ==================== ПРОВЕРКА ЛОГОВ САЙТОВ ====================
-def check_site_logs(checker, panel_type, domains):
+def check_site_logs_info(checker, panel_type, domains):
+    """Ошибки в логах сайтов + ЧТО МЫ НЕ ПРОСМОТРЕЛИ.
+
+    {'errors': {домен: текст}, 'unread': [готовые строки], 'viewed': int}
+
+    Прежняя форма возвращала только словарь ошибок, а непрочитанный лог просто
+    пропускался (`if content:`). Следствие: лог с правами 0600 root, который
+    оператор под своим UID открыть не может, попадал в ту же ветку, что и чисто
+    проверенный лог, и отчёт говорил «Ошибок в логах сайтов не обнаружено».
+    То есть «мы не увидели» было подписано как «ошибок нет» — ровно та ложь,
+    которую этот релиз закрывает в поиске логов (1.20.0), но уровнем ниже.
+
+    `unread` — строки оператору (там же и причины из find_logs_info: закрытый
+    или отсутствующий каталог логов). `viewed` — сколько файлов прочитано,
+    чтобы «не просмотрено» не выглядело как «проверено и чисто».
+    """
     errors = {}
+    unread = []
+    viewed = 0
     for domain in domains:
-        log_files = find_logs(checker, panel_type, domain, 'error')
-        for log_file in log_files:
-            if log_file.startswith('⚠️'):
+        info = find_logs_info(checker, panel_type, domain, 'error')
+        for note in info['notes']:
+            if note not in unread:
+                unread.append(note)
+        if not info['paths']:
+            if not info['checked']:
+                note = (f"⚠️ Логи {domain}: сервер не подтвердил просмотр ни "
+                        f"одного каталога — состояние не проверено, повторите "
+                        f"проверку")
+                if note not in unread:
+                    unread.append(note)
+            continue
+        for log_file in info['paths']:
+            read = read_file_info(checker, log_file)
+            if read['content'] is None:
+                note = f"⚠️ Лог {log_file} не просмотрен: {read['reason']}"
+                if note not in unread:
+                    unread.append(note)
                 continue
-            content = read_file_content(checker, log_file)
+            viewed += 1
+            content = read['content']
             if content:
-                lines = content.splitlines()[-200:]
-                for line in lines:
+                log_lines = content.splitlines()[-200:]
+                for line in log_lines:
                     if re.search(r'error|fail|critical|fatal|panic|warning', line, re.I):
                         errors.setdefault(domain, []).append(f"{log_file}: {line.strip()}")
 
@@ -926,23 +1017,47 @@ def check_site_logs(checker, panel_type, domains):
     for domain, err_lines in errors.items():
         if err_lines:
             result[domain] = '\n'.join(err_lines[:10])
-    return result
+    return {'errors': result, 'unread': unread, 'viewed': viewed}
+
+
+def check_site_logs(checker, panel_type, domains):
+    """Ошибки в логах сайтов словарём {домен: текст} (причины — в *_info)."""
+    return check_site_logs_info(checker, panel_type, domains)['errors']
 
 
 def site_logs_report(checker, panel):
-    domains = get_domains(checker, panel)
+    dom = get_domains_info(checker, panel)
+    domains = dom['domains']
     lines = []
-    if domains:
-        lines.append(f"Найдены домены: {', '.join(domains)}")
-        lines.append("\n=== ОШИБКИ В ЛОГАХ САЙТОВ ===")
-        site_errors = check_site_logs(checker, panel, domains)
-        if site_errors:
-            for key, err in site_errors.items():
-                lines.append(f"\n{key}:\n{err}")
+    if not domains:
+        # Разделяем «доменов нет» и «мы ничего не узнали» (закон 1.19-1.20).
+        for note in dom['notes']:
+            lines.append(f"   {note}")
+        if dom['checked']:
+            lines.append("Не удалось определить домены для проверки логов.")
         else:
-            lines.append("Ошибок (по ключевым словам) в логах сайтов не обнаружено.")
-    else:
-        lines.append("Не удалось определить домены для проверки логов.")
+            lines.append("❓ Домены для проверки логов не определены: каталоги "
+                         "конфигов не подтверждены сервером — состояние не "
+                         "проверено. Повторите проверку: прошлая могла "
+                         "оборваться.")
+        return "\n".join(lines)
+
+    lines.append(f"Найдены домены: {', '.join(domains)}")
+    if dom['notes']:
+        lines.append("   Список доменов может быть неполным:")
+        for note in dom['notes']:
+            lines.append(f"   {note}")
+    lines.append("\n=== ОШИБКИ В ЛОГАХ САЙТОВ ===")
+    site = check_site_logs_info(checker, panel, domains)
+    if site['errors']:
+        for key, err in site['errors'].items():
+            lines.append(f"\n{key}:\n{err}")
+    if site['unread']:
+        lines.append(f"\n❌ Часть логов сайтов не просмотрена "
+                     f"(прочитано файлов: {site['viewed']}):")
+        lines.extend(site['unread'])
+    if not site['errors'] and not site['unread']:
+        lines.append("Ошибок (по ключевым словам) в логах сайтов не обнаружено.")
     return "\n".join(lines)
 
 

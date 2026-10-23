@@ -1,7 +1,7 @@
 """Дополнительные проверки: SSL-сертификаты, WHOIS, порты, массовый grep по логам."""
 import re
 
-from common import q
+from common import log_reader, q
 from discovery import (CERT_STATE_ICON, cert_days_label, cert_state,
                        parse_cert_days)
 from logs import find_logs, find_logs_info, get_domains
@@ -410,16 +410,6 @@ LOG_STATE_TEXT = {
 _LOG_AWK = ('{k++;buf[(k-1)%L]=$0; if(M==""||$0~M)n++}'
             ' END{printf "LOGTOTAL %d\\n", n;'
             ' s=(k>L)?k-L+1:1; for(i=s;i<=k;i++) print buf[(i-1)%L]}')
-
-
-def log_reader(path):
-    """Читатель лога: `zcat` для ротированных .gz, иначе `cat`.
-
-    Одно место на весь отчёт: его зовёт и команда, и разбор ответа. Когда он был
-    записан дважды, отчёт мог назвать отсутствующей не ту утилиту, которую звал
-    (ровно та грабля, что лечили в v1.18 с «запись есть»).
-    """
-    return 'zcat' if str(path).endswith('.gz') else 'cat'
 
 
 def grep_log_command(filepath, pattern, context=0, limit=200):

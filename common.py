@@ -374,21 +374,165 @@ def find_files(checker, pattern, limit=20):
     return info['paths'] + info['notes']
 
 
+def find_file_info(checker, patterns):
+    """(первый найденный путь, причины пустоты) — различает «нет файла» и «нет прав».
+
+    Прежний `find_file` возвращал None на любую неудачу:
+
+        out, _, _ = checker.run(f"ls -1 {pattern} 2>/dev/null | head -1")
+
+    То есть «файла нет», «каталога нет» и «нет прав на каталог» — три ответа с
+    ПРОТИВОПОЛОЖНЫМ лечением — сливались в одно None, а вызывающий код
+    (поиск конфига среди нескольких раскладок) не мог отличить «пробуй следующий
+    путь» от «у тебя нет прав ничего увидеть». Различение уже посчитано в
+    find_files_info (v1.20.0), здесь оно только отдаётся наружу.
+    """
+    notes = []
+    for pattern in patterns:
+        info = find_files_info(checker, pattern, 1)
+        if info['paths']:
+            return info['paths'][0], []
+        notes.extend(info['notes'])
+    return None, notes
+
+
 def find_file(checker, patterns):
     """Находит первый существующий файл из списка паттернов (glob, без q())."""
-    for pattern in patterns:
-        out, _, _ = checker.run(f"ls -1 {pattern} 2>/dev/null | head -1")
-        if out.strip():
-            return out.strip()
-    return None
+    return find_file_info(checker, patterns)[0]
+
+
+# Причина, по которой файл не прочитан. Тексты — оператору, а не в лог.
+RF_TEXT = {
+    'unreadable': "не читается под этим пользователем: нет прав на файл "
+                  "(обычно нужен root или членство в группе файла)",
+    'missing': "файла нет на сервере — проверьте раскладку и тип панели",
+    'isdir': "по этому пути каталог, а не файл",
+    'unchecked': "состояние не проверено: сервер не подтвердил чтение (ответ "
+                 "пуст). Повторите проверку: прошлая могла оборваться",
+}
+
+def log_reader(path):
+    """Читатель файла: `zcat` для ротированных .gz, иначе `cat`.
+
+    Одно место на весь проект: его зовут и construction команды (read_file_cmd),
+    и webcheck (grep_log_command). Записанный дважды признак однажды разъезжается
+    — отчёт начинает называть отсутствующей не ту утилиту (грабель v1.18.0,
+    лечилась в v1.19.0 на `whois_record_lines`/`log_reader`).
+    """
+    return 'zcat' if str(path).endswith('.gz') else 'cat'
+
+
+_RF_MARK = 'RFSTATE '
+
+
+def read_file_cmd(path, reader=None):
+    """Одна POSIX-команда: состояние файла + его содержимое.
+
+    Штатная форма чтения была `cat {q(path)} 2>/dev/null` с `if rc != 0: return
+    None`. Замерено живьём (uid=1000), rc=1 дают два противоположных случая:
+
+        locked.conf       rc=1  stderr=cat: …: Permission denied
+        nope.conf         rc=1  stderr=cat: …: No such file or directory
+
+    а `2>/dev/null` выбрасывал ровно ту строку, где написана причина. Плюс rc=0
+    бывает и у прочитанного пустого файла, и у прочитанного файла — «пусто» тоже
+    нуждалось в отдельном ответе.
+
+    POSIX-тесты `[ -e ]`/`[ -r ]` дают первичное состояние, НО `cat` вызывается
+    ВСЕГДА: у файла внутри закрытого каталога `[ ! -e ]` отвечает «нет файла»
+    (stat невозможен без x на каталог), хотя система говорит «Permission denied»
+    — тот же закон, что спас в 1.20.0 на уровне каталога, но уровнем ниже.
+    Поэтому свидетель (stderr) обязан быть, а решает python.
+
+    Маркер состояния — ПЕРВАЯ строка ответа, содержимое идёт после: иначе файл,
+    первой строкой которого стоит «RFSTATE …», выглядел бы как служебный ответ
+    (подделка состояния данными — замерено).
+
+    `${PIPESTATUS}` нет вовсе (dash: «Bad substitution»), `$(…)` нет (ломает
+    замок инъекции и читаемость), `2>/dev/null` нет (губит причину).
+
+    Читатель — `log_reader(path)`, то есть для ротированных `.gz` это `zcat`.
+    Архивы раньше читались отдельной строкой со своим `2>/dev/null`
+    (`zcat … 2>/dev/null` в analyze_access_log), и «архив битый» для отчёта был
+    тем же, что «записей нет». Различение уже есть здесь — второй реализации не
+    будет (единый читатель, как `log_reader` в 1.19.0).
+    """
+    p = q(path)
+    r = reader or log_reader(path)
+    return (f'if [ -d {p} ]; then echo "RFSTATE isdir"; '
+            f'elif [ ! -e {p} ]; then echo "RFSTATE missing"; '
+            f'elif [ ! -r {p} ]; then echo "RFSTATE unreadable"; '
+            f'else echo "RFSTATE readable"; fi; '
+            f'{r} {p}')
+
+
+def parse_read_answer(out, err):
+    """(state, content) из ответа read_file_cmd; state=None — маркера не было."""
+    lines = (out or '').splitlines()
+    if lines and lines[0].startswith(_RF_MARK):
+        return (lines[0][len(_RF_MARK):].strip() or None,
+                '\n'.join(lines[1:]))
+    return None, None
+
+
+def read_file_info(checker, filepath):
+    """Читает файл и возвращает СОСТОЯНИЕ, а не только содержимое.
+
+    dict(state, content, reason): state — readable / unreadable / missing /
+    isdir / unchecked, reason — готовая строка оператору (None, если файл
+    прочитан). Пустой прочитанный файл — `readable` с `content == ''`, а не
+    ошибка: «конфиг пустой» и «я не мог его прочитать» — разные диагнозы, и
+    потребитель (`if content:`) раньше их не различал вовсе.
+    """
+    out, err, rc = checker.run(read_file_cmd(filepath))
+    state, body = parse_read_answer(out, err)
+    low = (err or '').lower()
+    why = next((l.strip() for l in (err or '').splitlines() if l.strip()), '')[:160]
+
+    if state is None:
+        # Маркера нет: ответ от прежней/чужой команды либо обрыв на середине.
+        if out:
+            return {'state': None, 'content': out, 'reason': None}
+        if rc != 0 and 'permission denied' in low:
+            state = 'unreadable'
+        elif rc != 0 and 'no such file' in low:
+            state = 'missing'
+        else:
+            # Ответ системы цитируется: «gzip: not in gzip format» и «dig: command
+            # not found» — разные диагнозы, а выдумывать вместо них «пусто» нельзя.
+            return {'state': 'unchecked', 'content': None,
+                    'reason': (RF_TEXT['unchecked'] +
+                               (f". Ответ системы: «{why}»" if why else ''))}
+        return {'state': state, 'content': None,
+                'reason': RF_TEXT.get(state, RF_TEXT['unchecked'])}
+
+    if state == 'missing' and 'permission denied' in low:
+        # Решающий случай (замер живьём): у файла внутри закрытого каталога
+        # `[ -e ]` врал «нет файла», а система отвечала Permission denied.
+        # Поверить тесту — значит отправить оператора проверять раскладку
+        # вместо прав.
+        state = 'unreadable'
+    elif state == 'readable' and rc != 0 and (err or '').strip():
+        # Тест права дал «читаем», но упал сам читатель: битый .gz (`gzip: stdin:
+        # not in gzip format`), пропавший в момент чтения диск, отсутствующий
+        # zcat. Прочитанное недостоверно как полное: итог по такому файлу — «не
+        # просмотрено», а не «пусто» (тот же закон, что в 1.19.0 для grep логов).
+        return {'state': 'readerr', 'content': None,
+                'reason': (f"читатель ({log_reader(filepath)}) сообщил об ошибке: "
+                           f"«{why}» — вывод неполон, «пусто» по этому файлу "
+                           f"сказать нельзя")}
+    if state == 'readable':
+        return {'state': state, 'content': body, 'reason': None}
+    return {'state': state, 'content': None,
+            'reason': RF_TEXT.get(state, RF_TEXT['unchecked'])}
 
 
 def read_file_content(checker, filepath):
-    """Читает содержимое файла"""
-    out, _, rc = checker.run(f'cat {q(filepath)} 2>/dev/null')
-    if rc != 0:
-        return None
-    return out
+    """Читает содержимое файла; None — если прочитать не удалось.
+
+    Состояние (почему не удалось) видно в read_file_info.
+    """
+    return read_file_info(checker, filepath)['content']
 
 
 def get_domain_from_config(checker, config_path):
