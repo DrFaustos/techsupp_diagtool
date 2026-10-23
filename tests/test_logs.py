@@ -449,24 +449,186 @@ class TestSiteLogs:
 
 # ==================== OOM ====================
 class TestSearchOom:
+    """Прежний вид (logs.py):
+
+        cmd = "zgrep -B 5 -A 5 -i '...' /var/log/kern.log* /var/log/syslog* 2>/dev/null"
+        out, _, _ = checker.run(cmd)          # rc принят и выброшен
+        if not out.strip():
+            return "OOM-событий в логах не найдено."
+
+    Замерено живьём (uid=1000, продуктовый BRE-шаблон, bash и dash — одинаково):
+
+        oom.log       rc=0  out_len=73   err=''            события ЕСТЬ
+        kern.log      rc=1  out_len=0    err=''            прочитан, совпадений нет
+        locked.log    rc=2  out_len=0    err=gzip: …: Permission denied
+        nothere*.log  rc=2  out_len=0    err=gzip: …: No such file or directory
+        bad.log.gz    rc=1  out_len=0    err=''            ← НЕ отличим от «чисто»
+
+    То есть «OOM-событий не найдено» печаталось и когда лог не читался под этим
+    UID, и когда /var/log/syslog* не существует (systemd-journal вместо syslog —
+    типичная Ubuntu 22.04+), и когда ротированный архив битый. Битый .gz худший:
+    zgrep на нём молчит с rc=1, поэтому различает только отдельная проверка
+    архива (gzip -t) — её и запираем.
+    """
+
+    @staticmethod
+    def _ans(stat, body='', unread=(), badgz=()):
+        """Служебный блок (до OOMEND) + тело zgrep — как в команде продукта."""
+        head = ['OOMSTAT ' + stat]
+        head += [f'OOMUNREAD {p}' for p in unread]
+        head += [f'OOMBADGZ {p}' for p in badgz]
+        return '\n'.join(head + ['OOMEND']) + '\n' + body
+
     def test_blocks_split_by_separator(self):
         out = ('invoked oom-killer\nKilled process 999\n'
                '--\nanother oom-killer event\n')
-        c = FakeSSH(routes=[('zgrep', out)])
+        c = FakeSSH(routes=[('zgrep', self._ans('1 0 0', out))])
         rep = logs_mod.search_oom_logs(c)
         assert 'Событие #1' in rep and 'Событие #2' in rep
         assert 'Killed process 999' in rep
         # разделитель zgrep ('--') не должен остаться отдельной строкой отчёта
         # (заголовки вида '--- Событие #1 ---' сюда не попадают)
         assert '--' not in [line.strip() for line in rep.splitlines()]
+        # служебные маркеры оператору не показываются
+        assert 'OOMSTAT' not in rep and 'OOMEND' not in rep
 
+    # ПЕРЕФОРМУЛИРОВАНО ОБЪЯВЛЕННО (тот же закон, что 1.20.0/1.21.0): прежний
+    # тест запирал ПУСТОЙ ответ сервера как «OOM-событий не найдено», т.е. «мы
+    # ничего не узнали» было заперто как «событий нет». Теперь «не найдено»
+    # заперто на подтверждённом просмотре, а неподтверждённый ответ — отдельный
+    # тест ниже.
     def test_no_events(self):
-        rep = logs_mod.search_oom_logs(FakeSSH())
+        c = FakeSSH(routes=[('zgrep', self._ans('2 0 0'))])
+        rep = logs_mod.search_oom_logs(c)
         assert rep == 'OOM-событий в логах не найдено.'
 
     def test_only_separators(self):
         c = FakeSSH(routes=[('zgrep', '--\n--\n')])
         assert 'OOM-событий не обнаружено' in logs_mod.search_oom_logs(c)
+
+    def test_unconfirmed_answer_is_not_no_events(self):
+        # Ни маркеров, ни тела: обрыв/отмена — это «не проверено».
+        rep = logs_mod.search_oom_logs(FakeSSH())
+        assert 'не проверено' in rep
+        assert 'не найдено' not in rep
+
+    def test_locked_log_is_not_called_no_oom(self):
+        # Решающий случай: логи есть, но под этим UID не читаются. Прежний ответ
+        # был неотличим от «событий нет» — оператор шёл искать причину в памяти,
+        # а не в правах.
+        c = FakeSSH(routes=[('zgrep', (
+            self._ans('2 1 0', unread=['/var/log/syslog']),
+            'gzip: /var/log/syslog: Permission denied', 2))])
+        rep = logs_mod.search_oom_logs(c)
+        assert 'прав' in rep
+        assert 'не найдено' not in rep
+        assert '/var/log/syslog' in rep
+
+    def test_partly_readable_logs_are_not_called_full_check(self):
+        # Один лог прочитан, второй закрыт: найденное терять нельзя, но и
+        # объявлять проверку полной нельзя.
+        c = FakeSSH(routes=[('zgrep', (
+            self._ans('2 1 0', 'oom-killer: gfp_mask=0x1\n',
+                     unread=['/var/log/syslog']),
+            'gzip: /var/log/syslog: Permission denied', 2))])
+        rep = logs_mod.search_oom_logs(c)
+        assert 'Событие #1' in rep
+        assert 'не просмотрена' in rep and '/var/log/syslog' in rep
+
+    def test_missing_kernel_logs_points_to_journal_not_to_no_oom(self):
+        # Типичная Ubuntu 22.04+/Debian 12+: /var/log/kern.log* и syslog* нет,
+        # ядро пишет в journald. «Событий не было» здесь — ложь: мы не смотрели.
+        c = FakeSSH(routes=[('zgrep', (
+            self._ans('0 0 0'),
+            'gzip: /var/log/kern.log*.gz: No such file or directory', 2))])
+        rep = logs_mod.search_oom_logs(c)
+        assert 'journalctl' in rep
+        assert '/var/log/kern.log*' in rep
+        assert 'не найдено' not in rep
+
+    def test_broken_gz_is_told_and_not_silence(self):
+        # Замер: zgrep на битом .gz молчит с rc=1 — без отдельной проверки
+        # архива он неотличим от «прочитано, совпадений нет».
+        c = FakeSSH(routes=[('zgrep', (
+            self._ans('2 0 1', badgz=['/var/log/syslog.2.gz']),
+            'gzip: /var/log/syslog.2.gz: not in gzip format', 1))])
+        rep = logs_mod.search_oom_logs(c)
+        assert '/var/log/syslog.2.gz' in rep
+        assert 'gzip' in rep
+        assert rep.splitlines()[0].startswith('❌')
+
+    def test_answer_without_markers_still_parsed_when_body_present(self):
+        # Совместимость (тот же приём, что read_file_info): ответ от прежней/
+        # чужой команды без маркеров разбирается как раньше, а не выбрасывается.
+        c = FakeSSH(routes=[('zgrep', 'invoked oom-killer\nKilled process 7\n')])
+        rep = logs_mod.search_oom_logs(c)
+        assert 'Событие #1' in rep and 'Killed process 7' in rep
+
+    def test_log_content_cannot_spoof_service_markers(self):
+        # Содержимое лога идёт ПОСЛЕ границы OOMEND: строки «OOMSTAT …» внутри
+        # лога не имеют права менять состояние отчёта (замер со spoof.log).
+        body = ('oom-killer: gfp_mask=0x1\n'
+                'OOMSTAT 99 99 99\n'
+                'OOMUNREAD /var/log/fake.log\n')
+        c = FakeSSH(routes=[('zgrep', self._ans('1 0 0', body))])
+        info = logs_mod.search_oom_info(c)
+        assert info['unread'] == [] and info['badgz'] == []
+        assert info['files_seen'] == 1
+
+    def test_search_oom_info_shape(self):
+        c = FakeSSH(routes=[('zgrep', self._ans('3 1 1', unread=['/a'],
+                                                badgz=['/b.gz']))])
+        info = logs_mod.search_oom_info(c)
+        assert info['files_seen'] == 3
+        assert info['unread'] == ['/a'] and info['badgz'] == ['/b.gz']
+        assert info['checked'] is True and info['events'] == []
+
+    def test_search_oom_logs_compat_is_a_string(self):
+        c = FakeSSH(routes=[('zgrep', self._ans('2 0 0'))])
+        assert isinstance(logs_mod.search_oom_logs(c), str)
+
+    def test_file_list_in_report_is_the_single_source(self):
+        # Пути логов были записаны дважды (в команде и в строке «Файлы: …») —
+        # разъехавшийся дубль обещает отчёт про одни файлы при поиске в других.
+        # Заперто на прогоне С событиями: именно тогда строка «Файлы: …» едет в
+        # отчёт (без событий отчёт остаётся короткой честной строкой).
+        c = FakeSSH(routes=[('zgrep', self._ans('2 0 0',
+                                                'oom-killer: gfp_mask=0x1\n'))])
+        rep = logs_mod.search_oom_logs(c)
+        assert 'Файлы:' in rep
+        for glob in logs_mod.OOM_GLOBS:
+            assert glob in rep
+            assert glob in c.find('zgrep')
+        # один источник: «Файлы:» перечисляет ровно то, что ушло в команду
+        assert rep.split('Файлы:')[1].splitlines()[0].strip(
+            ' ,') == ', '.join(logs_mod.OOM_GLOBS)
+
+    # ---------- замки по ОТПРАВЛЕННОЙ команде ----------
+
+    def test_sent_command_keeps_stderr_and_honest_limits(self):
+        c = FakeSSH(routes=[('zgrep', self._ans('1 0 0'))])
+        logs_mod.search_oom_logs(c)
+        cmd = c.find('zgrep')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd        # терял Permission denied / not in gzip
+        assert 'head -' not in cmd             # резал бы блоки молча
+        assert 'PIPESTATUS' not in cmd         # dash: «Bad substitution»
+        # Замок инъекции: подстановки команды быть не должно. НЕ `'(' not in
+        # cmd`: `$((n+1))` — POSIX-арифметика, а не command substitution, и
+        # прежняя формулировка запрещала бы сам подсчёт файлов (моя ошибка в
+        # этом guard'e, найдена прогоном, а не рассуждением).
+        assert '`' not in cmd
+        assert '$(' not in cmd.replace('$((', '')
+        assert len(c.commands) == 1            # цена не выросла
+
+    def test_archive_check_reports_its_own_error(self):
+        # `gzip -t … 2>/dev/null` оставил бы битый архив без объяснения —
+        # ответ системы обязан дойти (тот же закон, что для zgrep).
+        c = FakeSSH(routes=[('zgrep', self._ans('1 0 1', badgz=['/x.gz']))])
+        logs_mod.search_oom_logs(c)
+        cmd = c.find('gzip -t')
+        assert cmd is not None
+        assert 'gzip -t' in cmd and '2>/dev/null' not in cmd.split('gzip -t', 1)[1][:40]
 
 
 # ==================== почтовый лог: выбор файла ====================
