@@ -1062,29 +1062,189 @@ def site_logs_report(checker, panel):
 
 
 # ==================== ПОИСК OOM ====================
-def search_oom_logs(checker):
-    """Поиск событий Out-Of-Memory в системных логах"""
-    cmd = "zgrep -B 5 -A 5 -i 'out of memory\\|killed process\\|oom-killer' /var/log/kern.log* /var/log/syslog* 2>/dev/null"
-    out, _, _ = checker.run(cmd)
-    if not out.strip():
-        return "OOM-событий в логах не найдено."
-    lines = out.splitlines()
-    report_lines = ["=== ПОИСК OOM-СОБЫТИЙ В ЛОГАХ ===", "Файлы: /var/log/kern.log*, /var/log/syslog*", ""]
-    blocks = []
-    current_block = []
-    for line in lines:
-        if line.strip() == '--':
-            if current_block:
-                blocks.append('\n'.join(current_block))
-                current_block = []
+# Пути логов — ОДИН список: его зовут и команда, и строка «Файлы: …». Раньше они
+# были записаны дважды (в cmd и в заголовке отчёта) — разъехавшийся дубль обещает
+# «искали в одних файлах, отчитались по другим» (ср. cert_state 1.16.0,
+# whois_record_lines 1.18.0, log_reader 1.19.0, _log_patterns 1.20.0).
+OOM_GLOBS = ('/var/log/kern.log*', '/var/log/syslog*')
+
+# Шаблон прежний: BRE с `\|` (zgrep кормит grep без -E). Замерено живьём: тот же
+# набор слов без -E и без \| не находит ничего, поэтому менять его нельзя.
+OOM_PATTERN = 'out of memory\\|killed process\\|oom-killer'
+
+# Причины, по которым поиск не был полным. Тексты — оператору.
+OOM_TEXT = {
+    'unread': ("⚠️ Файл {path} не просмотрен: не читается под этим пользователем "
+               "— нет прав (обычно нужен root или членство в группе adm/syslog). "
+               "Его события в отчёте не участвовали"),
+    'badgz': ("⚠️ Файл {path} не просмотрен: gzip не смог открыть архив (битый "
+              "или недокачанный лог) — содержимое этого файла в отчёте не "
+              "участвовало, а zgrep об этом молчит"),
+    'noglob': ("⚠️ Ни одного из файлов {globs} на сервере нет — смотреть было "
+               "негде. Обычно ядро пишет в журнал systemd: "
+               "journalctl -k --grep=oom"),
+    'notool': ("⚠️ zgrep не установлен — ротированные архивы не проверялись, "
+               "поиск по ним не выполнялся"),
+}
+
+
+def search_oom_cmd():
+    """Одна POSIX-команда: состояние каждого файла + честный zgrep.
+
+    Прежний вид:
+
+        cmd = "zgrep … /var/log/kern.log* /var/log/syslog* 2>/dev/null"
+        out, _, _ = checker.run(cmd)        # rc принят и выброшен
+        if not out.strip(): return "OOM-событий в логах не найдено."
+
+    Пустой вывод тут дают пять разных вещей, и подписаны они были одинаково.
+    Замерено живьём (uid=1000, продуктовый BRE-шаблон, bash и dash — одинаково):
+
+        oom.log       rc=0  stdout=73  err=''         события ЕСТЬ
+        kern.log      rc=1  stdout=0   err=''         прочитан, совпадений нет
+        locked.log    rc=2  stdout=0   err=gzip: …: Permission denied
+        nothere*.log  rc=2  stdout=0   err=gzip: …: No such file or directory
+        bad.log.gz    rc=1  stdout=0   err=''         ← НЕ отличим от «чисто»
+
+    Последний случай и есть причина отдельной проверки архива: zgrep на битом .gz
+    молчит с rc=1, поэтому о нём говорит только `gzip -t` (без своего 2>/dev/null,
+    иначе ответ системы снова потеряется).
+
+    Отличие от прошлых слайсов: glob'ов несколько, и раскрытие делает шелл
+    сервера. Литерал с `*`, который не раскрылся, обязан быть пропущен (case по
+    `*`) — иначе «нет такого файла» было бы посчитано как «файл есть, событий
+    нет». Тот же закон, что в 1.20.0 для каталогов логов.
+
+    `${PIPESTATUS}` нет (dash: «Bad substitution»), `$(…)` нет (замок инъекции),
+    `2>/dev/null` нет — в нём лежала единственная строка с причиной. Служебный
+    блок печатается ДО границы OOMEND, тело zgrep — после, поэтому строка лога
+    вида «OOMSTAT 99 99 99» не может подделать состояние (проверено живьём).
+
+    Маркеры печатаются СРАЗУ (echo), а не копятся в переменную. Первая версия
+    собирала их в `s="$s\nOOMUNREAD $f"` и выводила одним printf: внутри
+    двойных кавычек шелл НЕ раскрывает `\n` (это литерал backslash-n), а
+    `printf '%s'` не раскрывает escape в аргументе — все маркеры сливались в
+    одну строку и парсер не видел ни одного. Поймано живым прогоном команды из
+    продукта: тесты этого не ловили, потому что служебный блок в них собирает
+    helper, а не шелл.
+    """
+    return ('set -- ' + ' '.join(OOM_GLOBS) + '; n=0; u=0; b=0'
+            '; for f in "$@"; do case "$f" in *"*"*) continue;; esac; n=$((n+1)); '
+            'if [ ! -r "$f" ]; then u=$((u+1)); echo "OOMUNREAD $f"; continue; fi; '
+            'case "$f" in *.gz) gzip -t "$f" || { b=$((b+1)); echo "OOMBADGZ $f"; }'
+            ';; esac; '
+            'done; '
+            'if command -v zgrep >/dev/null; then '
+            "printf 'OOMSTAT %d %d %d\\nOOMEND\\n' \"$n\" \"$u\" \"$b\"; "
+            "zgrep -B 5 -A 5 -i '" + OOM_PATTERN + "' \"$@\"; "
+            "else printf 'OOMSTAT %d %d %d notool\\nOOMEND\\n' \"$n\" \"$u\" \"$b\"; "
+            'fi')
+
+
+def parse_oom_answer(out):
+    """Служебный блок и тело zgrep из ответа команды.
+
+    Служебное берётся строго ДО ПЕРВОГО OOMEND: содержимое логов идёт после
+    границы и не может ни добавить, ни снять состояние. Маркеров нет (обрыв или
+    чужая реализация) — checked=False, тело = весь ответ (совместимость).
+    """
+    head, body, in_body = [], [], False
+    for line in (out or '').splitlines():
+        if in_body:
+            body.append(line)
+        elif line.strip() == 'OOMEND':
+            in_body = True
         else:
-            current_block.append(line)
-    if current_block:
-        blocks.append('\n'.join(current_block))
-    if not blocks:
+            head.append(line)
+
+    def _int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    seen, files, unread, badgz, notool = False, 0, [], [], False
+    for line in head:
+        s = line.strip()
+        if s.startswith('OOMSTAT '):
+            seen = True
+            parts = s.split()
+            files = _int(parts[1]) if len(parts) > 1 else 0
+            notool = 'notool' in parts[4:]
+        elif s.startswith('OOMUNREAD '):
+            unread.append(s.split(' ', 1)[1].strip())
+        elif s.startswith('OOMBADGZ '):
+            badgz.append(s.split(' ', 1)[1].strip())
+
+    if not seen:
+        body = (out or '').splitlines()
+    # Блоки zgrep: '--' разделяет совпадения, внутри блока -5/+5 строк контекста.
+    blocks, current = [], []
+    for line in body:
+        if line.strip() == '--':
+            if current:
+                blocks.append('\n'.join(current))
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append('\n'.join(current))
+    return {'checked': seen, 'files': files, 'unread': unread, 'badgz': badgz,
+            'notool': notool, 'events': blocks,
+            'empty_blocks': bool([l for l in body if l.strip()]) and not blocks}
+
+
+def search_oom_info(checker):
+    """Поиск OOM + ЧЕМ объясняется его пустота.
+
+    dict(events, notes, unread, badgz, files_seen, checked, globs).
+    """
+    out, _err, _rc = checker.run(search_oom_cmd())
+    p = parse_oom_answer(out)
+    notes = []
+    if p['notool']:
+        notes.append(OOM_TEXT['notool'])
+    for path in p['unread']:
+        notes.append(OOM_TEXT['unread'].format(path=path))
+    for path in p['badgz']:
+        notes.append(OOM_TEXT['badgz'].format(path=path))
+    if p['checked'] and p['files'] == 0:
+        # Файлов нет вовсе: на systemd-хосте это норма, и «событий не было» тут
+        # ложь — мы не смотрели.
+        notes.append(OOM_TEXT['noglob'].format(globs=', '.join(OOM_GLOBS)))
+    return {'events': p['events'], 'notes': notes, 'unread': p['unread'],
+            'badgz': p['badgz'], 'files_seen': p['files'],
+            'checked': p['checked'], 'empty_blocks': p['empty_blocks'],
+            'globs': list(OOM_GLOBS)}
+
+
+def search_oom_logs(checker):
+    """Поиск событий Out-Of-Memory в системных логах.
+
+    «OOM-событий не найдено» печатается только когда хотя бы один лог реально
+    прочитан и ни один не отвалился; иначе — причина (права / битый архив /
+    файлов нет / ответ не пришёл).
+    """
+    info = search_oom_info(checker)
+    if info['events']:
+        lines = ["=== ПОИСК OOM-СОБЫТИЙ В ЛОГАХ ===",
+                 "Файлы: " + ", ".join(info['globs']), ""]
+        for i, block in enumerate(info['events'], 1):
+            lines.append(f"--- Событие #{i} ---")
+            lines.append(block)
+            lines.append("")
+        if info['notes']:
+            # Найденное терять нельзя, но и объявлять проверку полной нельзя.
+            lines.append(f"❌ Часть логов не просмотрена "
+                         f"(прочитано файлов: {info['files_seen'] - len(info['unread'])}):")
+            lines.extend(info['notes'])
+        return "\n".join(lines)
+    if info['notes']:
+        return "\n".join(["❌ Поиск OOM выполнен не полностью:"] + info['notes'])
+    if info['empty_blocks']:
         return "OOM-событий не обнаружено (пустые блоки)."
-    for i, block in enumerate(blocks, 1):
-        report_lines.append(f"--- Событие #{i} ---")
-        report_lines.append(block)
-        report_lines.append("")
-    return "\n".join(report_lines)
+    if not info['checked']:
+        return ("❓ Итог поиска OOM не подтверждён: сервер не вернул ни состояния "
+                "файлов, ни итога — состояние не проверено. Повторите проверку: "
+                "прошлая могла оборваться.")
+    return "OOM-событий в логах не найдено."

@@ -36,6 +36,7 @@ from logs import (  # noqa: F401
     find_logs, find_logs_info, parse_access_log_line, filter_by_date,
     analyze_access_log, get_domains, get_domains_info, check_site_logs,
     check_site_logs_info, site_logs_report, search_oom_logs,
+    search_oom_info,
 )
 
 # --- dns ---
@@ -112,6 +113,7 @@ __all__ = [
     'find_logs', 'find_logs_info', 'parse_access_log_line', 'filter_by_date',
     'analyze_access_log', 'get_domains', 'get_domains_info', 'check_site_logs',
     'check_site_logs_info', 'site_logs_report', 'search_oom_logs',
+    'search_oom_info',
     'dns_report_local', 'dns_report', 'dns_resolvers_report',
     'get_current_dns_resolvers', 'set_dns_resolvers',
     'write_file', 'read_file', 'get_config_files',
