@@ -623,6 +623,162 @@ class TestInventoryExplainsGaps:
         assert not blind, blind
 
 
+# ======== ПОЧТОВЫЙ ИНВЕНТАРЬ ОБЯЗАН ОБЪЯСНЯТЬ СВОЮ ПУСТОТУ ========
+# Отличия от 1.24.0 два, и оба хуже. Первое: почтовый отчёт не просто молчит —
+# он печатает ЧИСЛО («Почтовых доменов: 2»), которое при недоступном файле
+# становится неверным утверждением, а не отсутствием ответа. Второе: этот же
+# инвентарь стоит шлюзом к ОПЕРАЦИИ (mailbox_guard) и при недоступной карте
+# отказывает текстом «Сначала добавьте домен в панель» — то есть отправляет
+# оператора менять конфигурацию почтового сервера по признаку «мы не
+# посмотрели». Рядом, в этом же файле, корректный образец уже есть:
+# known_mailbox_addresses возвращает (множество, ok) и прямо пишет, что по
+# неполученному списку нельзя ни разрешать, ни запрещать операцию.
+
+
+def _mail_routes(closed=None, **overrides):
+    """Все источники почты читаемы; `closed` — путь, который не читается.
+
+    overrides встают ПЕРЕД базовыми маршрутами: FakeSSH выбирает первое
+    совпадение, поэтому перекрытие, дописанное в хвост, не сработало бы и
+    тест проверял бы не тот файл.
+    """
+    base = [
+        ('/etc/postfix/virtual', 'RFSTATE readable\ninfo@real.tld dest@e.tld\n'),
+        ('/etc/postfix/virtusertable', 'RFSTATE readable\n'),
+        ('/etc/dovecot/users', 'RFSTATE readable\nbox@dove.tld:{SHA}x:y\n'),
+        ('/etc/postfix/main.cf',
+         'RFSTATE readable\nvirtual_mailbox_domains = main.tld\n'),
+    ]
+    if closed:
+        base = [(n, ('RFSTATE unreadable', f'cat: {n}: Permission denied', 1))
+                if n == closed else (n, r) for n, r in base]
+    return [list(r) for r in overrides.items()] + base
+
+
+NO_PERM = ('RFSTATE unreadable', 'cat: Permission denied', 1)
+BLANK = 'RFSTATE readable\n'
+
+
+class TestMailInventoryExplainsGaps:
+    """«Не прочитали карту» обязано называться причиной, а не «доменов нет»."""
+
+    def test_unreadable_map_is_named_with_the_reason(self):
+        c = FakeSSH(routes=_mail_routes(closed='/etc/postfix/virtual'))
+        domains, notes, blocked = dc.discover_mail_domains_info(c, 'none')
+        assert 'real.tld' not in domains
+        # blocked — то, что чтение было НЕВОЗМОЖНО: по такому источнику нельзя
+        # ни утверждать «доменов нет», ни разрешать/запрещать операцию.
+        assert blocked == ['/etc/postfix/virtual']
+        joined = ' '.join(notes)
+        assert '/etc/postfix/virtual' in joined and 'прав' in joined
+        # Назван источник, а не только путь: оператор ищет в панели/конфиге
+        # «postfix virtual», а не перебирает файлы.
+        assert 'postfix virtual' in joined
+
+    def test_unreadable_map_does_not_silently_shrink_the_count(self):
+        # Замер живьём: «Почтовых доменов: 2» вместо 3 — неверное число, а не
+        # отсутствие ответа. Инвентарь обязан сам сказать, что он неполон.
+        c = FakeSSH(routes=_mail_routes(closed='/etc/postfix/virtual'))
+        domains, notes, _blocked = dc.discover_mail_domains_info(c, 'none')
+        assert sorted(domains) == ['dove.tld', 'main.tld'] and notes
+
+    def test_readable_but_empty_map_makes_no_complaint(self):
+        # «Карта пустая» — честный ответ прочитанного файла; жалоба на неё
+        # обесценила бы настоящие предупреждения (то же решение, что в 1.24).
+        # ВАЖНО: берём ВТОРОЙ элемент пары MAIL_MAPS — путь, а не название
+        # источника: игла по слову «postfix virtual» не встречалась в команде
+        # чтения и маршрут молча не срабатывал (тест проверял бы default).
+        c = FakeSSH(routes=[(path, BLANK) for _src, path in dc.MAIL_MAPS] + [
+            (dc.DOVECOT_USERS, BLANK), (dc.POSTFIX_MAIN_CF, BLANK)])
+        domains, notes, blocked = dc.discover_mail_domains_info(c, 'none')
+        assert domains == {} and notes == [] and blocked == []
+
+    def test_missing_map_is_called_missing_not_no_domains(self):
+        c = FakeSSH(routes=_mail_routes(**{
+            '/etc/postfix/virtual': ('RFSTATE missing',
+                                     'cat: No such file or directory', 1)}))
+        _domains, notes, blocked = dc.discover_mail_domains_info(c, 'none')
+        assert notes and 'нет на сервере' in ' '.join(notes)
+        # Ключевое различие (мой же проект правки был сначала хуже): «файла
+        # нет» — НЕ пробел чтения. На него смотрели, его нет — на сервере без
+        # postfix это норма, и вывод «домена из него нет» по нему законен.
+        # Блокировать операцию может только то, что НЕ УДАЛОСЬ прочесть.
+        assert blocked == []
+
+    def test_overview_report_prints_the_reason(self):
+        # Различение посчитано ≠ оператор его увидел (урок 1.20/1.21/1.24).
+        c = FakeSSH(routes=_mail_routes(closed='/etc/postfix/virtual'))
+        out = dc.mail_overview_report(c, 'none')
+        assert 'Почтовых доменов: 2' in out
+        assert 'неполон' in out and '/etc/postfix/virtual' in out
+        assert 'real.tld' not in out
+
+    def test_overview_report_explains_an_empty_inventory(self):
+        c = FakeSSH(routes=_mail_routes(closed='/etc/dovecot/users',
+                                        **{'/etc/postfix/virtual': BLANK,
+                                           '/etc/postfix/main.cf': NO_PERM}))
+        out = dc.mail_overview_report(c, 'none')
+        assert 'не найдены' in out and 'прав' in out
+
+    def test_mail_auth_report_does_not_claim_nothing_to_check(self):
+        # «Почтовые домены не найдены — проверять нечего» при закрытой карте
+        # означает, что отчёт закрыл тикет, которого он не проверял.
+        c = FakeSSH(routes=_mail_routes(closed='/etc/dovecot/users',
+                                        **{'/etc/postfix/virtual': BLANK,
+                                           '/etc/postfix/main.cf': BLANK}))
+        out = dc.mail_auth_report(c, 'none')
+        assert 'прав' in out
+        assert 'нечего' not in out
+
+    def test_guard_names_the_cause_instead_of_bad_advice(self):
+        # Опасная часть лжи: совет «сначала добавьте домен в панель» при
+        # нечитаемой карте отправляет менять конфиг сервера по признаку
+        # «мы не посмотрели». Отказ обязан ОСТАТЬСЯ (защиту не ослабляем),
+        # но честный: причина + что сделать, а не ложное утверждение.
+        c = FakeSSH(routes=_mail_routes(closed='/etc/postfix/virtual'))
+        reason = dc.mailbox_guard(c, 'info@real.tld', 'none', 'create')
+        assert reason, 'guard обязан отказать, а не пропустить операцию'
+        assert '/etc/postfix/virtual' in reason and 'прав' in reason
+        assert 'добавьте домен в панель' not in reason.lower()
+
+    def test_guard_keeps_the_plain_refusal_when_inventory_is_complete(self):
+        # Инвариант не ослаблен: когда всё просмотрено и домена правда нет в
+        # списке, отказ и подсказка остаются — иначе guard перестал бы защищать.
+        c = FakeSSH(routes=_mail_routes())
+        reason = dc.mailbox_guard(c, 'a@other.tld', 'none', 'create')
+        assert reason and 'не является почтовым доменом' in reason
+        assert 'other.tld' in reason
+
+    def test_mailboxes_inventory_explains_missing_boxes(self):
+        c = FakeSSH(routes=_mail_routes(closed='/etc/dovecot/users'))
+        boxes, notes, _blocked = dc.discover_mailboxes_info(c, 'none')
+        assert 'box@dove.tld' not in [a for a, _ in boxes]
+        assert notes and 'dovecot' in ' '.join(notes).lower()
+
+    def test_public_mail_functions_keep_their_shape(self):
+        # Совместимость: отчёты, logs.py и diagnostic зовут старые имена и
+        # ждут dict / список, а не кортеж.
+        c = FakeSSH(routes=_mail_routes())
+        assert dc.discover_mail_domains(c, 'none') == {
+            'real.tld': ['postfix virtual'], 'dove.tld': ['dovecot users'],
+            'main.tld': ['postfix main.cf']}
+        boxes = dc.discover_mailboxes(c, 'none')
+        assert [a for a, _ in boxes] == ['box@dove.tld', 'info@real.tld']
+
+    def test_price_did_not_grow(self):
+        # Различение состояния стоит НОЛЬ лишних прогонов: read_file_info —
+        # та же одна команда, что делал read_file_content. 4 файла в доменах
+        # + 3 файла в ящиках (main.cf там не читается).
+        c = FakeSSH(routes=_mail_routes())
+        dc.discover_mail_domains(c, 'none')
+        dc.discover_mailboxes(c, 'none')
+        reads = [cmd for cmd in c.commands if 'RFSTATE' in cmd]
+        assert len(reads) == 7, reads
+        blind = [cmd for cmd in c.commands
+                 if '2>/dev/null' in cmd and 'RFSTATE' in cmd]
+        assert not blind, blind
+
+
 # ==================== ОТЧЁТЫ ====================
 class TestSiteHealth:
     def test_empty_inventory(self):
@@ -2547,10 +2703,20 @@ class TestMailboxCommands:
 # Guard — единственное, что стоит между оператором и разрушающей командой
 # панели. Проверяем его отдельно от исполнения: на FakeSSH видно и «панель
 # ответила ошибкой», и «список не получен» — обе ветки обязаны отказывать.
+# Мок описывает сервер, просмотренный ПОЛНОСТЬЮ: панель отвечает, и все
+# файловые источники прочитаны (пустые — но прочитанные). Без этих строк
+# дефолт FakeSSH ('', '', 0) означает «сервер не подтвердил чтение», то есть
+# состояние unchecked, и guard по новому закону 1.25.0 обязан отказывать
+# иначе — не «домен не почтовый», а «мы не смогли посмотреть». Прежние
+# утверждения тестов сохранены без ослабления; расширен только мок.
 ISP_MAIL_ENV = [
     ('mgrctl -m ispmgr maildomain', 'name=example.com elid=3\n'),
     ('mgrctl -m ispmgr email',
      'name=info@example.com domainname=example.com\n'),
+    ('/etc/postfix/virtual', 'RFSTATE readable\n'),
+    ('/etc/postfix/virtusertable', 'RFSTATE readable\n'),
+    ('/etc/dovecot/users', 'RFSTATE readable\n'),
+    ('/etc/postfix/main.cf', 'RFSTATE readable\n'),
 ]
 
 
