@@ -452,6 +452,177 @@ class TestDiscoverZones:
         assert zones[0]['serial'] == ''
 
 
+# ============ ИНВЕНТАРЬ ОБЯЗАН ОБЪЯСНЯТЬ ПУСТОТУ ============
+class TestInventoryExplainsGaps:
+    """«Не прочитал» обязан называться причиной, а не «ничего нет».
+
+    Замер живьём (uid=1000, НАСТОЯЩИЕ файлы и каталоги, discovery против них):
+
+        КОНТРОЛЬ (всё открыто)    sites=['site2.ru']  zones=['zone.ru']
+        vhost 0600 root           sites=[]  — неотличимо от пустого конфига
+        каталог vhost'ов без x    sites=[]  — ⚠️-заметка find_files ВЫБРОСИЛАСЬ
+        каталога vhost'ов нет     sites=[]  — та же подпись
+        каталог зон без x         zones=[] → «сервер не является NS» (враньё)
+        файл зоны 0600            serial='' → в отчёте serial=?
+
+    Четыре противоположных диагноза под одной подписью «пусто», а один из них
+    отчёт объясняет утверждением, которого не проверял. read_file_content (как
+    в v1.21) различает состояния, но потребители гасят None в `or ''` и в
+    `if content:` — то есть различение считается и выбрасывается. Тот же закон,
+    что в 1.19-1.23: посчитанное различие обязаны ДОВОДИТЬ до оператора.
+    """
+
+    def test_unreadable_vhost_explains_why_site_is_missing(self):
+        c = FakeSSH(routes=[
+            ('ls -1 /etc/nginx/vhosts', NGINX_VHOST[0] + '\n'),
+            (NGINX_VHOST[0], ('RFSTATE unreadable',
+                              'cat: %s: Permission denied' % NGINX_VHOST[0], 1)),
+        ])
+        sites, notes = dc.discover_sites_info(c, 'ispmanager')
+        assert sites == []
+        assert notes and 'прав' in ' '.join(notes)
+        assert NGINX_VHOST[0] in ' '.join(notes)   # назван конкретный файл
+
+    def test_readable_but_empty_vhost_makes_no_complaint(self):
+        # Пустой ПРОЧИТАННЫЙ конфиг — не неполнота: жалоба на него была бы
+        # шумом и обесценила бы настоящие предупреждения.
+        c = FakeSSH(routes=[
+            ('ls -1 /etc/nginx/vhosts', NGINX_VHOST[0] + '\n'),
+            (NGINX_VHOST[0], 'RFSTATE readable\n'),
+        ])
+        sites, notes = dc.discover_sites_info(c, 'ispmanager')
+        assert sites == [] and notes == []
+
+    def test_blocked_vhost_dir_note_is_not_thrown_away(self):
+        # find_files (v1.20) уже различает закрытый каталог; discover_sites
+        # фильтрует ⚠️-строки как не-пути и молча их теряет.
+        c = FakeSSH(routes=[
+            ('ls -1 /etc/nginx/vhosts',
+             ('FFDIR noperm /etc/nginx/vhosts\n',
+              "ls: cannot open directory '/etc/nginx/vhosts': Permission denied",
+              2)),
+        ])
+        sites, notes = dc.discover_sites_info(c, 'ispmanager')
+        assert sites == []
+        assert notes and 'прав' in ' '.join(notes)
+
+    def test_missing_vhost_dir_is_called_missing_not_no_sites(self):
+        c = FakeSSH(routes=[
+            ('ls -1 /etc/nginx/vhosts', 'FFDIR missing /etc/nginx/vhosts\n'),
+        ])
+        _sites, notes = dc.discover_sites_info(c, 'ispmanager')
+        assert notes and 'нет' in ' '.join(notes)
+
+    def test_health_report_says_why_sites_are_empty(self):
+        # Различение посчитано ≠ оператор его увидел (урок 1.20/1.21): отчёт
+        # обязан напечатать причину рядом с «Сайты не обнаружены».
+        c = FakeSSH(routes=[
+            ('ls -1 /etc/nginx/vhosts', NGINX_VHOST[0] + '\n'),
+            (NGINX_VHOST[0], ('RFSTATE unreadable',
+                              'cat: %s: Permission denied' % NGINX_VHOST[0], 1)),
+        ])
+        out = dc.site_health_report(c, 'ispmanager')
+        assert 'Сайты не обнаружены' in out
+        assert 'прав' in out
+        assert 'права' in out or 'root' in out    # что делать — понятно
+
+    def test_ssl_report_carries_the_same_gap_note(self):
+        # Тот же инвентарь читают оба отчёта: причина не должна жить в одном.
+        c = FakeSSH(routes=[
+            ('ls -1 /etc/nginx/vhosts', NGINX_VHOST[0] + '\n'),
+            (NGINX_VHOST[0], ('RFSTATE unreadable',
+                              'cat: %s: Permission denied' % NGINX_VHOST[0], 1)),
+        ])
+        out = dc.ssl_expiry_report(c, 'ispmanager')
+        assert 'прав' in out
+
+    def test_blocked_zone_dir_is_not_reported_as_not_ns(self):
+        # Замер: при каталоге зон без x отчёт утверждал «сервер не является NS
+        # для этих доменов (DNS тогда у регистратора/в облаке)» — утверждение,
+        # которое проверка не имела права делать.
+        c = FakeSSH(routes=[
+            ('ls -1 /var/named/zones',
+             ('FFDIR noperm /var/named/zones\n',
+              "ls: cannot open directory '/var/named/zones': Permission denied",
+              2)),
+        ])
+        out = dc.dns_zones_report(c, 'none')
+        assert 'не является NS' not in out
+        assert 'прав' in out
+
+    def test_unreadable_zone_serial_is_explained_not_dotted(self):
+        zone = '/var/named/zones/db.panel.tld'
+        c = FakeSSH(routes=[
+            ('ls -1 /var/named/zones', zone + '\n'),
+            (zone, ('RFSTATE unreadable',
+                    'cat: %s: Permission denied' % zone, 1)),
+        ])
+        zones, notes = dc.discover_dns_zones_info(c, 'none')
+        assert zones and zones[0]['serial'] == ''
+        assert notes and 'serial' in ' '.join(notes)
+
+    def test_zone_search_command_has_no_stderr_blindfold(self):
+        # discover_dns_zones до сих пор искал зоны слепым
+        # `ls -1 {pattern} 2>/dev/null | head -100` — та же грабелька, что
+        # убила причину в 1.18-1.21. find_files (1.20) различает каталоги.
+        c = FakeSSH()
+        dc.discover_dns_zones(c, 'none')
+        assert c.commands, 'зоны вообще не искали'
+        assert not [cmd for cmd in c.commands if '2>/dev/null' in cmd]
+
+    def test_gap_notes_are_deduplicated(self):
+        # Один закрытый каталог может прийти из двух паттернов: два
+        # одинаковых предупреждения в отчёте оператор прочитает как две беды.
+        c = FakeSSH(routes=[
+            ('ls -1 /etc/nginx/vhosts',
+             ('FFDIR noperm /etc/nginx/vhosts\n',
+              "ls: cannot open directory '/etc/nginx/vhosts': Permission denied",
+              2)),
+        ])
+        _sites, notes = dc.discover_sites_info(c, 'ispmanager')
+        assert len(notes) == len(set(notes))
+
+    def test_public_inventory_functions_keep_their_shape(self):
+        # Совместимость: gui и отчёты зовут старые имена и ждут список.
+        # РЕФОРМУЛИРОВКА своей же ошибки (объявленно): прежняя версия этого теста
+        # не задавала маршрут `mgrctl dnszone`, поэтому zones оказывались
+        # пустыми и проверка индекса падала — тест проверял собственную дырку в
+        # маршрутах, а не форму записи. Инвариант («старое имя возвращает список
+        # записей с теми же полями») сохранён строго, плюс сверка serial.
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain', ISP_WEBDOMAIN),
+            ('mgrctl -m ispmgr dnszone',
+             'name=panel.tld elid=5 filename=/var/named/zones/db.panel.tld\n'),
+            ('/var/named/zones/db.panel.tld',
+             'panel.tld. SOA ns a@panel.tld. 2026030303 3600\n'),
+        ])
+        sites = dc.discover_sites(c, 'ispmanager')
+        zones = dc.discover_dns_zones(c, 'ispmanager')
+        assert isinstance(sites, list) and isinstance(zones, list)
+        assert [s['domain'] for s in sites] == ['site1.ru']
+        assert set(zones[0]) >= {'domain', 'path', 'serial', 'source'}
+        assert zones[0]['serial'] == '2026030303'
+
+    def test_price_did_not_grow(self):
+        # Чтение vhost'а — одна команда (RFSTATE + читатель, v1.21), поиск
+        # каталога — одна; различение не имеет права стоить прогонов больше.
+        # РЕФОРМУЛИРОВКА своей же ошибки (объявленно): прежняя версия запрещала
+        # 2>/dev/null во ВСЕХ командах прогона и потому задела панельную
+        # `mgrctl … 2>/dev/null`, которую этот слайс не трогает. Инвариант
+        # («в поиске файлов и в чтении файла заглушки нет») сохранён строго, но
+        # проверяется на тех командах, к которым он относится.
+        c = FakeSSH(routes=[
+            ('ls -1 /etc/nginx/vhosts', NGINX_VHOST[0] + '\n'),
+            (NGINX_VHOST[0], 'RFSTATE readable\n' + NGINX_VHOST[1]),
+        ])
+        dc.discover_sites(c, 'ispmanager')
+        reads = [cmd for cmd in c.commands if 'RFSTATE' in cmd]
+        assert len(reads) == 1
+        blind = [cmd for cmd in c.commands
+                 if '2>/dev/null' in cmd and ('RFSTATE' in cmd or 'ls -1 ' in cmd)]
+        assert not blind, blind
+
+
 # ==================== ОТЧЁТЫ ====================
 class TestSiteHealth:
     def test_empty_inventory(self):
@@ -2132,8 +2303,16 @@ class TestUnverifiedIsNotClean:
         c = FakeSSH(routes=_verify_routes(probe=''))
         out = dc.mail_auth_report(c, 'ispmanager')
         assert c.count('a.root-servers.net') == len(dc.PUBLIC_RESOLVERS)
-        assert sum(1 for x in c.commands
-                   if '@' in x and 'root-servers' not in x) == 0
+        # РЕФОРМУЛИРОВКА объявленно (1.24.0). Прежний признак внешнего запроса
+        # — любой символ '@' в команде — перестал быть однозначным: поиск
+        # каталогов зон переведён на команду v1.20.0, внутри которой POSIX-
+        # цикл `for d in "$@"`. Замер живьём: внешних dig на домен по-прежнему
+        # ровно 0 (инвариант не ослаблен), но по старому признаку в выборку
+        # попадали 4 команды `set -- … "$@"`, не имеющие к DNS отношения.
+        # Считаем именно внешнюю DNS-пробу: dig с указанием резолвера.
+        ext = [x for x in c.commands
+               if 'dig' in x and ' @' in x and 'root-servers' not in x]
+        assert ext == []
         assert '[не сверено]' in out
         assert 'Провалено: 0, с замечаниями: 1' in out
 
