@@ -6,7 +6,8 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 import ttkbootstrap as tb
 import re
-from diagnostic import replace_ipv4, replace_ipv6, restart_services, get_config_files, read_file, write_file
+from diagnostic import (replace_ipv4, replace_ipv6, restart_services,
+                        get_config_files_info, read_file, write_file)
 from ttkbootstrap.constants import *
 
 
@@ -122,10 +123,22 @@ class AdminMixin:
         if not self.checker:
             return
 
-        files = get_config_files(self.checker, self.panel_type)
+        files, gaps = get_config_files_info(self.checker, self.panel_type)
         if not files:
-            messagebox.showinfo("Информация", "Конфигурационные файлы не найдены.")
+            # «Не найдено» и «не смогли посмотреть» — разные решения оператора:
+            # по первому меняют раскладку поиска, по второму поднимают права.
+            # Прежний один и тот же диалог врал вторым случаем.
+            if gaps:
+                messagebox.showwarning("Конфиг-файлы не удалось получить",
+                                       "\n".join(gaps[:6]))
+            else:
+                messagebox.showinfo("Информация",
+                                    "Конфигурационные файлы не найдены.")
             return
+        if gaps:
+            # Найденное терять нельзя, но неполный список обязан быть назван:
+            # два файла из двадцати читаются оператором как полный инвентарь.
+            messagebox.showwarning("Список неполный", "\n".join(gaps[:6]))
 
         editor_dialog = tb.Toplevel(self.root)
         editor_dialog.title("Редактор конфигурационных файлов")

@@ -3,7 +3,8 @@ import ipaddress
 from datetime import datetime
 
 from common import (BACKUP_SUBDIRS, q, ensure_backup_dir, create_backup,
-                    write_remote_file, RF_TEXT, read_file_info)
+                    write_remote_file, RF_TEXT, read_file_info,
+                    find_files_info, FF_DIR_TEXT)
 
 
 # ==================== РАБОТА С ФАЙЛАМИ (С БЭКАПАМИ) ====================
@@ -61,59 +62,139 @@ def read_file(checker, filepath):
     return f"❌ Файл {filepath} не прочитан: {reason}"
 
 
-def get_config_files(checker, panel_type):
-    files = []
-    common_paths = [
-        '/etc/nginx/nginx.conf',
-        '/etc/nginx/sites-available/',
-        '/etc/nginx/sites-enabled/',
-        '/etc/nginx/conf.d/',
-        '/etc/apache2/apache2.conf',
-        '/etc/apache2/sites-available/',
-        '/etc/apache2/sites-enabled/',
-        '/etc/apache2/conf-available/',
-        '/etc/apache2/conf-enabled/',
-        '/etc/httpd/conf/httpd.conf',
-        '/etc/httpd/conf.d/',
-        '/etc/php/*/php.ini',
-        '/etc/php/*/fpm/php.ini',
-        '/etc/php/*/cli/php.ini',
-        '/etc/mysql/mysql.conf.d/mysqld.cnf',
-        '/etc/mysql/my.cnf',
+# Где живут конфиги. Список — константа модуля, а не локальная переменная:
+# тест цены прогона обязан видеть, что проверок ровно столько, сколько путей,
+# а не вдвое больше (прежний код тратил по ДВЕ слепые команды на каждый путь).
+# Каталог заканчивается '/' — к нему в поиске добавляется '/*', чтобы `ls`
+# печатал ПОЛНЫЕ пути (иначе редактор получил бы имена без каталога).
+CONFIG_PATHS = [
+    '/etc/nginx/nginx.conf',
+    '/etc/nginx/sites-available/',
+    '/etc/nginx/sites-enabled/',
+    '/etc/nginx/conf.d/',
+    '/etc/apache2/apache2.conf',
+    '/etc/apache2/sites-available/',
+    '/etc/apache2/sites-enabled/',
+    '/etc/apache2/conf-available/',
+    '/etc/apache2/conf-enabled/',
+    '/etc/httpd/conf/httpd.conf',
+    '/etc/httpd/conf.d/',
+    '/etc/php/*/php.ini',
+    '/etc/php/*/fpm/php.ini',
+    '/etc/php/*/cli/php.ini',
+    '/etc/mysql/mysql.conf.d/mysqld.cnf',
+    '/etc/mysql/my.cnf',
+]
+
+PANEL_CONFIG_PATHS = {
+    'fastpanel': [
+        '/usr/local/fastpanel/etc/nginx/',
+        '/usr/local/fastpanel/etc/php/',
+        '/etc/nginx/fastpanel2-available/',
+    ],
+    'ispmanager': [
+        '/etc/nginx/vhosts/',
+        '/usr/local/mgr5/etc/nginx/',
+        '/usr/local/mgr5/etc/apache2/',
+        '/usr/local/mgr5/etc/php/',
     ]
-    panel_paths = {
-        'fastpanel': [
-            '/usr/local/fastpanel/etc/nginx/',
-            '/usr/local/fastpanel/etc/php/',
-            '/etc/nginx/fastpanel2-available/',
-        ],
-        'ispmanager': [
-            '/etc/nginx/vhosts/',
-            '/usr/local/mgr5/etc/nginx/',
-            '/usr/local/mgr5/etc/apache2/',
-            '/usr/local/mgr5/etc/php/',
-        ]
-    }
-    for path in common_paths:
+}
+
+CONFIG_LIMIT = 20      # файлов на один путь
+CONFIG_MAX = 50        # всего в списке: диалог с двумястами пунктами не читают
+
+NOT_SEARCHED_NOTE = ("⚠️ Ни один из {n} путей не подтвердил поиск: сервер вернул "
+                     "пустой ответ без состояния каталога. О конфиг-файлах ничего "
+                     "не известно — это «не проверено», а не «файлов нет». "
+                     "Повторите проверку: прошлая могла оборваться")
+
+
+def get_config_files_info(checker, panel_type):
+    """(список конфигов, notes): что нашли И чем объяснена пустота.
+
+    Прежний вид:
+
         out, _ = checker.exec_command(f'ls -d {q(path)} 2>/dev/null && echo "exists"')
         if out.strip() == 'exists':
-            out2, _ = checker.exec_command(f'ls -1 {q(path)} 2>/dev/null | head -20')
-            if out2.strip():
-                for f in out2.splitlines():
-                    if f.strip():
-                        files.append(f"{path}{f}" if path.endswith('/') else path)
-            else:
-                files.append(path)
-    if panel_type in panel_paths:
-        for path in panel_paths[panel_type]:
-            out, _ = checker.exec_command(f'ls -d {q(path)} 2>/dev/null && echo "exists"')
-            if out.strip() == 'exists':
-                out2, _ = checker.exec_command(f'find {q(path)} -type f 2>/dev/null | head -20')
-                if out2.strip():
-                    for f in out2.splitlines():
-                        if f.strip():
-                            files.append(f)
-    return sorted(list(set(files)))[:50]
+
+    Функция была мертва на ЛЮБОМ сервере. Замер живьём (uid=1000, /bin/bash):
+
+        out=$(ls -d /etc/hosts 2>/dev/null && echo "exists")  -> "/etc/hosts\\nexists"
+        [ "$out" = exists ]                                  -> ложь ВСЕГДА
+
+    `ls -d` печатает сам путь, `echo` идёт второй строкой, а `strip()` убирает
+    только края. То есть get_config_files возвращал [] всегда, и редактор
+    честно рапортовал «Конфигурационные файлы не найдены» на сервере, где все
+    конфиги есть. Тесты этого не видели: двойник возвращал идеальный 'exists\\n',
+    которого ls не выдаёт никогда (урок: двойник обязан говорить то, что
+    говорит система).
+
+    Второе враньё — `2>/dev/null`: в stderr лежит единственная строка, где
+    написано, почему пусто («Permission denied» против «No such file or
+    directory»), а для оператора это два разных действия — поднимать права или
+    проверять раскладку. Третье: пустой ПРОЧИТАННЫЙ каталог добавлялся в список
+    как файл, и редактор открывал каталог как конфиг (ровно isdir из 1.21.0).
+
+    Теперь состояние каталога и список даёт примитив find_files_info (1.20.0)
+    — ОДНОЙ командой на путь вместо двух слепых, поэтому различение состояний
+    не подорожало. Панельные каталоги обходятся `find` (рекурсивно — так и
+    было), но без `2>/dev/null`: вывод `find` про права и про отсутствие
+    файла читаются из stderr.
+    """
+    files = []
+    notes = []
+    asked = 0
+    confirmed = 0
+
+    for path in CONFIG_PATHS:
+        # glob намеренно НЕ через q(): в кавычках ls ищет файл со звездой в
+        # имени — так '/etc/php/*/php.ini' терялся из редактора всегда.
+        pattern = path + '*' if path.endswith('/') else path
+        info = find_files_info(checker, pattern, CONFIG_LIMIT)
+        asked += 1
+        files.extend(info['paths'])
+        # total is None и пустые dirs — ответа нашей команды не было вовсе
+        # (обрыв, чужой ls). Молчать в этом случае значит соврать, что путей
+        # нет; но и жалобу на каждый из 16 путей печатать нельзя — причина
+        # у них одна.
+        if info['dirs'] or info['total'] is not None:
+            confirmed += 1
+        for note in info['notes']:
+            if note not in notes:
+                notes.append(note)
+
+    for path in PANEL_CONFIG_PATHS.get(panel_type, []):
+        out, err = checker.exec_command(
+            f'find {q(path)} -type f | head -{CONFIG_LIMIT}')
+        files.extend(line.strip() for line in (out or '').splitlines()
+                     if line.strip())
+        low = (err or '').lower()
+        why = next((l.strip() for l in (err or '').splitlines() if l.strip()),
+                   '')[:160]
+        if 'permission denied' in low:
+            note = FF_DIR_TEXT['noperm'].format(path=path, why=why)
+        elif 'no such file' in low:
+            note = FF_DIR_TEXT['missing'].format(path=path, why=why)
+        else:
+            # Пустой вывод без ошибки: каталог прочитан, файлов нет — честный
+            # ответ. Жалоба на него обесценила бы настоящие предупреждения
+            # (то же решение, что в 1.24.0–1.26.0).
+            note = None
+        if note and note not in notes:
+            notes.append(note)
+
+    if asked and not confirmed:
+        notes.append(NOT_SEARCHED_NOTE.format(n=asked))
+    return sorted(set(files))[:CONFIG_MAX], notes
+
+
+def get_config_files(checker, panel_type):
+    """Список конфиг-файлов — прежняя форма без причин пустоты.
+
+    ''-списка тут мало: он значит и «файлов нет», и «мы не смогли посмотреть».
+    Редактор обязан звать get_config_files_info.
+    """
+    return get_config_files_info(checker, panel_type)[0]
 
 
 # ==================== ЗАМЕНА IP ====================

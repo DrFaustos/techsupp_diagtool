@@ -47,7 +47,7 @@ from dns import (  # noqa: F401
 
 # --- files ---
 from files import (  # noqa: F401
-    write_file, read_file, get_config_files,
+    write_file, read_file, get_config_files, get_config_files_info,
     replace_ipv4, replace_ipv6, restart_services,
 )
 
@@ -116,7 +116,7 @@ __all__ = [
     'search_oom_info',
     'dns_report_local', 'dns_report', 'dns_resolvers_report',
     'get_current_dns_resolvers', 'set_dns_resolvers',
-    'write_file', 'read_file', 'get_config_files',
+    'write_file', 'read_file', 'get_config_files', 'get_config_files_info',
     'replace_ipv4', 'replace_ipv6', 'restart_services',
     'ispmanager_restart', 'ispmanager_kill_core', 'ispmanager_update',
     'ispmanager_ssl_issue', 'ispmanager_disable', 'ispmanager_disable_geoip',
