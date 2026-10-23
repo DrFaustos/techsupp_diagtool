@@ -15,8 +15,8 @@ postfix-карты), — чистые функции: проверяются т�
 import re
 import shlex
 
-from common import (q, find_files, read_file_content, write_remote_file,
-                    prepare_secret_file, remove_remote_path)
+from common import (q, find_files_info, read_file_content, read_file_info,
+                    write_remote_file, prepare_secret_file, remove_remote_path)
 from logs import (find_logs, mail_log_snapshot_lines,
                   mail_delivery_digest_lines)
 from metrics import detect_panel, services_status_cmd, parse_service_statuses
@@ -448,14 +448,62 @@ def fp_mail_boxes(checker, domain=None):
 
 
 # ==================== ИНВЕНТАРЬ: САЙТЫ ====================
-def discover_sites(checker, panel_type=None):
-    """Список сайтов: панельный источник + разбор vhost'ов, сведё по домену.
+# «Сайтов нет» и «мы не смогли их увидеть» — противоположные диагнозы с
+# противоположным лечением (менять раскладку против поднимать права). Замер
+# живьём (uid=1000, НАСТОЯЩИЕ файлы и каталоги против discovery): закрытый
+# vhost, закрытый каталог vhost'ов, отсутствующий каталог и реально пустой
+# конфиг давали ОДИН ответ — пустой список, а отчёт подписывал его «Сайты не
+# обнаружены». Различение уже было посчитано (find_files — 1.20.0,
+# read_file_info — 1.21.0), но здесь оно выбрасывалось: ⚠️-строки фильтром
+# «это не путь», а причина чтения — гашением None в `or ''`.
+VHOST_GAP_NOTE = ("⚠️ Конфиг {path} не прочитан: {reason}. Домены из него в "
+                  "инвентаре не участвовали — «сайтов нет» по этому пути "
+                  "сказать нельзя")
 
-    Каждая запись: domain, owner, docroot, php, vhost (откуда узнали).
+# Общий заголовок блока пробелов: заметки уже начинаются с ⚠️, поэтому он
+# объясняет масштаб («инвентарь неполон»), а не дублирует знак.
+GAP_TITLE = "Инвентарь неполон: часть путей не просмотрена"
+
+
+def gap_notes_lines(notes, title=GAP_TITLE):
+    """Заметки о пробелах одним блоком (пустой список — пустой блок).
+
+    Отчёты обязаны печатать их, а не только считать: различие, до которого
+    не дошёл оператор, для него не существует (урок 1.20.0 и 1.21.0).
+    """
+    if not notes:
+        return []
+    return ["", f"⚠️ {title}:"
+            ] + [f"  {note}" for note in notes]
+
+
+def _uniq_notes(notes):
+    """Дедуп предупреждений.
+
+    Один каталог приходит из двух паттернов поиска, а два одинаковых ⚠️
+    оператор прочитает как две разные беды (признак, посчитанный дважды,
+    однажды разъезжается — грабель v1.18.0/v1.20.0).
+    """
+    seen, out = set(), []
+    for note in notes:
+        if note and note not in seen:
+            seen.add(note)
+            out.append(note)
+    return out
+
+
+def discover_sites_info(checker, panel_type=None):
+    """(sites, notes): сайты + чем объяснены дыры в их поиске.
+
+    notes — готовые оператору ⚠️-строки (каталог недоступен, конфиг не
+    прочитан, список срезан лимитом). Пустой ПРОЧИТАННЫЙ конфиг жалобы не
+    даёт: «пусто» — честный ответ, а не неполнота, и шум обесценил бы
+    настоящие предупреждения.
     """
     if panel_type is None:
         panel_type = detect_panel(checker)
     sites = {}
+    notes = []
 
     def add(domain, **info):
         dom = (domain or '').strip().lower()
@@ -485,22 +533,41 @@ def discover_sites(checker, panel_type=None):
                 vhost='mogwai sites')
 
     for pattern in VHOST_PATTERNS.get(panel_type, VHOST_PATTERNS['none']):
-        for path in find_files(checker, pattern, limit=50):
-            if path.startswith('⚠️'):
+        found = find_files_info(checker, pattern, limit=50)
+        notes.extend(found['notes'])
+        for path in found['paths']:
+            read = read_file_info(checker, path)
+            if read['content'] is None:
+                notes.append(VHOST_GAP_NOTE.format(
+                    path=path, reason=read['reason'] or ''))
                 continue
-            parsed = parse_nginx_vhost(read_file_content(checker, path) or '')
+            parsed = parse_nginx_vhost(read['content'])
             for dom in parsed['domains']:
                 add(dom, docroot=parsed['docroot'], php=parsed['php'],
                     vhost=path)
     for pattern in HTTPD_VHOST_PATTERNS.get(panel_type, []):
-        for path in find_files(checker, pattern, limit=50):
-            if path.startswith('⚠️'):
+        found = find_files_info(checker, pattern, limit=50)
+        notes.extend(found['notes'])
+        for path in found['paths']:
+            read = read_file_info(checker, path)
+            if read['content'] is None:
+                notes.append(VHOST_GAP_NOTE.format(
+                    path=path, reason=read['reason'] or ''))
                 continue
-            parsed = parse_apache_vhost(read_file_content(checker, path) or '')
+            parsed = parse_apache_vhost(read['content'])
             for dom in parsed['domains']:
                 add(dom, docroot=parsed['docroot'], vhost=path)
 
-    return sorted(sites.values(), key=lambda s: s['domain'])
+    return sorted(sites.values(), key=lambda s: s['domain']), _uniq_notes(notes)
+
+
+def discover_sites(checker, panel_type=None):
+    """Список сайтов — прежняя форма (без заметок) для старых потребителей.
+
+    Пробелы в поиске отдаёт discover_sites_info; отчёты обязаны звать её,
+    иначе «не увидели» снова станет «не найдено».
+    """
+    return discover_sites_info(checker, panel_type)[0]
 
 
 # ==================== ИНВЕНТАРЬ: ПОЧТА ====================
@@ -578,11 +645,29 @@ def discover_mailboxes(checker, panel_type=None, domain=None):
 
 
 # ==================== ИНВЕНТАРЬ: DNS-ЗОНЫ ====================
-def discover_dns_zones(checker, panel_type=None):
-    """[{domain, path, serial, source}] — панель + файлы зон BIND/nsd."""
+# Прежний поиск зон был слепым наглухо: `ls -1 {pattern} 2>/dev/null |
+# head -100` — та же грабелька, что губила причину в 1.18.0-1.21.0. Пустой
+# вывод давали три противоположных случая («каталога нет», «каталог закрыт»,
+# «зон правда нет»), а отчёт выбирал самое спокойное объяснение и ДОПИСЫВАЛ
+# его от себя: «сервер не является NS для этих доменов (DNS тогда у
+# регистратора/в облаке)». Замер живьём при каталоге зон без x: zones=[] и
+# ровно эта строка — утверждение про чужую инфраструктуру, которое проверка
+# не имела права делать, потому что в каталог она не заглянула.
+ZONE_SERIAL_GAP_NOTE = ("⚠️ Зона {path}: serial не определён — файл не "
+                        "прочитан: {reason}. «serial=?» в списке ниже значит "
+                        "«мы не посмотрели», а не «serial отсутствует»")
+
+
+def discover_dns_zones_info(checker, panel_type=None):
+    """(zones, notes): DNS-зоны + чем объяснены дыры в их поиске и чтении.
+
+    notes — готовые оператору ⚠️-строки: закрытый/отсутствующий каталог зон,
+    срезка списка лимитом, зона, у которой serial не удалось прочитать.
+    """
     if panel_type is None:
         panel_type = detect_panel(checker)
     zones = {}
+    notes = []
 
     if panel_type == 'ispmanager':
         for row in isp_dnszones(checker):
@@ -593,23 +678,43 @@ def discover_dns_zones(checker, panel_type=None):
                                       or row.get('file', ''),
                               'source': 'mgrctl dnszone'}
 
-    paths = []
+    # limit=100 — тот же head -100, что был раньше, но awk (v1.20.0) считает
+    # ВСЕ файлы и про срезку сообщает в notes: head резал список молча, и
+    # оператор не знал, сколько зон в отчёте не участвовало.
     for pattern in ZONE_PATTERNS:
-        out, _, _ = checker.run(f'ls -1 {pattern} 2>/dev/null | head -100')
-        paths.extend(p.strip() for p in (out or '').splitlines() if p.strip())
-    for path in paths:
-        dom = zone_domain_from_path(path)
-        if dom and dom not in zones:
-            zones[dom] = {'domain': dom, 'path': path, 'source': 'zone files'}
+        found = find_files_info(checker, pattern, limit=100)
+        notes.extend(found['notes'])
+        for path in found['paths']:
+            dom = zone_domain_from_path(path)
+            if dom and dom not in zones:
+                zones[dom] = {'domain': dom, 'path': path,
+                              'source': 'zone files'}
 
     result = sorted(zones.values(), key=lambda z: z['domain'])
     for zone in result:
-        if zone['path']:
-            zone['serial'] = parse_zone_serial(
-                read_file_content(checker, zone['path']) or '')
-        else:
-            zone['serial'] = ''
-    return result
+        zone['serial'] = ''
+        if not zone['path']:
+            continue
+        # Прежний `parse_zone_serial(read_file_content(...) or '')` превращал
+        # «не прочитал» в «serial отсутствует», и отчёт печатал serial=? —
+        # знак, который читается как «в зоне нет serial», а не как «мы не
+        # дошли до файла».
+        read = read_file_info(checker, zone['path'])
+        if read['content'] is None:
+            notes.append(ZONE_SERIAL_GAP_NOTE.format(
+                path=zone['path'], reason=read['reason'] or ''))
+            continue
+        zone['serial'] = parse_zone_serial(read['content'])
+    return result, _uniq_notes(notes)
+
+
+def discover_dns_zones(checker, panel_type=None):
+    """[{domain, path, serial, source}] — прежняя форма без заметок.
+
+    Чем объяснены дыры в поиске и чтении — в discover_dns_zones_info; отчёты
+    обязаны звать её, иначе «не посмотрели» снова станет «зон нет».
+    """
+    return discover_dns_zones_info(checker, panel_type)[0]
 
 
 # ==================== ОТЧЁТЫ ====================
@@ -774,10 +879,14 @@ def site_health_lines(checker, sites, limit=HEALTH_CHECK_LIMIT):
 
 
 def site_health_report(checker, panel_type=None):
-    sites = discover_sites(checker, panel_type)
+    sites, gaps = discover_sites_info(checker, panel_type)
     lines = ["=== САЙТЫ И ИХ ДОСТУПНОСТЬ ==="]
     if not sites:
         lines.append("Сайты не обнаружены (ни панельного списка, ни vhost'ов).")
+        # Прежняя строка была окончательным диагнозом. Замер: тот же вывод
+        # давал закрытый каталог vhost'ов, где сайты лежат сотнями — то есть
+        # «мы не увидели» и «их нет» печатались одним предложением.
+        lines.extend(gap_notes_lines(gaps))
         return "\n".join(lines)
     lines.append(f"Найдено сайтов: {len(sites)}\n")
     for site in sites:
@@ -803,6 +912,9 @@ def site_health_report(checker, panel_type=None):
                                      total=len(sites)))
     lines.extend(site_health_render(probed))
     lines.extend(site_health_footnote(sites))
+    # Пробелы печатаются и когда сайты нашлись: «Найдено сайтов: 3» при
+    # закрытом каталоге, где лежат ещё двадцать, — тоже недостоверный итог.
+    lines.extend(gap_notes_lines(gaps))
     return "\n".join(lines)
 
 
@@ -835,10 +947,13 @@ def ssl_expiry_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
     Дни берём из той же пробы, что и коды (site_status_command), — один
     TLS-хендшейк на домен; ограничение limit — как у health-check.
     """
-    sites = discover_sites(checker, panel_type)
+    sites, gaps = discover_sites_info(checker, panel_type)
     lines = ["=== SSL: СРОК ДЕЙСТВИЯ СЕРТИФИКАТОВ ==="]
     if not sites:
         lines.append("Сайты не обнаружены — проверять сертификаты не на чём.")
+        # Тот же инвентарь читают оба отчёта: причина обязана доехать в оба,
+        # иначе «в SSL всё тихо» останется выводом про непрочитанные vhost'ы.
+        lines.extend(gap_notes_lines(gaps))
         return "\n".join(lines)
 
     probed = sites[:limit]
@@ -1949,17 +2064,28 @@ def mail_auth_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
 
 
 def dns_zones_report(checker, panel_type=None):
-    zones = discover_dns_zones(checker, panel_type)
+    zones, gaps = discover_dns_zones_info(checker, panel_type)
     lines = ["=== DNS-ЗОНЫ НА СЕРВЕРЕ ==="]
     if not zones:
-        lines.append("Зон не найдено — сервер не является NS для этих доменов "
-                     "(DNS тогда у регистратора/в облаке).")
+        if gaps:
+            # «NS — не мы» — утверждение о чужой инфраструктуре. Право на него
+            # есть только когда каталоги зон действительно просмотрены; иначе
+            # отчёт выдумывает объяснение там, где не смог посмотреть (замер
+            # живьём: каталог зон без x давал ровно прежнюю спокойную строку).
+            lines.append("Зоны не найдены — но каталоги зон просмотрены не "
+                         "полностью, поэтому вывод предварительный: см. "
+                         "предупреждения ниже.")
+        else:
+            lines.append("Зон не найдено — сервер не является NS для этих "
+                         "доменов (DNS тогда у регистратора/в облаке).")
+        lines.extend(gap_notes_lines(gaps))
         return "\n".join(lines)
     lines.append(f"Найдено зон: {len(zones)}\n")
     for zone in zones:
         serial = zone['serial'] or '?'
         lines.append(f"  {zone['domain']:45s} serial={serial:>12s} "
                      f"[{zone['source']}]")
+    lines.extend(gap_notes_lines(gaps))
     return "\n".join(lines)
 
 
