@@ -529,6 +529,34 @@ class TestGrepLogsReport:
         _, c = self._report(self._read(1, 'x'))
         assert c.count('grep') == 1
 
+    # ---- пустота поиска: «не найдено» только на просмотренных каталогах ----
+
+    def test_unreadable_dir_is_not_reported_as_no_logs(self):
+        # Логи есть, но оператор под своим UID их не увидит. Прежний вывод был
+        # неотличим от «логов нет» — оператор шёл искать другой домен, а не права.
+        c = FakeSSH(routes=[('ls -1', 'FFDIR noperm /var/log/nginx\nFFCOUNT 0\n')])
+        out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', '500')
+        assert 'прав' in out
+        assert 'Логи для домена не найдены' not in out
+
+    def test_missing_dir_names_the_path(self):
+        c = FakeSSH(routes=[('ls -1', 'FFDIR missing /var/log/apache2\nFFCOUNT 0\n')])
+        out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', '500')
+        assert '/var/log/apache2' in out and 'Каталога' in out
+
+    def test_no_logs_message_survives_on_a_read_directory(self):
+        # Прежнее требование (запертое в test_diagnostic) сохранено: когда каталоги
+        # просмотрены и в них пусто, «не найдены» обязано звучать.
+        c = FakeSSH(routes=[('ls -1', 'FFDIR ok /var/log/nginx\nFFCOUNT 0\n')])
+        out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', '500')
+        assert 'Логи для домена не найдены' in out
+
+    def test_unconfirmed_search_is_not_reported_as_no_logs(self):
+        c = FakeSSH(routes=[])
+        out = webcheck_mod.grep_logs_report(c, 'none', 'example.com', '500')
+        assert 'не проверено' in out
+        assert 'Логи для домена не найдены' not in out
+
 
 class TestListCommonReports:
     def test_both_5xx_and_404_sections(self):

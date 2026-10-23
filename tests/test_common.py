@@ -143,26 +143,151 @@ class TestWriteRemoteFile:
 
 
 class TestFindFiles:
+    """«Не найдено» говорится только когда посмотреть было на что.
+
+    Прежний код: `out, _, _ = checker.run(f"ls -1 {pattern} 2>/dev/null |
+    head -{limit}")`. Пустой вывод давали ЧЕТЫРЕ разных состояния, и все четыре
+    подписывались одинаково (в `grep_logs_report` — «❌ Логи для домена не
+    найдены»):
+
+      1) файлов правда нет (каталог есть, пуст) — «логов нет» честно;
+      2) каталога нет — другая раскладка/панель определена неверно;
+      3) нет прав на каталог (логи 0750 root:adm, оператор под своим UID) —
+         логи ЕСТЬ, но мы их никогда не увидим;
+      4) лимит срезал список — часть логов просто не участвовала в отчёте.
+
+    (2) и (3) для оператора противоположны: во втором случае менять параметры,
+    в первом — права. Замерено живьём: честный rc у `ls` на все три случая —
+    rc=2 («no such file» и «permission denied» неразличимы), различает только
+    текст stderr и ветки `[ -d ]` / `[ -r ]` / `[ -x ]` по каталогу. Отсюда
+    форма команды: состояние каталога спрашивается ДО ls, stderr не глушится,
+    а число файлов считает awk (FFCOUNT), а не `head`, который резал список
+    молча.
+    """
+
+    @staticmethod
+    def _ok(*paths, total=None):
+        """Ответ сервера по прочитанному каталогу: пути + FFCOUNT + FFDIR ok."""
+        out = list(paths)
+        out.append(f"FFCOUNT {total if total is not None else len(paths)}")
+        return '\n'.join(out) + '\n'
+
     def test_lists_files(self):
-        c = FakeSSH(routes=[('ls -1', '/a.log\n/b.log\n')])
+        c = FakeSSH(routes=[('FFCOUNT', self._ok('/a.log', '/b.log'))])
         assert common.find_files(c, '/var/log/*.log') == ['/a.log', '/b.log']
 
-    def test_appends_limit_warning(self):
-        c = FakeSSH(routes=[('ls -1', '/a.log\n/b.log\n/c.log\n')])
-        files = common.find_files(c, '/var/log/*.log', 2)
-        assert files[:2] == ['/a.log', '/b.log']
+    def test_limit_warning_names_the_real_total(self):
+        # Прежний маркер говорил «показаны первые 20» и молчал о том, сколько
+        # их всего: оператор не знал, сколько логов НЕ участвовало в отчёте.
+        # Замер живьём: 30 файлов, head -20 -> «показаны первые 20».
+        c = FakeSSH(routes=[('FFCOUNT', self._ok(*['/l%d.log' % i for i in range(20)],
+                                                 total=30))])
+        files = common.find_files(c, '/var/log/*.log', 20)
+        assert files[:20] == ['/l%d.log' % i for i in range(20)]
         assert files[-1].startswith('⚠️')
-        assert 'head -2' in c.find('ls -1')
+        assert '20' in files[-1] and '30' in files[-1]
 
-    def test_no_warning_under_limit(self):
-        c = FakeSSH(routes=[('ls -1', '/a.log\n')])
+    def test_no_warning_when_nothing_was_cut(self):
+        c = FakeSSH(routes=[('FFCOUNT', self._ok('/a.log'))])
         assert common.find_files(c, '/var/log/*.log', 20) == ['/a.log']
 
+    def test_missing_directory_is_reported_as_such(self):
+        # «Каталога нет» = раскладка/панель не те: менять надо параметры поиска.
+        c = FakeSSH(routes=[('FFCOUNT', 'FFDIR missing /var/log/apache2\nFFCOUNT 0\n')])
+        files = common.find_files(c, '/var/log/apache2/*.log', 20)
+        # Пути — пустые; вместо них ⚠️-строка (её фильтруют как не-путь), т.е.
+        # молчание невозможно: consumers увидят причину.
+        assert [f for f in files if not f.startswith('⚠️')] == []
+        assert any('Каталога' in f for f in files)
+        info = common.find_files_info(c, '/var/log/apache2/*.log', 20)
+        assert info['dirs'][0][0] == 'missing'
+        assert 'нет' in info['notes'][0] and '/var/log/apache2' in info['notes'][0]
+
+    def test_unreadable_directory_is_not_called_missing_files(self):
+        # Решающий случай: логи есть, но оператор под своим UID их не увидит.
+        # Прежний вывод был идентичен «логов нет» — оператор шёл искать другой
+        # домен, а не права.
+        c = FakeSSH(routes=[('FFCOUNT',
+                             'FFDIR noperm /var/www/httpd-logs\nFFCOUNT 0\n')])
+        info = common.find_files_info(c, '/var/www/httpd-logs/*.log', 20)
+        assert info['paths'] == []
+        assert info['dirs'][0][0] == 'noperm'
+        note = ' '.join(info['notes'])
+        assert 'прав' in note
+        assert 'не найдено' not in note and 'не найдены' not in note
+
+    def test_readable_empty_directory_has_no_alibi(self):
+        # Каталог прочитан, файлов нет — вот это и есть честное «не найдено»,
+        # и выдумывать ему «нет прав» нельзя.
+        c = FakeSSH(routes=[('FFCOUNT', 'FFDIR ok /var/log/nginx\nFFCOUNT 0\n')])
+        info = common.find_files_info(c, '/var/log/nginx/*.log', 20)
+        assert info['paths'] == [] and info['notes'] == []
+        assert info['dirs'][0][0] == 'ok'
+
+    def test_partial_access_keeps_the_paths_it_got(self):
+        # Панельные паттерны раскрываются в несколько каталогов: один закрыт,
+        # другой читается — найденное терять нельзя, но и молчать нельзя.
+        c = FakeSSH(routes=[('FFCOUNT',
+                             'FFDIR noperm /var/www/a/data/logs\n'
+                             'FFDIR ok /var/www/b/data/logs\n'
+                             '/var/www/b/data/logs/x.log\nFFCOUNT 1\n')])
+        files = common.find_files(c, '/var/www/*/data/logs/*.log', 20)
+        assert files == ['/var/www/b/data/logs/x.log', files[-1]]
+        assert files[-1].startswith('⚠️') and 'прав' in files[-1]
+
+    def test_legacy_warning_line_is_not_treated_as_a_path(self):
+        # Обратная совместимость: старые/чужие выводы могут нести «⚠️ ...»
+        # строкой — она не путь (её фильтруют 4 потребителя).
+        c = FakeSSH(routes=[('FFCOUNT', '/a.log\n⚠️ (показаны первые 20 файлов)\n')])
+        assert common.find_files(c, '/var/log/*.log', 20) == ['/a.log',
+                                                             '⚠️ (показаны первые 20 файлов)']
+
+    def test_answer_without_markers_keeps_paths_and_invents_nothing(self):
+        # Ответ без FFCOUNT (обрыв, чужая реализация): пути сохраняем, total не
+        # выдумываем — закон «не проверено ≠ 0» из v1.16-v1.19.
+        c = FakeSSH(routes=[('ls -1', '/a.log\n/b.log\n')])
+        info = common.find_files_info(c, '/var/log/*.log', 20)
+        assert info['paths'] == ['/a.log', '/b.log']
+        assert info['total'] is None
+        assert info['dirs'] == []
+
+    def test_reader_stderr_is_not_thrown_away(self):
+        # Поведенческий замок по ОТПРАВЛЕННОЙ команде (не по исходнику):
+        # прежнее 2>/dev/null теряло «Permission denied» — единственную строку,
+        # объясняющую пустоту.
+        c = FakeSSH(routes=[('FFCOUNT', self._ok('/a.log'))])
+        common.find_files(c, '/var/log/nginx/*.log', 20)
+        cmd = c.find('ls -1')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd
+        assert 'head -' not in cmd          # срезка больше не молчит
+        assert 'PIPESTATUS' not in cmd      # dash: «Bad substitution»
+
     def test_glob_is_not_quoted_on_purpose(self):
-        # pattern — shell-glob, его нельзя экранировать (иначе ls ничего не найдёт)
-        c = FakeSSH(routes=[('ls -1', '')])
-        common.find_files(c, '/var/log/nginx/*.log')
-        assert c.find('ls -1 /var/log/nginx/*.log') is not None
+        # pattern — shell-glob: его нельзя экранировать, иначе ls ничего не
+        # найдёт. Прежний замок искал «ls -1 /var/log/nginx/*.log» буквально и
+        # сдох бы на любой форме с переменной; запираю смысл: glob дошёл до ls
+        # без кавычек вокруг переменной.
+        c = FakeSSH(routes=[('FFCOUNT', self._ok('/a.log'))])
+        common.find_files(c, '/var/log/nginx/*.log', 20)
+        cmd = c.find('ls -1')
+        assert '/var/log/nginx/*.log' in cmd
+        assert 'ls -1 "$P"' not in cmd and "ls -1 '$P'" not in cmd
+
+    def test_directory_state_is_asked_before_listing(self):
+        # rc=ls различает только «всё хорошо» и «что-то нет» (замер: rc=2 и для
+        # «нет файла», и для «нет прав»), поэтому состояние каталога спрашивается
+        # отдельной POSIX-веткой ДО ls.
+        c = FakeSSH(routes=[('FFCOUNT', self._ok('/a.log'))])
+        common.find_files(c, '/var/log/nginx/*.log', 20)
+        cmd = c.find('ls -1')
+        assert cmd.index('-d "') < cmd.index('ls -1')
+        assert '-r "' in cmd and '-x "' in cmd
+
+    def test_price_is_one_command(self):
+        c = FakeSSH(routes=[('FFCOUNT', self._ok('/a.log'))])
+        common.find_files(c, '/var/log/nginx/*.log', 20)
+        assert len(c.commands) == 1
 
 
 class TestFindFile:

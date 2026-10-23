@@ -49,19 +49,98 @@ class TestFindLogs:
     def test_domain_is_sanitized_against_injection(self):
         # _safe_name вырезает shell-метасимволы: имя домена не может расшириться
         # до команды (паттерны идут в ls без кавычек — они glob'ы).
+        #
+        # ФОРМУ ЗАМКА МЕНЯЮ ОСОЗНАННО и объявляю это. Прежний вариант запирал
+        # требование «метасимволы из имени домена не станут командой» как «символа
+        # ; и " нет во всей строке». С составной POSIX-формой (состояние каталога
+        # спрашивается ДО ls — см. common.find_files_cmd) `;` и `"` есть в самой
+        # конструкции shell: прежний замок запрещал бы само различение, за которое
+        # стоят релизы 1.18-1.20. Инвариант сохраняю строго, но на месте угрозы:
+        # имя домена попадает ТОЛЬКО в сегмент glob'а, и метасимволов не должно
+        # быть именно там.
+        #
+        # БУКВЫ остаются — и это правильно. _safe_name вырезает метасимволы и
+        # склеивает 'example.com$(curl evil)")' в 'example.comcurlevil': подстрока
+        # curl тут обычный текст имени, она не может стать командой. Прежний замок
+        # сам этого ожидал (assert 'example.comcurl' in commands[0]), поэтому
+        # запрещать буквы было бы неверно.
+        attack = 'example.com$(curl evil)")'
         c = FakeSSH(routes=[('ls -1', '')])
-        logs_mod.find_logs(c, 'none', 'example.com$(curl evil)")')
+        logs_mod.find_logs(c, 'none', attack)
+        assert c.commands, 'поиск должен был уйти на сервер'
         for cmd in c.commands:
-            assert '$(' not in cmd and ';' not in cmd and '"' not in cmd
+            # Подстановки команд не должно быть НИ В ОДНОЙ отправленной команде,
+            # включая служебную часть (её пишем мы сами — она обязана быть чистой).
+            assert '$(' not in cmd and '`' not in cmd
+            if 'ls -1 ' in cmd:
+                glob = cmd.split('ls -1 ', 1)[1].split(' |', 1)[0]
+                assert glob, 'glob обязан дойти до ls буквально'
+                for ch in ';$"`|&<>(){}[]*?!\\\'\n':
+                    if ch != '*':
+                        assert ch not in glob, f'{ch!r} в glob из имени домена'
+                # Имя домена дошло до ls буквально. Звёздочку здесь НЕ требуем:
+                # паттерны панели 'none' — конкретные имена файлов
+                # ('/var/log/nginx/домен.error.log'), без glob-символов вовсе.
+                assert 'example.comcurl' in glob
         assert 'example.comcurl' in c.commands[0]
+
+
+class TestMissingLogsReason:
+    """Причина пустоты доходит до оператора, а не подменяется «не найдено».
+
+    common.find_files умеет различать «каталога нет», «нет прав», «срезал
+    лимит», но find_logs отдаёт заметки тем же списком, что и пути, а каждый
+    потребитель отфильтровывает их как не-пути (logs.py и webcheck.py). В
+    итоге на выходе снова стояло «Не найден … лог» — ложь возвращалась на
+    последнем шаге. Заперто здесь, а не только в common.
+    """
+
+    def test_unreadable_dir_is_not_reported_as_missing_logs(self):
+        c = FakeSSH(routes=[('ls -1', 'FFDIR noperm /var/log/nginx\nFFCOUNT 0\n')])
+        out = logs_mod.analyze_access_log(c, 'none', 'example.com')
+        assert 'прав' in out
+        assert 'Не найден access-лог' not in out
+
+    def test_missing_dir_names_the_path_it_could_not_read(self):
+        c = FakeSSH(routes=[('ls -1', 'FFDIR missing /var/log/apache2\nFFCOUNT 0\n')])
+        out = logs_mod.analyze_access_log(c, 'none', 'example.com')
+        assert '/var/log/apache2' in out and 'Каталога' in out
+
+    def test_unconfirmed_answer_is_not_verified(self):
+        # Ни путей, ни маркеров: «не проверено», а не «логов нет» (закон 1.16+).
+        c = FakeSSH(routes=[])
+        out = logs_mod.analyze_access_log(c, 'none', 'example.com')
+        assert 'не проверено' in out
+        assert 'Не найден access-лог' not in out
+
+    def test_find_logs_info_separates_paths_from_reasons(self):
+        c = FakeSSH(routes=[('ls -1', 'FFDIR ok /var/log/nginx\n'
+                                       '/var/log/nginx/a.log\nFFCOUNT 1\n')])
+        info = logs_mod.find_logs_info(c, 'none', 'example.com', 'access')
+        assert info['paths'] == ['/var/log/nginx/a.log']
+        assert info['notes'] == [] and info['checked'] is True
+
+    def test_find_logs_stays_compatible_for_older_consumers(self):
+        # find_logs зовут discovery/panels/GUI: совместимость обязана остаться.
+        c = FakeSSH(routes=[('ls -1', 'FFDIR noperm /var/log/nginx\nFFCOUNT 0\n')])
+        got = logs_mod.find_logs(c, 'none', 'example.com')
+        assert [g for g in got if not g.startswith('⚠️')] == []
+        assert any(g.startswith('⚠️') for g in got)
 
 
 # ==================== анализ access-логов ====================
 class TestAnalyzeAccessLog:
     def test_no_logs_found(self):
-        c = FakeSSH(routes=[('ls -1', '')])
+        # ЗАМОК ПЕРЕФОРМУЛЕН ОБЪЯВЛЕННО: раньше пустой ОТВЕТ (даже без единого
+        # маркера состояния каталога) запирался как «Не найден access-лог», т.е.
+        # «не проверено» было заперто как «логов нет» — ровно та ложь, которую
+        # лечат релизы 1.16-1.20. Теперь «Не найден» заперт на проверенном
+        # пустом каталоге (FFDIR ok), а неподтверждённый ответ заперт отдельно
+        # ниже (test_unconfirmed_answer_is_not_verified).
+        c = FakeSSH(routes=[('ls -1', 'FFDIR ok /var/log/nginx\nFFCOUNT 0\n')])
         out = logs_mod.analyze_access_log(c, 'none', 'example.com')
         assert 'Не найден access-лог' in out
+        assert 'не проверено' not in out
 
     def test_counters_and_tops(self):
         c = FakeSSH(routes=[
