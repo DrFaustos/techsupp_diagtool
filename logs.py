@@ -4,7 +4,8 @@ from collections import Counter
 
 from common import (DOMAIN_PATHS, q, find_files, find_files_info,
                     read_file_content, read_file_info,
-                    domains_from_configs_info)
+                    domains_from_configs_info, DOMAIN_CONFIG_LIMIT,
+                    DOMAIN_TRUNCATED_NOTE)
 from metrics import detect_panel  # noqa: F401 (реэкспорт для удобства)
 
 
@@ -948,16 +949,47 @@ def get_domains_info(checker, panel_type):
                          f"быть неполным")
 
     configs = []
+    truncated = False
     for pattern in DOMAIN_PATHS.get(panel_type, DOMAIN_PATHS['none']):
-        info = find_files_info(checker, pattern, 10)
+        # DOMAIN_CONFIG_LIMIT (1.32.0) вместо прежней десятки. Держать 10
+        # заставляла ЦЕНА: каждый конфиг читался отдельным SSH-раундом
+        # (замер живьём: 10 файлов = 11 команд, 50 = 51, 200 = 201). Сводная
+        # команда этого же слайса читает всю пачку за один заход (замер:
+        # 200 путей = 1 команда, 7.5 КБ при бюджете ~2 МБ, rc=0, stderr
+        # пуст), поэтому срезка перестала быть ценовой и осталась чистой
+        # ложью: замер 40 реальных конфигей - оператор видел 10 доменов.
+        info = find_files_info(checker, pattern, DOMAIN_CONFIG_LIMIT)
         if info['dirs'] or info['total'] is not None:
             checked = True
+        # Признание о срезке изымается ПО ПОЛЮ trunc_note, а не сравнением
+        # или поиском по тексту: разбор localized формулировки однажды
+        # разъезжается с самим текстом (закон 1.31.0). Ниже она пересказана
+        # на языке доменов.
+        trunc = info.get('trunc_note')
+        if trunc:
+            truncated = True
         for note in info['notes']:
+            if note == trunc:
+                continue
             if note not in notes:
                 notes.append(note)
         for config_file in info['paths']:
             if config_file not in configs:
                 configs.append(config_file)
+
+    # Слайс 1.32.0: срезка обязана быть названа на языке ДОМЕНОВ. Строка
+    # примитива говорит про ФАЙЛЫ («Показаны первые N файлов из M»), а этот
+    # отчёт печатает заголовок «Найдены домены: ...» - связку «файл -> домен»
+    # оператор не проходит и читает десять имён как полный список сайтов.
+    # Поэтому строку примитива здесь НЕ показываем (она про другой отчёт), а
+    # ставим свою, с числом прочитанных конфигей.
+    #
+    # total не суммируется: шаблоны панелей перекрываются (одни и те же файлы
+    # лежат в sites-enabled и в conf.d), и сумма total'ов соврала бы о
+    # масштабе. Называется то, что известно точно, - сколько конфигей
+    # прочитано и из них извлечены домены.
+    if truncated:
+        notes.append(DOMAIN_TRUNCATED_NOTE.format(shown=len(configs)))
 
     # Чтение конфигов — ОДИН вызов на весь прогон (1.29.0). Прежняя plain-
     # версия возвращала только список, поэтому «нет прав на конфиг» и «конфига

@@ -373,11 +373,17 @@ class TestGetDomainsReason:
         paths = ['/etc/nginx/conf.d/site%d.conf' % i for i in range(10)]
 
         class TenLocked(FakeSSH):
-            def run(self, cmd):
-                self.commands.append(cmd)
-                if 'grep' in cmd:
-                    return ('', 'grep: Permission denied', 2)
-                return super().run(cmd)
+            # ПЕРЕФОРМУЛИРОВАНО ОБЪЯВЛЕННО (слайс 1.32.0). Прежний перехват
+            # «если в команде есть grep — ответить одной ошибкой» был честен,
+            # пока чтение ходило по файлам. Как только пачка стала ОДНОЙ
+            # маркерной командой, он глушил её целиком: пустой stdout при
+            # непустом stderr — ответ, которого настоящая сводка не выдаёт
+            # НИКОГДА (printf печатает маркеры при любом rc). Продукт правомерно
+            # вернул «не проверено», а тест требовал «нет прав» и падал. Лечится
+            # не продукт, а язык двойника: моделируется ответ ВНУТРЕННЕГО grep
+            # на каждый путь, через общий хук раскрытия пачки (support.py).
+            def _batch_row(self, path):
+                return ('', 'grep: %s: Permission denied' % path, 2)
 
         c = TenLocked(routes=[('ls -1', '\n'.join(paths) + '\nFFCOUNT 10\n')])
         info = logs_mod.get_domains_info(c, 'none')
@@ -385,6 +391,129 @@ class TestGetDomainsReason:
         assert info['checked'] is True
         assert len(info['notes']) == 1
         assert 'прав' in info['notes'][0]
+
+
+# ========== СПИСОК ДОМЕНОВ НЕ ИМЕЕТ ПРАВА БЫТЬ ОБРЕЗАННЫМ МОЛЧА ==========
+class TestDomainListNotSilentlyTruncated:
+    """Главная ложь слайса 1.32.0 — измеренная, а не предположенная.
+
+    Замер живьём (настоящий /bin/bash этого хоста, 40 реальных файлов):
+
+        get_domains_info(...)  ->  в списке 10 доменов, на сервере их 40
+
+    Признание о срезке существовало, но говорило про ФАЙЛЫ («Показаны первые
+    10 файлов из 40: остальные в этом отчёте не участвовали»), а отчёт
+    печатает заголовок «Найдены домены: …». Связку «файл -> домен» оператор
+    не проходит: он читает заголовок как полный список и идёт искать
+    пропавший сайт по другому основанию.
+
+    Поднять лимит раньше было нельзя: чтение конфига стоило один SSH-раунд
+    (замер: 10 файлов = 11 команд, 50 = 51, 200 = 201). После сводной команды
+    этого же слайса пачка читается одной командой (замер: 200 путей = одна
+    команда, 7.5 КБ, rc=0, stderr пуст) — только тогда срезку и перестали
+    держать из-за цены.
+    """
+
+    @staticmethod
+    def _paths(n):
+        return ['/etc/nginx/conf.d/site%04d.conf' % i for i in range(n)]
+
+    class Readable(FakeSSH):
+        """Честный ответ системы: каждый конфиг читаем и несёт свой домен.
+
+        FakeSSH не исполняет awk, поэтому срезку по L двойник эмулирует САМ.
+        Без этого parse_find_answer получил бы все пути и total, равный их
+        числу: срезки не существовало бы вовсе, и тест признания стал бы
+        тривиально-зелёным (признание не родилось бы никогда).
+        """
+
+        LOGS_SEEN = ('FFDIR ok /var/log/nginx\nFFCOUNT 0\n')
+
+        def _answer(self, cmd):
+            # Логи — отдельным специфичным роутом (первое совпадение выигрывает):
+            # иначе каталог логов ответил бы списком конфигей, а проверка
+            # «признание о срезке дошло до отчёта» ловила бы вместо него
+            # заметку «Логи … не проверено» и стала бы тривиально-зелёной.
+            if '/var/log' in cmd:
+                return (self.LOGS_SEEN, '', 0)
+            if 'ls -1' in cmd and '-v L="' in cmd:
+                out, err, rc = super()._answer(cmd)
+                limit = int(cmd.partition('-v L="')[2].split('"', 1)[0])
+                found = [ln for ln in out.splitlines() if ln.startswith('/')]
+                kept = found[:limit] + ['FFCOUNT %d' % len(found)]
+                return '\n'.join(kept) + '\n', err, rc
+            return super()._answer(cmd)
+
+        def _batch_row(self, path):
+            # Ответ ВНУТРЕННЕГО grep (общий хук раскрытия пачки, support.py):
+            # двойник обязан говорить языком системы, а не удобным выводом.
+            return ('server_name %s;\n'
+                    % path.rsplit('/', 1)[-1].replace('.conf', '.tld'),
+                    '', 0)
+
+    def _checker(self, n):
+        return self.Readable(routes=[('ls -1', '\n'.join(self._paths(n)) +
+                                      '\nFFCOUNT %d\n' % n)])
+
+    def test_forty_configs_give_forty_domains_not_ten(self):
+        # Решающий тест: найденное нельзя терять. Система ответила на все 40
+        # конфигей — отчёт обязан называть 40 доменов, а не десять.
+        info = logs_mod.get_domains_info(self._checker(40), 'none')
+        assert len(info['domains']) == 40, (
+            'оператор видит %d доменов при 40 конфигей на сервере'
+            % len(info['domains']))
+        assert info['notes'] == [], (
+            'всё прочитано — признание о срезке выдумывать нельзя: %s'
+            % info['notes'])
+
+    def test_real_truncation_is_admitted_in_domain_language(self):
+        # Парк больше лимита — срезка легитимна, но обязана быть названа на
+        # языке ДОМЕНОВ: прежняя строка говорила про файлы, и оператор не
+        # соотносил её со списком доменов под заголовком «Найдены домены».
+        info = logs_mod.get_domains_info(self._checker(500), 'none')
+        assert 0 < len(info['domains']) < 500
+        assert len(info['notes']) == 1, (
+            'один пробел не имеет права быть назван дважды: %s' % info['notes'])
+        note = info['notes'][0]
+        assert 'домен' in note, (
+            'признание о срезке обязано говорить про домены: %r' % note)
+        assert 'не провер' in note, (
+            'срезанная часть не проверена — это обязано быть сказано: %r'
+            % note)
+
+    def test_price_does_not_grow_with_the_number_of_configs(self):
+        # Замок цены (закрыт сводной командой выше по файлу, это НЕ RED).
+        # Честность не имеет права дорожать линейно внутри самого поиска
+        # доменов, иначе поднятие лимита запрещено фактом цены — круг
+        # замкнётся (именно так и было до сводной команды).
+        small = self._checker(10)
+        logs_mod.get_domains_info(small, 'none')
+        big = self._checker(400)
+        logs_mod.get_domains_info(big, 'none')
+        assert len(big.commands) == len(small.commands), (
+            'поиск доменов дорожает с числом конфигей: %d против %d'
+            % (len(big.commands), len(small.commands)))
+
+    def test_truncation_note_needs_a_real_truncation(self):
+        # Инвертированный контроль: каталог просмотрен и пуст — «доменов нет»
+        # честно, признания о срезке быть не должно (закон серии: признание
+        # нужно только на пробел).
+        c = FakeSSH(routes=[('ls -1',
+                             'FFDIR ok /etc/nginx/conf.d\nFFCOUNT 0\n')])
+        info = logs_mod.get_domains_info(c, 'none')
+        assert info['domains'] == [] and info['checked'] is True
+        assert info['notes'] == []
+
+    def test_incomplete_list_is_told_in_the_report(self):
+        # Признание обязано доходить до оператора, а не жить только в dict:
+        # site_logs_report печатает заголовок «Найдены домены: …» и обязан
+        # сказать, что список неполный. Логи при этом ЗАКРЫТЫ ОТДЕЛЬНЫМ
+        # честным роутом (каталог просмотрен и пуст), поэтому фраза
+        # «не провер» во выводе может прийти только из признания о срезке.
+        out = logs_mod.site_logs_report(self._checker(500), 'none')
+        assert 'Найдены домены' in out
+        assert 'не провер' in out, (
+            'отчёт обрезал список доменов молча: %r' % out[:400])
 
 
 # ==================== ошибки в логах сайтов ====================

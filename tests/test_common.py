@@ -725,30 +725,35 @@ class TestDomainsFromConfigsAggregates:
 
     PATHS = ['/etc/nginx/conf.d/site%d.conf' % i for i in range(10)]
 
-    @staticmethod
-    @staticmethod
-    def _path_of(cmd):
-        # Путь из `grep -h 'server_name' '/etc/…/site0.conf' 2>&1` берётся
-        # shlex'ом. Наивный cmd.split("'")[1] вытаскивает НЕ путь, а слово
-        # server_name: кавычек в команде две, и первая пара — вокруг паттерна.
-        # Такой двойник молча кормит все десять файлов одним ответом, и тест
-        # «группы не сливаются» ничего не проверяет (проверено прогоном).
-        toks = shlex.split(cmd)
-        for tok in toks:
-            if tok.startswith('/'):
-                return tok
-        return '?'
+    def _checker(self, grep_answer, drop=()):
+        """Двойник НОВОЙ сводной команды (1.32.0) через общий механизм.
 
-    def _checker(self, grep_answer):
-        path_of = self._path_of
+        ПЕРЕФОРМУЛИРОВАНО ОБЪЯВЛЕННО (урок 1.27.0). Прежний двойник подменял
+        ответ на `grep -h <путь>`, потому что сводка ходила по файлам. Как
+        только чтение переводится на ОДНУ команду, старый двойник молчал бы на
+        ней, а молчание продукт обязан толковать как пробел: тесты «группы не
+        сливаются» зазеленели бы по НЕВЕРНОЙ причине. Язык двойника обязан
+        следовать за языком системы.
 
-        class Multi(FakeSSH):
-            def run(self, cmd):
-                self.commands.append(cmd)
-                if 'grep' in cmd:
-                    return grep_answer(path_of(cmd))
-                return super().run(cmd)
-        return Multi()
+        Раскрытие пачки (shell-семантика `set -- …; for f in "$@"` и сборка
+        printf-маркеров) живёт в ОДНОМ месте — tests/support.py. Прежняя
+        локальная копия протокола была бы вторым парсером: она обязана
+        разъехаться с настоящим форматом ровно тогда, когда начнёт что-то
+        значить (тот же закон, из-за которого разбор server_name вынесен в
+        domains_from_config_text одним местом).
+
+        Здесь остаётся только модель ответа внутреннего grep:
+        grep_answer(path) -> (out, err, rc), а drop — пути БЕЗ ответа (обрыв
+        сводной команды в середине: таймаут канала, чужая реализация).
+        """
+        to_drop = set(drop)
+
+        class Batch(FakeSSH):
+            def _batch_row(self, path):
+                if path in to_drop:
+                    return None
+                return grep_answer(path)
+        return Batch()
 
     def test_ten_locked_configs_give_one_note(self):
         c = self._checker(lambda p: ('', 'grep: %s: Permission denied' % p, 2))
@@ -803,10 +808,151 @@ class TestDomainsFromConfigsAggregates:
     def test_no_files_is_silence(self):
         assert common.domains_from_configs_info(FakeSSH(), []) == ([], [])
 
-    def test_price_is_one_command_per_config(self):
+    # ПЕРЕФОРМУЛИРОВАНО ОБЪЯВЛЕННО (слайс 1.32.0). Прежний тест звался
+    # test_price_is_one_command_per_config и ЗАПРЕТАЛ цену «одна команда на
+    # файл». Для своей версии он был честным, но именно он делал невозможным
+    # поднятие лимита: замер живьём, 200 реальных конфигей - 10 файлов = 11
+    # SSH-команд, 50 = 51, 200 = 201. Из-за этой цены get_domains_info держал
+    # limit=10 и докладывал 10 доменов при 40 на сервере, а оператор читал это
+    # как «доменов больше нет». Требование цены меняется на противоположное:
+    # ОДНА команда на всю пачку.
+    def test_price_is_one_command_for_the_whole_batch(self):
         c = self._checker(lambda p: ('server_name a.tld;', '', 0))
         common.domains_from_configs_info(c, self.PATHS)
-        assert len(c.commands) == len(self.PATHS)
+        assert len(c.commands) == 1, (
+            'чтение пачки стоит %d SSH-команд; при линейной цене лимит нельзя '
+            'поднять, поэтому оператор видит не весь список доменов'
+            % len(c.commands))
+
+    def test_dropped_batch_answer_is_admission_not_silence(self):
+        # Инвертированный контроль: сводная команда оборвалась и не вернула
+        # НИ ОДНОГО ответа. Молчание здесь запрещено: «доменов нет» при
+        # непустом запросе - это ложь (закон 1.19-1.31).
+        c = self._checker(lambda p: ('server_name a.tld;', '', 0),
+                          drop=tuple(self.PATHS))
+        domains, notes = common.domains_from_configs_info(c, self.PATHS)
+        assert domains == []
+        assert len(notes) == 1, 'пробел обязан быть назван ровно один раз'
+        assert 'не провер' in notes[0]
+
+    def test_partial_batch_answer_keeps_found_and_admits_the_rest(self):
+        # Найденное нельзя терять ради признания: ответы пришли на 6 путей из
+        # 10 - домены этих 6 обязаны остаться, а недостающие - быть названы
+        # одним признанием с числом (иначе оператор не узнает о масштабе).
+        lost = tuple(self.PATHS[6:])
+        c = self._checker(lambda p: ('server_name %s.tld;'
+                                     % p.rsplit('/', 1)[-1][:-5], '', 0),
+                          drop=lost)
+        domains, notes = common.domains_from_configs_info(c, self.PATHS)
+        assert len(domains) == 6, domains
+        assert len(notes) == 1 and '4' in notes[0], notes
+
+    def test_empty_request_does_not_ask_server(self):
+        # Цена тоже часть честности: при пустом списке сводка не имеет права
+        # слать команду «в никуда» (set -- без аргументов).
+        c = FakeSSH()
+        assert common.domains_from_configs_info(c, []) == ([], [])
+        assert c.commands == []
+
+
+# ============ СВОДКА ЧТЕНИЯ КОНФИГОВ: ОДНА КОМАНДА НА ПАЧКУ =================
+# Живой замер (слайс 1.32.0, фаза Reproduce): чтение N конфигов стоило N
+# SSH-раундов - domains_from_configs_info звал _domain_config_probe по одному
+# разу на каждый файл. Замер на настоящем /bin/bash этого хоста, 200 реальных
+# конфигей: limit=10 -> 11 команд, limit=50 -> 51, limit=200 -> 201.
+#
+# Отсюда следовала ГЛАВНАЯ ложь слайса (замер же): оператор видел 10 доменов
+# при 40 конфигах на сервере. Поднять лимит было нельзя - он умножал бы
+# SSH-заходы. Значит сначала удешевление: ОДНА команда с printf-маркерами и
+# отдельным rc на каждый ответ (тот же протокол, что заперт для стека и порта
+# панели в 1.31.0), и только потом лимит.
+#
+# Эталонный ответ СНИТ ЖИВЬЁМ с настоящими файлами (читаемый, закрытый 0000,
+# отсутствующий, каталог, rc=1 без server_name, путь с пробелом, путь с
+# кириллицей) - двойник обязан говорить языком системы, а не удобным выводом
+# (урок 1.27.0: роуты 'active\nactive' и '200\n000' описывали ответ, которого
+# настоящие команды не выдают никогда, и тесты проходили по НЕВЕРНОЙ причине).
+MARKER_PROBE_ANSWER = (
+    "@F 0\t/etc/conf.d/ok.conf\nserver_name alfa.example.com;\n"
+    "@F 0\t/etc/conf.d/ok2.conf\n    server_name bravo.tld www.example.com;\n"
+    "@F 1\t/etc/conf.d/nosn.conf\n\n"
+    "@F 2\t/etc/conf.d/locked.conf\ngrep: /etc/conf.d/locked.conf: "
+    "Permission denied\n"
+    "@F 2\t/etc/conf.d/netu.conf\ngrep: /etc/conf.d/netu.conf: No such file "
+    "or directory\n"
+    "@F 2\t/etc/conf.d/katalog.conf\ngrep: /etc/conf.d/katalog.conf: Is a "
+    "directory\n"
+    "@F 0\t/etc/conf.d/comment.conf\n#    server_name ghost.tld;\n"
+    "server_name real.tld; # comment.tld\n"
+    "@F 0\t/etc/conf.d/my site.conf\nserver_name space.tld;\n"
+)
+
+
+class TestDomainConfigsBatchProtocol:
+    PATHS = ['/etc/conf.d/site%d.conf' % i for i in range(5)]
+
+    def test_probe_command_is_one_round_and_keeps_rc_per_file(self):
+        cmd = common.domain_configs_probe_cmd(self.PATHS)
+        assert cmd.count('grep') == 1, 'grep обязан вызываться внутри цикла'
+        assert '2>/dev/null' not in cmd, 'причина пустоты снова в /dev/null'
+        assert '|' not in cmd, 'пайп забрал бы rc grep (урок 1.28.0)'
+        assert '${PIPESTATUS' not in cmd, 'под dash это Bad substitution'
+        assert 'r=$?' in cmd, 'rc обязан сниматься ДО printf (echo крадёт $?)'
+        assert '"$f"' in cmd, 'путь обязано кавычить: имена бывают с пробелом'
+        assert '@F' in cmd and 'printf' in cmd
+
+    def test_probe_command_quotes_paths(self):
+        cmd = common.domain_configs_probe_cmd(['/var/www/my site/a.conf'])
+        assert "'/var/www/my site/a.conf'" in cmd, cmd
+
+    def test_probe_answer_parser_keeps_rc_path_and_body(self):
+        got = common.parse_domain_probe_answer(MARKER_PROBE_ANSWER)
+        assert [(g['path'], g['rc']) for g in got] == [
+            ('/etc/conf.d/ok.conf', 0), ('/etc/conf.d/ok2.conf', 0),
+            ('/etc/conf.d/nosn.conf', 1), ('/etc/conf.d/locked.conf', 2),
+            ('/etc/conf.d/netu.conf', 2), ('/etc/conf.d/katalog.conf', 2),
+            ('/etc/conf.d/comment.conf', 0), ('/etc/conf.d/my site.conf', 0)]
+        assert got[3]['body'] == ('grep: /etc/conf.d/locked.conf: '
+                                  'Permission denied')
+        assert got[2]['body'] == '', 'rc=1 обязан прийти с пустым телом'
+
+    def test_batch_and_single_forms_agree_on_every_state(self):
+        # Решающий тест слайса: сводка не имеет права потерять НИ ОДНОГО
+        # различения, которое уже умела пофайловая форма. Сравниваются ДВЕ
+        # формы на одном микше состояний.
+        batch_rows = common.parse_domain_probe_answer(MARKER_PROBE_ANSWER)
+        via_batch = [common.classify_grep_probe(g['rc'], g['body'], g['path'])
+                     for g in batch_rows]
+        # Та же пачка пофайлово: каналы разделены (grep без 2>&1).
+        routes = []
+        for g in batch_rows:
+            if g['rc'] == 0:
+                routes.append((g['path'], (g['body'], '', 0)))
+            elif g['rc'] == 1:
+                routes.append((g['path'], ('', '', 1)))
+            else:
+                routes.append((g['path'], ('', g['body'], 2)))
+        c = FakeSSH(routes=routes)
+        via_single = [common._domain_config_probe(c, g['path'])
+                      for g in batch_rows]
+        assert [(x['kind'], x['why']) for x in via_batch] == \
+               [(x['kind'], x['why']) for x in via_single], \
+               'сводка потеряла различение: %s vs %s' % (via_batch, via_single)
+        kinds = [x['kind'] for x in via_batch]
+        assert kinds.count(None) == 5, kinds
+        assert kinds.count('unreadable') == 1
+        assert kinds.count('missing') == 1
+        assert kinds.count('isdir') == 1
+        assert sorted(common.classify_grep_probe(
+            0, 'server_name real.tld; # comment.tld', '')['domains']) == \
+            ['real.tld'], 'комментарий не имеет права стать доменом'
+
+    def test_truncated_batch_answer_is_not_read_as_silence(self):
+        # Обрыв канала (чужая реализация/таймаут): ни одного маркера. Вводить
+        # молчанием «доменов нет» нельзя - это пробел (закон 1.19-1.31).
+        assert common.parse_domain_probe_answer('') == []
+        assert common.parse_domain_probe_answer(
+            'server_name a.tld;\n') == []
 
 
 # ==================== СЛУЖЕБНЫЙ КАНАЛ: ПРАВА И УБОРКА СЕКРЕТОВ ====================

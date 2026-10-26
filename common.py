@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.31.0"
+__version__ = "1.32.0"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -38,6 +38,20 @@ LOG_PATHS = {
         'httpd_access': '/var/log/httpd/*access_log'
     }
 }
+
+# Сколько конфигей веб-сервера читаем на поиск доменов (слайс 1.32.0).
+#
+# Прежняя срезка была равна 10 и держалась ЦЕНОЙ: каждый конфиг читался
+# отдельным SSH-раундом (замер живьём: 10 файлов = 11 команд, 50 = 51,
+# 200 = 201). Сводная команда этого же слайса читает всю пачку за один
+# заход, и граница перестала быть ценовой: замер 200 путей - ОДНА команда,
+# 7.5 КБ при бюджете аргументов ~2 МБ, rc=0, stderr пуст.
+#
+# 200 - не «на вырвет»: это число, при котором срезка перестает быть ложью
+# для типового парка (замер: при 40 конфигей оператор видел 10 доменов).
+# Парк больше лимита легитимен, но обязан быть назван - см.
+# DOMAIN_TRUNCATED_NOTE.
+DOMAIN_CONFIG_LIMIT = 200
 
 DOMAIN_PATHS = {
     'fastpanel': [
@@ -358,10 +372,21 @@ def find_files_info(checker, pattern, limit=20):
         text = FF_DIR_TEXT.get(state)
         if text:
             notes.append(text.format(path=path, why=why))
+    trunc_note = None
     if total is not None and total > len(paths):
-        notes.append(f"⚠️ Показаны первые {len(paths)} файлов из {total}: "
-                     f"остальные в этом отчёте не участвовали")
-    return {'paths': paths, 'dirs': dirs, 'total': total, 'notes': notes}
+        trunc_note = (f"⚠️ Показаны первые {len(paths)} файлов из {total}: "
+                      f"остальные в этом отчёте не участвовали")
+        notes.append(trunc_note)
+    # trunc_note (1.32.0): та же строка ещё и отдельным полем. Нужно для
+    # потребителя, которому срезка мешает в чужих словах: get_domains_info
+    # пересказывает её на языке ДОМЕНОВ (отчёт печатает «Найдены домены», и
+    # «показаны первые 10 ФАЙЛОВ» под таким заголовком оператор не соотносит
+    # со списком). Изъять строку он обязан по этому полю, а не сравнением или
+    # поиском по тексту: разбор localized формулировки однажды разъезжается с
+    # самим текстом (закон 1.31.0, куплен на «состояние решается rc, а не
+    # словами»).
+    return {'paths': paths, 'dirs': dirs, 'total': total, 'notes': notes,
+            'trunc_note': trunc_note}
 
 
 def find_files(checker, pattern, limit=20):
@@ -564,6 +589,23 @@ DOMAIN_GAP_TEXT = {
 DOMAIN_UNCHECKED_NOTE = ("⚠️ Домены по {path} не определены — состояние не "
                          "проверено: «{why}». Это НЕ «доменов нет»")
 
+# Слайс 1.32.0. Главная ложь, измеренная живьём (40 реальных конфигей на
+# сервере, настоящая ФС): get_domains_info докладывал 10 доменов. Признание о
+# срезке существовало, но было подписано словом «файлы» («Показаны первые 10
+# файлов из 40»), а отчёт печатает заголовок «Найдены домены: …» — связку
+# «файл -> домен» оператор не проходит и читает заголовок как полный список.
+# Поэтому потребитель пересказывает срезку вот этой строкой, на языке доменов.
+#
+# Число total здесь НАМЕРЕННО не называется. find_files_info знает total по
+# ОДНОМУ шаблону, а get_domains_info идёт по списку шаблонов, которые у панелей
+# ПЕРЕКРЫВАЮТСЯ ('/etc/nginx/sites-enabled/*' и '/etc/nginx/conf.d/*.conf'
+# описывают одни и те же файлы): сложить total'ы — значит соврать о масштабе
+# (при трёх перекрывающихся шаблонах реальные 500 файлов дали бы 1500).
+# Называется то число, которое известно точно: сколько конфигей прочитано.
+DOMAIN_TRUNCATED_NOTE = (
+    "⚠️ Список доменов неполный: прочитаны {shown} конфигей веб-сервера, а "
+    "каталоги отдают больше — домены по непрочитанным конфигам не проверены")
+
 
 def domains_from_config_text(text):
     """Домены из строк `server_name ...;` — чистая функция, без I/O.
@@ -640,29 +682,42 @@ def _tidy_citation(text, path):
     return ' '.join(t.split())
 
 
-def _domain_config_probe(checker, config_path):
-    """Один конфиг → {'domains', 'kind', 'why'}; kind=None — молчать честно.
+def classify_grep_probe(rc, body, path, err=''):
+    """Один ответ grep → {'domains', 'kind', 'why'} — чистая функция.
 
-    kind: None (файл прочитан, вопрос закрыт) | 'unreadable' | 'missing' |
-    'isdir' | 'unchecked'. Разделение «пробел не закрыт» (kind=None) и
-    «пробел есть» (kind) — закон 1.19–1.28: признание нужно только там, где
-    отчёт иначе врёт.
+    Таблица состояний ОДНА на обе формы чтения конфигов: прежнюю пофайловую
+    (одна SSH-команда на файл) и новую сводную (одна команда на пачку,
+    domain_configs_probe_cmd). Иначе две формы однажды разъедутся — тот же
+    закон, из-за которого разбор `server_name` уже вынесен в
+    domains_from_config_text одним местом.
+
+    Состояние решается КОДОМ ВОЗВРАТА И КАНАЛОМ, а не текстом ответа
+    (закон 1.31.0: локализованная формулировка — не основание). Замер живьём на настоящем /bin/bash, реальные файлы:
+
+        rc=0 + непустой stdout   прочитан, есть совпадения   kind=None
+        rc=1 + пустой stderr     прочитан, server_name нет   kind=None
+        rc=2 + Permission denied закрыт 0000                 'unreadable'
+        rc=2 + No such file      конфига нет                 'missing'
+        rc=2 + Is a directory    путь — каталог              'isdir'
+
+    kind=None — «пробел не закрыт» (молчать честно), kind — «пробел есть»;
+    признание нужно только там, где отчёт иначе врёт (закон 1.19–1.28).
 
     'why' — ответ системы (цитируется, а не подменяется удобным диагнозом) с
     ВЫРЕЗАННЫМ путём. Путь печатается в каждом сообщении grep, и без вырезания
     десять закрытых файлов дали бы десять РАЗНЫХ ключей — сводка рассыпалась бы
-    на десять строк (замер живьём после первого GREEN этого слайса: 10 конфигов
-    0000 = 10 одинаковых признаний). Разные же ответы системы («memory
-    exhausted» против «input file is also the output») обязаны остаться
-    раздельными: это разные основания.
+    на десять строк (замер живьём: 10 конфигов 0000 = 10 одинаковых признаний).
+    Разные же ответы системы («memory exhausted» против «input file is also the
+    output») обязаны остаться раздельными: это разные основания.
+
+    'body' — stdout ответа, 'err' — stderr. Прежняя форма звала grep с `2>&1` и
+    получала всё в stdout; сводная форма тоже объединяет каналы (rc снимается
+    до печати). Поэтому 'err' необязателен, но если он есть — приоритет причины
+    у него, как было в одиночной форме.
     """
-    cmd = f"grep -h 'server_name' {q(config_path)} 2>&1"
-    out, err, rc = checker.run(cmd)
-    text_out = out or ''
-    text_err = err or ''
+    text_out = str(body or '')
+    text_err = str(err or '')
     low = (text_out + ' ' + text_err).lower()
-    why = next((line.strip() for line in (text_err or text_out).splitlines()
-                if line.strip()), '')[:200]
 
     if rc == 0:
         if text_out.strip():
@@ -684,8 +739,145 @@ def _domain_config_probe(checker, config_path):
         kind = 'isdir'
     elif 'no such file' in low:
         kind = 'missing'
-    key = _tidy_citation(why, config_path) or f'код возврата {rc}'
+    why = next((line.strip() for line in (text_err or text_out).splitlines()
+                if line.strip()), '')[:200]
+    key = _tidy_citation(why, path) or f'код возврата {rc}'
     return {'domains': [], 'kind': kind or 'unchecked', 'why': key}
+
+
+# Маркер одного ответа в сводной команде чтения конфигов. Формат строки:
+# '@F <rc><TAB><путь>' — путь печатается ПОСЛЕ rc и через TAB, потому что сам
+# путь может содержать пробелы ('/var/www/my site/a.conf' — панели кладут
+# каталоги и так) и даже кириллицу (замер живьём: оба случая разбираются).
+DOMAIN_PROBE_MARKER = '@F'
+
+
+def domain_configs_probe_cmd(config_paths):
+    """Одна команда на ВСЮ пачку конфигов: rc и ответ на каждый файл.
+
+    Зачем: прежнее чтение звало `_domain_config_probe` по одному разу на файл,
+    и цена честности росла линейно. Замер живьём на настоящем /bin/bash этого
+    хоста, 200 реальных конфигей: 10 файлов = 11 SSH-команд, 50 = 51, 200 =
+    201. Из-за этого же `get_domains_info` держал limit=10 и докладывал 10
+    доменов при 40 на сервере — оператор читал это как «доменов больше нет».
+    Поднять лимит, не удешевив чтение, означало бы умножить SSH-заходы.
+
+    Форма проверена живьём (замер этого слайса): `v=$(grep … 2>&1)` и `r=$?`
+    без промежуточного echo — иначе первая же печать крадёт $? и rc станет
+    нулём printf, а не grep'а (урок 1.31.0, куплен второй раз).
+
+    Пайпа нет ЦЕЛИКОМ: rc принадлежит последней команде пайпа, а не grep
+    (урок 1.28.0). `${PIPESTATUS}` не используем — под dash (обычный /bin/sh в
+    Debian/Ubuntu) это «Bad substitution» (замерено на прошлых слайсах).
+
+    `2>/dev/null` нет: в stderr лежит ровно та строка, где написана причина
+    пустоты («Permission denied» против «No such file or directory» —
+    противоположные лечения).
+
+    Пустой список путей безопасен: `set --` без аргументов, цикл молчит
+    (замер: вывод пуст, rc=0).
+    """
+    quoted = ' '.join(q(p) for p in (config_paths or []))
+    return (
+        f'set -- {quoted}; '
+        'for f in "$@"; do '
+        'v=$(grep -h \'server_name\' "$f" 2>&1); '
+        'r=$?; '
+        f'printf \'{DOMAIN_PROBE_MARKER} %s\\t%s\\n\' "$r" "$f"; '
+        'printf \'%s\\n\' "$v"; '
+        'done'
+    )
+
+
+def parse_domain_probe_answer(out):
+    """[{path, rc, body}] из ответа сводной команды; [] — ответа не было.
+
+    rc не разбирается / маркера нет — запись НЕ создаётся: выдумывать состояние
+    нельзя, а «ни одной записи при непустом запросе» обязано превратиться в
+    признание «не проверено» (это решает вызывающая сводка), а не в «доменов
+    нет». Молчание обрыва здесь не диагноз (закон 1.19–1.31).
+
+    Тело ответа — строки до следующего маркера; при rc=1 оно приходит пустым,
+    при rc=2 содержит сообщение системы («grep: …: Permission denied»).
+    """
+    rows = []
+    cur = None
+    buf = []
+    for line in str(out or '').splitlines():
+        if line.startswith(DOMAIN_PROBE_MARKER + ' '):
+            if cur is not None:
+                cur['body'] = '\n'.join(buf)
+                rows.append(cur)
+            cur = None
+            buf = []
+            rest = line[len(DOMAIN_PROBE_MARKER) + 1:]
+            head, sep, path = rest.partition('\t')
+            try:
+                rc = int(head.strip())
+            except ValueError:
+                continue          # битый маркер — не ответ системы
+            if not sep:
+                continue          # путь не пришёл: разбор невозможен
+            cur = {'path': path, 'rc': rc, 'body': ''}
+            continue
+        if cur is not None:
+            buf.append(line)
+    if cur is not None:
+        cur['body'] = '\n'.join(buf)
+        rows.append(cur)
+    return rows
+
+
+def _domain_config_probe(checker, config_path):
+    """Один конфиг → {'domains', 'kind', 'why'}; kind=None — молчать честно.
+
+    Слайс 1.32.0: состояние больше НЕ решается здесь — разбор живёт в
+    classify_grep_probe одним местом, чтобы сводная форма (одна команда на
+    пачку) не могла разъехаться с этой. Команда и её rc остались прежними,
+    поэтому запертые тесты одиночной формы продолжают ловить пайп и /dev/null.
+    """
+    cmd = f"grep -h 'server_name' {q(config_path)} 2>&1"
+    out, err, rc = checker.run(cmd)
+    return classify_grep_probe(rc, out, config_path, err)
+
+
+BATCH_MISSING_WHY = 'сводная команда сервера не вернула ответа на этот конфиг'
+
+
+def _config_probes(checker, paths):
+    """{путь: probe} на ВСЮ пачку — ОДНА SSH-команда (слайс 1.32.0).
+
+    Цена — причина, по которой существует эта функция: прежний цикл звал
+    `_domain_config_probe` на каждый файл, и честность дорожала линейно
+    (замер живьём, 200 реальных конфигей: 10 файлов = 11 SSH-команд,
+    50 = 51, 200 = 201). Из-за этой же цены `get_domains_info` держал
+    limit=10 и докладывал 10 доменов при 40 на сервере.
+
+    Один путь остаётся на одиночной форме: её заперли тесты 1.29.0 (цена
+    «одна команда», отсутствие пайпа и `2>/dev/null`) и она привычна
+    оператору; вторая команда на тот же файл была бы лишним заходом.
+
+    Ответа на путь нет (обрыв канала, таймаут, чужая реализация) — probe
+    получает kind='unchecked': молчать нельзя, «доменов нет» при непустом
+    запросе — ложь (закон 1.19–1.31). Причина тут же цитируется у системы,
+    если она что-то ответила в stderr; выдумывать ответ мы не имеем права.
+    """
+    if len(paths) == 1:
+        return {paths[0]: _domain_config_probe(checker, paths[0])}
+
+    out, err, _rc = checker.run(domain_configs_probe_cmd(paths))
+    probes = {}
+    for row in parse_domain_probe_answer(out):
+        probes.setdefault(row['path'],
+                          classify_grep_probe(row['rc'], row['body'],
+                                              row['path']))
+    missing = [p for p in paths if p not in probes]
+    if missing:
+        why = next((line.strip() for line in (err or '').splitlines()
+                    if line.strip()), '')[:160] or BATCH_MISSING_WHY
+        for path in missing:
+            probes[path] = {'domains': [], 'kind': 'unchecked', 'why': why}
+    return probes
 
 
 def domains_from_configs_info(checker, config_paths):
@@ -712,11 +904,17 @@ def domains_from_configs_info(checker, config_paths):
     Найденное при этом не теряется: 9 прочитанных + 1 закрытый дают 9 доменов
     и одну заметку, а не «доменов нет».
     """
+    paths = [str(p) for p in (config_paths or [])]
+    if not paths:
+        # Ни одного конфига: спрашивать нечего, молчание честно (признание на
+        # пустой запрос было бы выдуманным пробелом).
+        return [], []
+    probes = _config_probes(checker, paths)
     domains = []
     groups = {}
     order = []
-    for path in (config_paths or []):
-        probe = _domain_config_probe(checker, path)
+    for path in paths:
+        probe = probes[path]
         domains.extend(probe['domains'])
         if probe['kind'] is None:
             continue
@@ -725,7 +923,7 @@ def domains_from_configs_info(checker, config_paths):
             groups[key] = {'kind': probe['kind'], 'why': probe['why'],
                            'paths': []}
             order.append(key)
-        groups[key]['paths'].append(str(path))
+        groups[key]['paths'].append(path)
 
     notes = []
     for key in order:
