@@ -2,7 +2,13 @@
 import re
 import socket
 
-from common import q, create_backup, write_remote_file
+from common import (q, create_backup, write_remote_file,
+                    # Состояние резолвера спрашивает ОДНА функция
+                    # (1.32.6-1.32.7): пустой stdout systemctl —
+                    # «система не ответила», а не «не активно», и
+                    # решать по нему нельзя нигде и ни в какой
+                    # форме, здесь особенно: ветка пишет файл.
+                    unit_status_info)
 
 
 # ==================== DNS ФУНКЦИИ ====================
@@ -160,8 +166,22 @@ def set_dns_resolvers(checker, nameservers):
         lines.append("❌ Не передано ни одного корректного DNS-адреса.")
         return "\n".join(lines)
 
-    out, _, _ = checker.run('systemctl is-active systemd-resolved 2>/dev/null')
-    if out.strip() != 'active':
+    resolved = unit_status_info(checker, 'systemd-resolved')
+    if resolved['status'] is None:
+        # Молчание systemctl — это «мы не спросили», а не «не активно».
+        # Прежний код решал по «!= active» и на пустом ответе выбирал
+        # ветку записи: делал резервную копию и перезаписывал
+        # /etc/resolv.conf. Замер живьём (хост без systemd, bus мёртв):
+        # ЛЮБОЙ is-active отвечает пустым stdout при rc=1, причина живёт в
+        # stderr — а её как раз и глушил 2>/dev/null. Под управлением
+        # живого resolved /etc/resolv.conf — симлинк на stub-файл, поэтому
+        # запись по непроверенному признаку ломает резолвинг машины.
+        # Опасное действие не совершается: ни cp, ни запись.
+        lines.append('⚠️ Состояние systemd-resolved не проверено — резолверы не меняем.')
+        lines.append(resolved['note'])
+        return "\n".join(lines)
+
+    if resolved['status'] != 'active':
         lines.append("systemd-resolved не активен. Редактируем /etc/resolv.conf напрямую.")
         backup_path = create_backup(checker, '/etc/resolv.conf', 'dns')
         if backup_path:

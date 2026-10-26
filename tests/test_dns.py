@@ -150,6 +150,66 @@ BACKUP_ROUTES = [
 ]
 
 
+class TestSetResolversUnchecked:
+    """Молчание systemctl не даёт права переписывать /etc/resolv.conf.
+
+    Прежняя ветка решала по «!= active». Пустой ответ systemctl (хост без
+    systemd, мёртвый bus, обрыв канала) попадал в ту же ветку, что и честное
+    «inactive», — и инструмент делал резервную копию и перезаписывал
+    /etc/resolv.conf. Это самый опасный случай серии 1.32.6: там молчание лишь
+    врало в отчёте, здесь оно совершает запись. На хосте с живым resolved этот
+    файл — симлинк на /run/systemd/resolve/stub-resolv.conf, и запись по нему
+    портит управление резолвингом на боевой машине.
+
+    Замер живьём (хост без systemd, каталог /run/systemd/system отсутствует):
+    ЛЮБОЙ `systemctl is-active ЮНИТ` отвечает пустым stdout при rc=1, причина
+    («System has not been booted with systemd as init system (PID 1). Can't
+    operate.») живёт в stderr — тот канал и глушил 2>/dev/null.
+    """
+
+    NO_SYSTEMD = ('', 'System has not been booted with systemd as init '
+                      "system (PID 1). Can't operate.", 1)
+
+    def _checker(self):
+        client = FakeSftpClient()
+        c = FakeSSH(routes=BACKUP_ROUTES + [
+            ('is-active systemd-resolved', self.NO_SYSTEMD),
+            # Именно stub-адрес: так выглядит файл под управлением resolved.
+            ('cat /etc/resolv.conf', 'nameserver 127.0.0.53\n'),
+        ], client=client)
+        return c, client
+
+    def test_silence_does_not_write_resolv_conf(self):
+        c, client = self._checker()
+        out = dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
+        assert client.store == {}, \
+            'запись по непроверенному признаку: %r' % (client.store,)
+        assert 'обновлён' not in out, out
+
+    def test_silence_does_not_back_up_or_touch_filesystem(self):
+        # Резервная копия — это тоже запись (cp), и её наличие значит, что
+        # инструмент уже ВЫБРАЛ ветку «правим resolv.conf». Выбора не было:
+        # система ничего не ответила.
+        c, _ = self._checker()
+        dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
+        assert c.find('cp /etc/resolv.conf') is None, 'cp был запущен'
+
+    def test_silence_is_named_as_unchecked_with_the_reason(self):
+        c, _ = self._checker()
+        out = dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
+        assert 'не проверено' in out, out
+        assert 'systemd' in out, 'причина обязана доехать до оператора'
+
+    def test_channels_are_not_blinded(self):
+        # Замок на форму команды: 2>/dev/null прячет причину отказа, а
+        # признак обязан различать «ответили inactive» и «не ответили».
+        c, _ = self._checker()
+        dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
+        cmd = c.find('is-active')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd and '2>&1' not in cmd, cmd
+
+
 class TestSetResolversPlain:
     """Сценарий без systemd-resolved: правим /etc/resolv.conf напрямую."""
 
