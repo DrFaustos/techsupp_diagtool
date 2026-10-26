@@ -498,29 +498,315 @@ class TestReadAnswerIsByteExact:
 
 
 class TestGetDomainFromConfig:
-    RAW = ('server {\n'
-           '    server_name example.com www.example.com;\n'
-           '}\n')
+    # Двойник обязан говорить ЯЗЫКОМ СИСТЕМЫ (урок 1.27.0). Прежний роут
+    # ('grep -h', 'example.com') описывал ответ, которого grep не выдаёт
+    # никогда: grep печатает СТРОКУ КОНФИГА ЦЕЛИКОМ, а уже извлечённое имя
+    # домена производил пайп sed/tr/grep. Пока двойник врал, пайп можно было
+    # чинить сколько угодно — тесты остались бы зелёными над мёртвой логикой.
+    GREP_OK = '    server_name example.com www.example.com;\n'
 
     def test_extracts_domains(self):
-        c = FakeSSH(routes=[('grep -h', 'example.com\nwww.example.com\n')])
+        c = FakeSSH(routes=[('grep -h', self.GREP_OK)])
         assert sorted(common.get_domain_from_config(c, '/etc/nginx/vhosts/x')) == \
             ['example.com', 'www.example.com']
 
     def test_filters_wildcards_placeholders(self):
-        out = 'example.com\n*.example.com\n_\nlocalhost\ndefault_server\nнет-точки\n'
-        c = FakeSSH(routes=[('grep -h', out)])
-        assert common.get_domain_from_config(c, '/etc/nginx/vhosts/x') == ['example.com']
+        # Ответ grep — директива целиком; фильтр обязан отсечь то же, что
+        # отсекал прежний пайп.
+        c = FakeSSH(routes=[('grep -h',
+                             'server_name example.com *.example.com _ '
+                             'localhost default_server нет-точки;\n')])
+        assert common.get_domain_from_config(c, '/etc/nginx/vhosts/x') == \
+            ['example.com']
 
     def test_empty_when_no_server_name(self):
-        c = FakeSSH(routes=[('grep -h', '')])
+        # Честный ответ grep «файл прочитан, совпадений нет»: rc=1 + пустой
+        # вывод. Именно его прежний код не умел отличить от «нет прав».
+        c = FakeSSH(routes=[('grep -h', ('', '', 1))])
         assert common.get_domain_from_config(c, '/etc/nginx/vhosts/x') == []
 
     def test_config_path_quoted(self):
-        c = FakeSSH(routes=[('grep -h', '')])
+        c = FakeSSH(routes=[('grep -h', ('', '', 1))])
         common.get_domain_from_config(c, '/etc/nginx/vhosts/we; rm -rf /')
         cmd = c.find('grep -h')
         assert "'/etc/nginx/vhosts/we; rm -rf /'" in cmd
+
+
+# ==================== ПАРСЕР server_name: прежний sed врал содержимым ========
+class TestServerNamesParsing:
+    """Чистая функция: без I/O, поэтому каждая ловушка — один короткий кейс.
+
+    Все «ЛОЖЬ» ниже — не догадка, а прямой замер прежней команды на настоящих
+    файлах (uid=1000, /bin/bash):
+
+        '#    server_name uhatil.tld;'          -> ['uhatil.tld']
+        '   # server_name staryj.tld;'          -> ['staryj.tld']
+        'server_names_hash_bucket_size 128.0;'  -> ['128.0']
+        'server_name hodovyj.tld; # ... ljevoj' -> ['ljevoj.tld']  <<< настоящий
+                                                                      домен ПОТЕРЯН
+
+    Формально это не «нет прав», а «есть лишние домены»: по выдуманным именам
+    check_site_logs ищет /var/log/nginx/<выдумка>.error.log и рапортует о
+    домене, которого на сервере нет.
+    """
+
+    @staticmethod
+    def parse(text):
+        return sorted(common.domains_from_config_text(text))
+
+    def test_plain_directive(self):
+        assert self.parse('server_name zhivoy.tld;') == ['zhivoy.tld']
+
+    def test_tab_separated_directive(self):
+        assert self.parse('\t\tserver_name\t\ttabovij.tld;\t') == ['tabovij.tld']
+
+    def test_several_domains_on_one_line(self):
+        assert self.parse('server_name a.tld b.tld c.tld;') == \
+            ['a.tld', 'b.tld', 'c.tld']
+
+    def test_several_directive_lines(self):
+        assert self.parse('server_name a.tld;\nserver_name b.tld;\n') == \
+            ['a.tld', 'b.tld']
+
+    def test_commented_line_is_not_a_domain(self):
+        assert self.parse('#    server_name uhatil.tld;') == []
+
+    def test_indented_comment_is_not_a_domain(self):
+        assert self.parse('    # server_name staryj.tld;') == []
+
+    def test_trailing_comment_neither_adds_nor_replaces(self):
+        # Прежний sed (жадный `.*server_name`) брал ПОСЛЕДНИЙ server_name в
+        # строке: отчёт терял настоящий домен и называл выдуманный.
+        got = self.parse('server_name hodovyj.tld; # server_name ljevoj.tld;')
+        assert got == ['hodovyj.tld']
+
+    def test_similar_directive_is_not_a_domain(self):
+        # 'server_names_hash_bucket_size' начинается на 'server_name', но
+        # директивой server_name не является: прежний sed доставал из неё
+        # '128.0', и инвентарь доменов получал домен «128.0».
+        assert self.parse('server_names_hash_bucket_size 128.0;') == []
+
+    def test_wildcard_placeholder_and_localhost_filtered(self):
+        assert self.parse('server_name *.a.tld _ localhost default_server '
+                          'bezy-tochki zhivoy.tld;') == ['zhivoy.tld']
+
+    def test_dedup_keeps_every_real_domain(self):
+        got = common.domains_from_config_text('server_name b.tld a.tld b.tld;')
+        assert sorted(got) == ['a.tld', 'b.tld']
+
+    def test_value_without_semicolon_is_still_a_domain(self):
+        # Слегка побитый конфиг: домен всё равно есть, молчать хуже, чем
+        # назвать его (прежний sed на этом кейсе молчал).
+        assert self.parse('server_name bez-zap-toy.tld') == ['bez-zap-toy.tld']
+
+
+# ==================== Чем объяснена пустота: rc=2 принадлежит grep'у ========
+class TestGetDomainFromConfigExplainsGaps:
+    """Три rc grep'а без пайпа = три разных ответа оператору.
+
+    Замер живьём (этот хост, uid=1000), `grep -h 'server_name' ПУТЬ 2>&1`:
+
+        читаемый, домены есть     rc=0 'server_name example.com www.example.com;'
+        прочитан, server_name нет rc=1 ''
+        ЗАКРЫТ 0000               rc=2 'grep: ...: Permission denied'
+        ОТСУТСТВУЕТ               rc=2 'grep: ...: No such file or directory'
+        КАТАЛОГ                   rc=2 'grep: ...: Is a directory'
+
+    Прежний пайп (`grep ... 2>/dev/null | sed ... | tr ... | grep -v ...`)
+    отдавал rc ПОСЛЕДНЕЙ команды — то есть 0/1 по результату фильтра, — и на
+    всех пяти состояниях про права не говорил НИКОГДА, а `2>/dev/null`
+    выбрасывал единственную строку, где причина написана. Это тот же закон,
+    что куплен в 1.28.0 на systemctl: пайп обнуляет rc владельца команды.
+    """
+
+    GREP_OK = '    server_name example.com www.example.com;\n'
+    LOCKED = ('', 'grep: /etc/nginx/vhosts/x: Permission denied', 2)
+    GONE = ('', 'grep: /etc/nginx/vhosts/x: No such file or directory', 2)
+    ADIR = ('', 'grep: /etc/nginx/vhosts/x: Is a directory', 2)
+
+    def test_found_config_makes_no_complaint(self):
+        c = FakeSSH(routes=[('grep -h', self.GREP_OK)])
+        domains, notes = common.get_domain_from_config_info(c, '/etc/nginx/vhosts/x')
+        assert sorted(domains) == ['example.com', 'www.example.com']
+        assert notes == []
+
+    def test_read_without_server_name_is_honest_silence(self):
+        # «Файл прочитан, совпадений нет» — ответ системы, а не пробел:
+        # признание обесценило бы настоящие (тот же закон, что для пустого
+        # прочитанного каталога логов в 1.24-1.28).
+        c = FakeSSH(routes=[('grep -h', ('', '', 1))])
+        domains, notes = common.get_domain_from_config_info(c, '/etc/nginx/vhosts/x')
+        assert domains == [] and notes == []
+
+    def test_locked_config_is_not_reported_as_no_domains(self):
+        c = FakeSSH(routes=[('grep -h', self.LOCKED)])
+        domains, notes = common.get_domain_from_config_info(c, '/etc/nginx/vhosts/x')
+        assert domains == []
+        assert notes and 'прав' in notes[0]
+        assert 'нет на сервере' not in notes[0]
+
+    def test_missing_config_says_absent_and_names_the_path(self):
+        c = FakeSSH(routes=[('grep -h', self.GONE)])
+        domains, notes = common.get_domain_from_config_info(c, '/etc/nginx/vhosts/x')
+        assert domains == []
+        assert notes and 'нет на сервере' in notes[0]
+        assert '/etc/nginx/vhosts/x' in notes[0]
+        assert 'прав' not in notes[0]
+
+    def test_directory_is_not_a_config(self):
+        c = FakeSSH(routes=[('grep -h', self.ADIR)])
+        domains, notes = common.get_domain_from_config_info(c, '/etc/nginx/vhosts/x')
+        assert domains == []
+        assert notes and 'каталог' in notes[0]
+
+    def test_system_answer_is_quoted_without_a_hole(self):
+        # Живой контроль первого GREEN (настоящий /bin/bash) показал калеку:
+        # путь вырезан из сообщения grep, а дыра по шву осталась —
+        # «(grep:: Permission denied)». Цитата — единственное, что оператор
+        # читает как доказательство; её режут по шву, а не по живому.
+        c = FakeSSH(routes=[('grep -h', self.LOCKED)])
+        _d, notes = common.get_domain_from_config_info(c, '/etc/nginx/vhosts/x')
+        assert notes and 'grep: Permission denied' in notes[0]
+        assert '::' not in notes[0], 'дыра по шву вырезания пути'
+        assert ' : ' not in notes[0], 'дыра по шву вырезания пути'
+
+    def test_unknown_grep_failure_is_unchecked_and_quoted(self):
+        # Ответ системы цитируется, а не превращается в удобный диагноз.
+        c = FakeSSH(routes=[('grep -h', ('', 'grep: memory exhausted', 2))])
+        domains, notes = common.get_domain_from_config_info(c, '/etc/nginx/vhosts/x')
+        assert domains == []
+        assert notes and 'не проверено' in notes[0]
+        assert 'memory exhausted' in notes[0]
+
+    def test_silent_server_is_not_reported_as_no_domains(self):
+        # rc=0 с пустым выводом grep не бывает (rc=0 обязан совпадением):
+        # это обрыв ответа, а не «server_name нет».
+        domains, notes = common.get_domain_from_config_info(FakeSSH(), '/etc/nginx/x')
+        assert domains == []
+        assert notes and 'не проверено' in notes[0]
+
+    def test_command_leaves_rc_with_grep(self):
+        c = FakeSSH()
+        common.get_domain_from_config(c, '/etc/nginx/x')
+        cmd = c.find('grep -h')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd, 'причина пустоты снова в /dev/null'
+        assert '2>&1' in cmd
+        # Пайп обязан исчезнуть ЦЕЛИКОМ: rc принадлежит последней команде
+        # пайпа, а не grep (урок 1.28.0, закуплен второй раз).
+        for part in ('| sed', '| tr', '| grep'):
+            assert part not in cmd, f'в команде остался пайп {part!r}'
+
+    def test_price_is_one_command(self):
+        # Честность не должна стоить SSH-заходов: прежний пайп был ОДНОЙ
+        # командой, новая grep-форма — тоже одна.
+        c = FakeSSH(routes=[('grep -h', self.GREP_OK)])
+        common.get_domain_from_config(c, '/etc/nginx/a.conf')
+        assert len(c.commands) == 1
+
+    def test_wrapper_keeps_plain_list(self):
+        # Совместимость: публичная форма по-прежнему отдаёт только список.
+        c = FakeSSH(routes=[('grep -h', self.GREP_OK)])
+        assert sorted(common.get_domain_from_config(c, '/etc/nginx/x')) == \
+            ['example.com', 'www.example.com']
+        c2 = FakeSSH(routes=[('grep -h', self.LOCKED)])
+        assert common.get_domain_from_config(c2, '/etc/nginx/x') == []
+
+
+# ==================== АГРЕГАЦИЯ: 10 закрытых конфигов ≠ 10 признаний ========
+class TestDomainsFromConfigsAggregates:
+    """Одно признание на ПРИЧИНУ, а не на файл (закон 1.24–1.28).
+
+    Замер живьём после первого GREEN этого слайса: десять конфигов с правами
+    0000 давали ДЕСЯТЬ одинаковых строк в get_domains_info()['notes']. Отчёт
+    тонул в признании, а признание, которого десять, оператор перестаёт читать
+    — тот же дефект, что лечился «одним признанием на прогон» в 1.28.0.
+    """
+
+    PATHS = ['/etc/nginx/conf.d/site%d.conf' % i for i in range(10)]
+
+    @staticmethod
+    @staticmethod
+    def _path_of(cmd):
+        # Путь из `grep -h 'server_name' '/etc/…/site0.conf' 2>&1` берётся
+        # shlex'ом. Наивный cmd.split("'")[1] вытаскивает НЕ путь, а слово
+        # server_name: кавычек в команде две, и первая пара — вокруг паттерна.
+        # Такой двойник молча кормит все десять файлов одним ответом, и тест
+        # «группы не сливаются» ничего не проверяет (проверено прогоном).
+        toks = shlex.split(cmd)
+        for tok in toks:
+            if tok.startswith('/'):
+                return tok
+        return '?'
+
+    def _checker(self, grep_answer):
+        path_of = self._path_of
+
+        class Multi(FakeSSH):
+            def run(self, cmd):
+                self.commands.append(cmd)
+                if 'grep' in cmd:
+                    return grep_answer(path_of(cmd))
+                return super().run(cmd)
+        return Multi()
+
+    def test_ten_locked_configs_give_one_note(self):
+        c = self._checker(lambda p: ('', 'grep: %s: Permission denied' % p, 2))
+        domains, notes = common.domains_from_configs_info(c, self.PATHS)
+        assert domains == []
+        assert len(notes) == 1, 'отчёт тонет: %d одинаковых признаний' % len(notes)
+        assert 'прав' in notes[0]
+        assert '10' in notes[0], 'сводка обязана назвать число файлов'
+        assert 'site0.conf' in notes[0], 'сводка обязана дать пример пути'
+
+    def test_missing_files_are_not_mixed_with_permission_denied(self):
+        # Противоположные лечения (поднимать права против менять раскладку
+        # панели) не имеют права сливаться в одно признание.
+        def answer(p):
+            if p.endswith('site0.conf'):
+                return ('', 'grep: %s: Permission denied' % p, 2)
+            return ('', 'grep: %s: No such file or directory' % p, 2)
+
+        c = self._checker(answer)
+        domains, notes = common.domains_from_configs_info(c, self.PATHS)
+        assert domains == []
+        assert len(notes) == 2
+        assert any('прав' in n and 'нет на сервере' not in n for n in notes)
+        assert any('нет на сервере' in n for n in notes)
+
+    def test_different_system_answers_do_not_merge(self):
+        # Разные ответы системы — разные основания: схлопнуть их значит
+        # соврать про причину (ответ системы цитируется, а не подменяется).
+        def answer(p):
+            if p.endswith('site0.conf'):
+                return ('', 'grep: memory exhausted', 2)
+            return ('', 'grep: input file is also the output', 2)
+
+        c = self._checker(answer)
+        _domains, notes = common.domains_from_configs_info(c, self.PATHS)
+        assert len(notes) == 2
+
+    def test_readable_configs_stay_silent_and_keep_domains(self):
+        # Найденное нельзя терять ради признания, а признание нельзя
+        # превращать в шум: 9 прочитанных + 1 закрытый = 9 доменов и 1 строка.
+        def answer(p):
+            if p.endswith('site3.conf'):
+                return ('', 'grep: %s: Permission denied' % p, 2)
+            return ('server_name %s;\n'
+                    % p.rsplit('/', 1)[-1].replace('.conf', '.tld'), '', 0)
+
+        c = self._checker(answer)
+        domains, notes = common.domains_from_configs_info(c, self.PATHS)
+        assert len(domains) == 9
+        assert len(notes) == 1 and 'site3.conf' in notes[0]
+
+    def test_no_files_is_silence(self):
+        assert common.domains_from_configs_info(FakeSSH(), []) == ([], [])
+
+    def test_price_is_one_command_per_config(self):
+        c = self._checker(lambda p: ('server_name a.tld;', '', 0))
+        common.domains_from_configs_info(c, self.PATHS)
+        assert len(c.commands) == len(self.PATHS)
 
 
 # ==================== СЛУЖЕБНЫЙ КАНАЛ: ПРАВА И УБОРКА СЕКРЕТОВ ====================

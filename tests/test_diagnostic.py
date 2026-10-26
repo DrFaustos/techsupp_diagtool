@@ -407,7 +407,7 @@ class TestFManager:
 
     def test_filemode_garbage_is_safe(self):
         # st_mode у части записей приходит None/мусором: stat.filemode бросает
-        # TypeError, а таблицаlist_dir не имеет права падать на одной записи
+        # TypeError, а таблица list_dir не имеет права падать на одной записи
         assert fm._filemode(None) == '?'
         assert fm._filemode('abc') == '?'
         assert fm._filemode(0o100644) == '-rw-r--r--'

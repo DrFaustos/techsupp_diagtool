@@ -280,12 +280,12 @@ class TestGetDomains:
 
     def test_ispmanager_falls_back_to_configs(self):
         c = FakeSSH(routes=[('mgrctl', ''), ('ls -1', '/etc/nginx/vhosts/example\n'),
-                            ('grep -h', 'example.com\n')])
+                            ('grep -h', 'server_name example.com;\n')])
         assert logs_mod.get_domains(c, 'ispmanager') == ['example.com']
 
     def test_plain_nginx_configs(self):
         c = FakeSSH(routes=[('ls -1', '/etc/nginx/sites-enabled/example\n'),
-                            ('grep -h', 'example.com\nwww.example.com\n')])
+                            ('grep -h', 'server_name example.com www.example.com;\n')])
         assert sorted(logs_mod.get_domains(c, 'none')) == ['example.com', 'www.example.com']
 
     def test_empty_when_nothing_found(self):
@@ -324,11 +324,33 @@ class TestGetDomainsReason:
         info = logs_mod.get_domains_info(FakeSSH(), 'none')
         assert info['domains'] == [] and info['checked'] is False
 
+    # ПЕРЕФОРМУЛИРОВАНО ОБЪЯВЛЕННО (урок 1.27.0): прежний роут
+    # ('grep -h', 'example.com') описывал ответ, которого grep не выдаёт
+    # никогда, — grep печатает СТРОКУ КОНФИГА ЦЕЛИКОМ, а имя домена извлекал
+    # sed-пайп. Двойник отвечал «уже готовым доменом», поэтому под зелёными
+    # тестами нельзя было ни починить пайп, ни заметить, что он теряет причины
+    # пустоты. Язык системы восстановлен.
     def test_get_domains_stays_compatible(self):
         # Совместимость: публичная форма продолжает возвращать список доменов.
         c = FakeSSH(routes=[('ls -1', '/etc/nginx/sites-enabled/example\nFFCOUNT 1\n'),
-                            ('grep -h', 'example.com\n')])
+                            ('grep -h', 'server_name example.com;\n')])
         assert logs_mod.get_domains(c, 'none') == ['example.com']
+
+    def test_unreadable_config_reaches_domains_info(self):
+        # Решающий случай слайса: каталог просмотрен, конфиг НАЙДЕН, но его
+        # содержимое не прочитано. Прежний get_domains_info звал plain-форму
+        # (только список) и докладывал «доменов нет» — оператор шёл менять
+        # раскладку панели вместо того, чтобы поднимать права.
+        c = FakeSSH(routes=[
+            ('ls -1', '/etc/nginx/conf.d/site.conf\nFFCOUNT 1\n'),
+            ('grep -h', ('', 'grep: /etc/nginx/conf.d/site.conf: '
+                             'Permission denied', 2)),
+        ])
+        info = logs_mod.get_domains_info(c, 'none')
+        assert info['domains'] == []
+        assert info['checked'] is True
+        assert any('прав' in n for n in info['notes'])
+        assert 'нет на сервере' not in ''.join(info['notes'])
 
     def test_mgrctl_silence_is_told_not_hidden(self):
         # Панельный источник молчит (mgrctl нет/упал) — это надо сказать: иначе
@@ -343,6 +365,27 @@ class TestGetDomainsReason:
         assert c.find('mgrctl') is not None
         assert '2>/dev/null' not in c.find('mgrctl')
 
+    def test_ten_locked_configs_do_not_drown_the_report(self):
+        # Решающий случай второй половины слайса. Первый GREEN донёс причину
+        # до оператора — но ДЕСЯТЬЮ строками: по одной на каждый закрытый
+        # конфиг (замер живьём). Признание, которого десять, обесценивается,
+        # поэтому сводка обязана быть одна и назвать число файлов.
+        paths = ['/etc/nginx/conf.d/site%d.conf' % i for i in range(10)]
+
+        class TenLocked(FakeSSH):
+            def run(self, cmd):
+                self.commands.append(cmd)
+                if 'grep' in cmd:
+                    return ('', 'grep: Permission denied', 2)
+                return super().run(cmd)
+
+        c = TenLocked(routes=[('ls -1', '\n'.join(paths) + '\nFFCOUNT 10\n')])
+        info = logs_mod.get_domains_info(c, 'none')
+        assert info['domains'] == []
+        assert info['checked'] is True
+        assert len(info['notes']) == 1
+        assert 'прав' in info['notes'][0]
+
 
 # ==================== ошибки в логах сайтов ====================
 class TestSiteLogs:
@@ -351,7 +394,7 @@ class TestSiteLogs:
 
     def test_collects_error_lines_per_domain(self):
         c = FakeSSH(routes=[('ls -1', '/var/log/nginx/example.com.error.log\n'),
-                            ('grep -h', 'example.com\n'),
+                            ('grep -h', 'server_name example.com;\n'),
                             ('cat ', self.LOGS)])
         res = logs_mod.check_site_logs(c, 'none', ['example.com'])
         assert 'example.com' in res
@@ -365,7 +408,7 @@ class TestSiteLogs:
 
     def test_report_with_domains(self):
         c = FakeSSH(routes=[('ls -1', '/var/log/nginx/example.com.error.log\n'),
-                            ('grep -h', 'example.com\n'),
+                            ('grep -h', 'server_name example.com;\n'),
                             ('cat ', self.LOGS)])
         out = logs_mod.site_logs_report(c, 'none')
         assert 'Найдены домены: example.com' in out
@@ -394,7 +437,7 @@ class TestSiteLogs:
     def test_report_when_logs_clean(self):
         c = FakeSSH(routes=[('ls -1',
                              '/var/log/nginx/example.com.error.log\nFFCOUNT 1\n'),
-                            ('grep -h', 'example.com\n'),
+                            ('grep -h', 'server_name example.com;\n'),
                             ('cat ', 'everything is fine\n')])
         out = logs_mod.site_logs_report(c, 'none')
         assert 'Ошибок' in out and 'не обнаружено' in out
@@ -405,9 +448,9 @@ class TestSiteLogs:
     # 'grep -h' — это чтение конфига в get_domains_info: без него домен не
     # определился бы и отчёт встал бы на «домены не определены», не дойдя до
     # логов (проверено прогоном: проверка «не просмотрен» тогда ничего не
-    # проверяла).
+    # проверяла). Ответ — СТРОКА КОНФИГА, а не готовый домен (язык системы).
     UNREADABLE = [('ls -1', '/var/log/nginx/example.com.error.log\nFFCOUNT 1\n'),
-                  ('grep -h', 'example.com\n'),
+                  ('grep -h', 'server_name example.com;\n'),
                   ('RFSTATE', ('RFSTATE unreadable\n', 'cat: Permission denied', 1))]
 
     def test_unreadable_logs_are_not_called_clean(self):
