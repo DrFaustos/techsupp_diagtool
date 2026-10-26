@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.4"
+__version__ = "1.32.5"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -474,6 +474,97 @@ def find_files_info(checker, pattern, limit=20):
     # константой, а не с повторной единицей.
     return {'paths': paths, 'dirs': dirs, 'total': total, 'notes': notes,
             'trunc_note': trunc_note, 'ls_rc': ls_rc}
+
+
+# ==================== СЧЁТЧИК find (1.32.5) ====================
+# `find … 2>/dev/null | wc -l` непригоден как ответ «нарушений нет»: код возврата
+# конвейера принадлежит wc (то есть всегда 0), а stderr find глох в заглушке.
+# Замер живьём (mawk 1.3.4, реальный парк): закрытый chmod 000 каталог и
+# несуществующий пользователь дают ровно «0» при rc конвейера 0 — то же число,
+# что даёт честная пустота. Отчёт по такому ответу печатал «✅ Все файлы
+# принадлежат bitrix» и «✅ world-writable файлов нет», то есть ложно-чистый
+# вердикт проверки безопасности.
+#
+# Отказ от wc обязателен, но НЕдостаточен. Признак полноты — код возврата САМОГО
+# find, снятый внутри группы до awk (канон 1.32.3; PIPESTATUS под dash — «Bad
+# substitution»). Число строк «find: » признаком быть не может: если find не
+# запустился вовсе (rc=127), строк ошибок ноль, и вердикт снова стал бы
+# ложно-чистым — ровно тот класс, который этот слайс и лечит.
+_COUNT_AWK = ('{if (substr($0,1,6)=="find: ") {print "FERR " $0; next} '
+              'if (substr($0,1,6)=="FCOUNT" || substr($0,1,4)=="FRC ") '
+              '{print; next} k++} '
+              'END{printf "FCOUNT %d\\n", k+0}')
+
+
+def count_find_cmd(root, expr):
+    """Одна POSIX-команда: сколько находит find и дошёл ли обход до конца.
+
+    `root` экранируется через q(): это имя каталога, а не glob (в отличие от
+    паттернов find_files_cmd, где `*` обязан дойти до shell буквально). `expr`
+    пишется вызывающим кодом и уходит литерально: через q() он стал бы одним
+    аргументом «-mindepth 1 -type f», и find ничего бы не нашёл.
+
+    stderr find идёт в канал (`2>&1`): в нём единственная строка с причиной
+    пустоты. awk превращает её в маркер FERR и НЕ считает найденным файлом, а
+    маркеры печатает, но не считает — иначе счётчик соврал бы на их число
+    (тот же закон, что заперт для `FFRC` в 1.32.3).
+    """
+    return (f'{{ find {q(root)} {expr} 2>&1; echo "FRC $?"; }} | '
+            f"awk '{_COUNT_AWK}'")
+
+
+def parse_count_answer(out):
+    """(число, rc find, первая причина) из ответа count_find_cmd.
+
+    count=None — маркера FCOUNT не было (обрыв канала, чужая реализация):
+    выдумывать ноль нельзя, «не проверено» и «нул нарушений» — разные ответы
+    (закон 1.16–1.19). То же для rc: None — неизвестно, 0 — обход дошёл.
+
+    Причина берётся первая и только одна: второй строкой find обычно повторяет
+    то же самое, а оператору нужна та, с которой начинается лечение.
+    """
+    count = rc = None
+    reason = ''
+    for line in (out or '').splitlines():
+        s = line.strip()
+        if s.startswith('FCOUNT '):
+            try:
+                count = int(s.split(' ', 1)[1].strip())
+            except ValueError:
+                count = None
+        elif s.startswith('FRC '):
+            try:
+                rc = int(s.split(' ', 1)[1].strip())
+            except ValueError:
+                rc = None
+        elif s.startswith('FERR ') and not reason:
+            reason = s[5:].strip()[:160]
+    return count, rc, (reason or None)
+
+
+def count_find_info(checker, root, expr):
+    """Сколько нашёл find и ЧЕМ объяснена неполнота: {'count','complete','note'}.
+
+    complete=False — обход не дошёл до конца (нет прав, нет пути, find не
+    запустился) или ответ не распознан: найденное число в этом случае означает
+    «столько увидели», и по нему нельзя утверждать «нарушений нет».
+    """
+    out, _err, _rc = checker.run(count_find_cmd(root, expr))
+    count, frc, reason = parse_count_answer(out)
+    if count is None or frc is None:
+        # Маркеров нет: прежний голый ответ wc (одна цифра) тоже попадает сюда,
+        # и он не результат — мы не знаем, дошёл ли обход.
+        return {'count': count, 'complete': False,
+                'note': '⚠️ Ответ счётчика не распознан (нет маркеров FCOUNT/FRC)'
+                        ' — проверка неполна: о дереве ничего не известно, это '
+                        '«не проверено», а не «нарушений нет»'}
+    if frc == 0:
+        return {'count': count, 'complete': True, 'note': None}
+    why = reason if reason else f'код возврата find {frc}'
+    return {'count': count, 'complete': False,
+            'note': f'⚠️ Обход {root} не дошёл до конца: «{why}». Проверка '
+                    f'неполна: {count} — это «столько увидели», а не «столько '
+                    'есть»: утверждать «нарушений нет» по нему нельзя'}
 
 
 def find_files(checker, pattern, limit=20):

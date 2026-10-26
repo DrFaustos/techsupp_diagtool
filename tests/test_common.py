@@ -335,6 +335,89 @@ class TestFindFiles:
         assert info['ls_rc'] == 0
         assert info['dirs'][0][0] == 'ok'
 
+    # ============ 1.32.5: счётчик find обязан различать пустоту и отказ ======
+    # bitrix_perms_report считал нарушения как `find … 2>/dev/null | wc -l`.
+    # Код возврата конвейера принадлежит wc, а stderr заглушён, поэтому отказ
+    # («нет прав», «нет такого пользователя») выглядел как «нарушений 0».
+    # Замер живьём (mawk 1.3.4, реальный парк): закрытый каталог — FCOUNT 0 при
+    # FERR 1; неизвестный пользователь — FCOUNT 0 при FERR 1; читаемый каталог
+    # с одним файлом — FCOUNT 1 при FERR 0; честный пустой — FCOUNT 0 FERR 0.
+    # Контрпример снят там же: файл с именем «find: weird» в открытом каталоге
+    # остаётся в счёте, а не в ошибках, — строка данных это путь, он начинается
+    # с корня, а не с «find: ».
+    #
+    # Признак полноты — код возврата САМОГО find (маркер FRC, канон 1.32.3), а
+    # НЕ число строк «find: ». Причина измерена: если find не запущен вовсе
+    # (rc=127), строк ошибок НОЛЬ, и признак по тексту снова дал бы ложно-чистый
+    # вердикт — тот самый класс, который этот слайс и лечит.
+    def test_count_command_keeps_stderr_and_markers(self):
+        cmd = common.count_find_cmd('/home/bitrix/www',
+                                    '-mindepth 1 -type f -perm -o+w')
+        assert '2>&1' in cmd, cmd
+        assert '2>/dev/null' not in cmd, 'причина отказа снова тонет: %r' % cmd
+        assert 'wc -l' not in cmd, 'код возврата конвейера съедается wc'
+        assert 'FCOUNT' in cmd and 'FERR' in cmd, cmd
+        assert '-perm -o+w' in cmd, 'предикат обязан дойти буквально'
+
+    def test_count_command_quotes_root_with_spaces(self):
+        # Замок на экранирование. Прежнее наивное ожидание («путь всегда в
+        # кавычках») было бы ложью: q() есть shlex.quote, и он НЕ кавычит путь
+        # без спецсимволов. Проверяем случай, где кавычки обязательны.
+        cmd = common.count_find_cmd('/home/bitrix/my www', '-mindepth 1')
+        assert "'/home/bitrix/my www'" in cmd, cmd
+
+    def test_count_answer_reads_both_markers(self):
+        # Тройка (число, rc find, первая причина). Причина — не украшение: у
+        # «Permission denied» и «No such file or directory» противоположное
+        # лечение (поднимать права против проверять путь), склеивать их нельзя
+        # — тот же закон, что запрещает mixing rc=2 и rc=126 в 1.32.3.
+        assert common.parse_count_answer('FCOUNT 3\nFRC 0\n') == (3, 0, None)
+        assert common.parse_count_answer('FCOUNT 0\nFRC 1\n') == (0, 1, None)
+        # find не запустился вовсе: строк ошибок нет, а вердикт обязан быть
+        # НЕполным (иначе «✅ нарушений нет» вернётся тем же путём).
+        assert common.parse_count_answer('FCOUNT 0\nFRC 127\n') == (0, 127, None)
+
+    def test_count_answer_keeps_the_first_reason(self):
+        out = ('FERR find: cannot open directory /home/bitrix/www: '
+               'Permission denied\n'
+               'FERR find: /home/bitrix/www/upload: Permission denied\n'
+               'FCOUNT 0\nFRC 1\n')
+        count, rc, reason = common.parse_count_answer(out)
+        assert count == 0 and rc == 1
+        assert reason and 'Permission denied' in reason
+        assert reason.count('Permission denied') == 1, 'берётся первая причина'
+
+    def test_count_answer_without_markers_is_not_zero(self):
+        # Тот же закон, что FFCOUNT/FFRC: ответа не было — это не «нул».
+        # Голый ответ старой формы (просто число от wc) без маркеров — тоже не
+        # результат: мы не знаем, дошёл ли обход до конца.
+        assert common.parse_count_answer('') == (None, None, None)
+        assert common.parse_count_answer('0\n') == (None, None, None)
+
+    def test_count_info_refuses_to_call_failure_a_zero(self):
+        c = FakeSSH(routes=[('find ', 'FCOUNT 0\nFRC 1\n')])
+        info = common.count_find_info(c, '/home/bitrix/www',
+                                      '-mindepth 1 ! -user bitrix')
+        assert info['count'] == 0
+        assert info['complete'] is False
+        assert info['note'] and 'неполна' in info['note']
+
+    def test_count_info_without_answer_is_not_complete(self):
+        # Обрыв/чужая реализация: маркеров нет — вердикт не имеет силы.
+        c = FakeSSH(routes=[('find ', '0\n')])
+        info = common.count_find_info(c, '/home/bitrix/www', '-mindepth 1')
+        assert info['count'] is None
+        assert info['complete'] is False and info['note']
+
+    def test_count_info_honest_zero_is_complete(self):
+        # Контрпример: FRC 0 — обход дошёл до конца, complete=True и note
+        # отсутствует. Выдумывать проверке беду нельзя.
+        c = FakeSSH(routes=[('find ', 'FCOUNT 0\nFRC 0\n')])
+        info = common.count_find_info(c, '/home/bitrix/www',
+                                      '-mindepth 1 -type f')
+        assert info['count'] == 0 and info['complete'] is True
+        assert info['note'] is None
+
     def test_rc_two_is_not_relabelled_as_argv_flood(self):
         # Второй обязательный контрпример. Замер живьём: «глоб не раскрылся»,
         # «каталога нет» и «нет прав» дают rc=2, а argv-голод — rc=126. Глотнуть

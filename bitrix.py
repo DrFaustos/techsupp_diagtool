@@ -10,7 +10,8 @@ import re
 from datetime import datetime, timezone
 
 from common import (q, save_crontab_backup, write_remote_file,
-                    prepare_secret_file, remove_remote_path)
+                    prepare_secret_file, remove_remote_path,
+                    count_find_info)
 # Почтовый лог читает ОДНА функция на весь проект (logs.read_mail_log): у нас
 # уже были парные реализации, которые разъехались бы «в одном отчёте лог есть,
 # в другом — логов нет». Здесь же закрывается и Debian: раньше читался только
@@ -888,6 +889,36 @@ WRITABLE_DIRS = ('bitrix/cache', 'bitrix/managed_cache', 'bitrix/data',
                  'upload', 'bitrix/php_interface')
 
 
+def _count_verdict_lines(info, ok_text, warn_text, unknown_text):
+    """Строки отчёта по одному счётчику find: сначала факт, затем его сила.
+
+    Прежний код решал по строке `wc -l`: «0» рождался и из честной пустоты, и из
+    несостоявшегося обхода (нет прав на каталог, нет такого пользователя), и
+    печатал «✅ Все файлы принадлежат bitrix» там, где ничего не удалось увидеть
+    (замер живьём на закрытом chmod 000 корне — ложно-чистый вердикт проверки
+    безопасности). Теперь вердикт берётся из complete, а не из числа.
+
+    Найденное при неполном обходе скрывать нельзя, но и подписывать им «всё
+    чисто» нельзя: число уходит вместе с признанием, что это «столько увидели».
+    """
+    lines = []
+    cnt = info['count']
+    if cnt is None:
+        # Маркеров не было (обрыв канала, чужая реализация, голый ответ wc):
+        # это не «нул нарушений», это отсутствие ответа.
+        return [unknown_text]
+    if not info['complete']:
+        if cnt:
+            lines.append(warn_text.format(n=cnt))
+        lines.append(info['note'])
+        return lines
+    if cnt == 0:
+        lines.append(ok_text)
+    else:
+        lines.append(warn_text.format(n=cnt))
+    return lines
+
+
 def bitrix_perms_report(checker):
     lines = ['=== ПРАВА ФАЙЛОВ САЙТА ===']
     out, _, rc = checker.run(f'ls -ld {q(BITRIX_DOCROOT)} 2>/dev/null')
@@ -896,26 +927,21 @@ def bitrix_perms_report(checker):
         return '\n'.join(lines)
     lines.append(f'Корень сайта: {out.strip()}')
 
-    out, _, _ = checker.run(
-        f'find {q(BITRIX_DOCROOT)} -mindepth 1 ! -user {q(SITE_OWNER)} 2>/dev/null | wc -l')
-    cnt = out.strip()
-    if cnt == '0':
-        lines.append(f'✅ Все файлы принадлежат {SITE_OWNER}')
-    elif cnt.isdigit():
-        lines.append(f'⚠️ Файлов с другим владельцем: {cnt} — починка: '
-                     '«Права файлов: починить» ниже в меню')
-    else:
-        lines.append('⚠️ Не удалось посчитать владельцев (find не отработал)')
-
-    out, _, _ = checker.run(
-        f'find {q(BITRIX_DOCROOT)} -type f -perm -o+w 2>/dev/null | wc -l')
-    cnt = out.strip()
-    if cnt == '0':
-        lines.append('✅ world-writable файлов нет')
-    elif cnt.isdigit():
-        lines.append(f'⚠️ Файлов, доступных на запись всем (o+w): {cnt} — '
-                     'потенциальная дыра, ищите через '
-                     f'find {BITRIX_DOCROOT} -type f -perm -o+w')
+    lines.extend(_count_verdict_lines(
+        count_find_info(checker, BITRIX_DOCROOT,
+                        f'-mindepth 1 ! -user {q(SITE_OWNER)}'),
+        f'✅ Все файлы принадлежат {SITE_OWNER}',
+        '⚠️ Файлов с другим владельцем: {n} — починка: '
+        '«Права файлов: починить» ниже в меню',
+        '⚠️ Не удалось посчитать владельцев: счётчик не ответил — это '
+        '«не проверено», а не «все файлы в порядке»'))
+    lines.extend(_count_verdict_lines(
+        count_find_info(checker, BITRIX_DOCROOT, '-type f -perm -o+w'),
+        '✅ world-writable файлов нет',
+        '⚠️ Файлов, доступных на запись всем (o+w): {n} — потенциальная дыра, '
+        f'ищите через find {BITRIX_DOCROOT} -type f -perm -o+w',
+        '⚠️ Не удалось посчитать world-writable файлы: счётчик не ответил — '
+        'о дырах такого рода ничего не известно'))
 
     for rel in WRITABLE_DIRS:
         path = f'{BITRIX_DOCROOT}/{rel}'

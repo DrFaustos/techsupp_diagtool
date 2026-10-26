@@ -561,8 +561,16 @@ class TestTopTables:
 
 
 # ==================== права файлов сайта ====================
-def _perms_routes(owner_cnt='0', world_cnt='0', dirs='ok'):
-    """Маршруты для bitrix_perms_report: dirs — ответ на test -d/test -w."""
+def _perms_routes(owner_cnt='FCOUNT 0\nFRC 0\n',
+                  world_cnt='FCOUNT 0\nFRC 0\n', dirs='ok'):
+    """Маршруты для bitrix_perms_report: dirs — ответ на test -d/test -w.
+
+    Дефолты заговорили НОВЫМ протоколом (1.32.5): FCOUNT/FRC вместо голого
+    числа от wc. Прежние '0\\n' описывают команду, которую больше не
+    отправляют, а молчаливая старым языком фикстура дала бы зелёный тест по
+    НЕВЕРНОЙ причине — тот же закон, что заперт для двойника FakeSSH в 1.32.3
+    и зафиксирован в v1.27.0.
+    """
     return [
         ('ls -ld', 'drwxr-xr-x 42 bitrix bitrix 4096 Oct 10 12:00 /home/bitrix/www'),
         ('! -user', owner_cnt + '\n'),
@@ -581,7 +589,10 @@ class TestPerms:
         assert '/home/bitrix/www' in out
 
     def test_report_flags_broken_owners_and_perms(self):
-        c = FakeSSH(routes=_perms_routes(owner_cnt='1234', world_cnt='7'))
+        # Фикстура говорит НОВЫМ языком (FCOUNT + FRC 0 = обход дошёл до конца):
+        # голое число '1234' описывает команду, которую больше не отправляют.
+        c = FakeSSH(routes=_perms_routes(owner_cnt='FCOUNT 1234\nFRC 0\n',
+                                         world_cnt='FCOUNT 7\nFRC 0\n'))
         out = bx.bitrix_perms_report(c)
         assert 'Файлов с другим владельцем: 1234' in out
         assert 'доступных на запись всем (o+w): 7' in out
@@ -604,6 +615,42 @@ class TestPerms:
         c = FakeSSH(routes=_perms_routes(owner_cnt='find: error'))
         out = bx.bitrix_perms_report(c)
         assert 'Не удалось посчитать владельцев' in out
+
+    # ============ 1.32.5: «нарушений 0» обязан быть полным проверением =======
+    # Прежний счёт: `find … 2>/dev/null | wc -l`. Код возврата конвейера
+    # принадлежит wc, stderr заглушён. Замер живьём на реальной ФС (закрытый
+    # chmod 000 корень сайта, пользователя bitrix на машине нет): прежний код
+    # напечатал «✅ Все файлы принадлежат bitrix» и «✅ world-writable файлов
+    # нет» — ложно-чистый вердикт проверки безопасности. Новый протокол снят
+    # тем же прогоном: closed — FRC 1, unknown user — FRC 1, честный пустой
+    # или читаемый — FRC 0.
+    def test_closed_root_is_not_reported_all_green(self):
+        c = FakeSSH(routes=_perms_routes(owner_cnt='FCOUNT 0\nFRC 1\n',
+                                         world_cnt='FCOUNT 0\nFRC 1\n'))
+        out = bx.bitrix_perms_report(c)
+        assert '✅ Все файлы принадлежат' not in out, out
+        assert '✅ world-writable' not in out, out
+        assert 'неполна' in out, out
+
+    def test_partial_scan_shows_found_count_and_warns(self):
+        # Часть дерева прочитана (7 файлов с другим владельцем), часть — нет.
+        # Скрыть найденное нельзя, но и молчать о неполноте нельзя.
+        c = FakeSSH(routes=_perms_routes(owner_cnt='FCOUNT 7\nFRC 2\n',
+                                         world_cnt='FCOUNT 0\nFRC 0\n'))
+        out = bx.bitrix_perms_report(c)
+        assert 'другим владельцем: 7' in out, out
+        assert 'неполна' in out, out
+        assert '✅ world-writable файлов нет' in out, out
+
+    def test_honest_zeroes_keep_their_green(self):
+        # Контрпример (запрещающий guard обязан иметь контрпример): FCOUNT 0
+        # при FRC 0 — честное «нарушений нет», зелёный обязан остаться.
+        c = FakeSSH(routes=_perms_routes(
+            owner_cnt='FCOUNT 0\nFRC 0\n',
+            world_cnt='FCOUNT 0\nFRC 0\n'))
+        out = bx.bitrix_perms_report(c)
+        assert '✅ Все файлы принадлежат bitrix' in out, out
+        assert 'неполна' not in out, out
 
     def test_fix_requires_group(self):
         # группы bitrix нет -> chown отправлять нельзя
