@@ -48,10 +48,15 @@ DETECTORS = (('CJK', CJK_DEFECT),
 # в ту секунду, когда он написан, а не когда оператор увидел строку в отчёте.
 # В 1.32.0 сторож поймал три таких дефекта в МОИХ же свежих docstring
 # (склейки латиницы с кириллицей) - то есть работает.
+# В 1.32.1 добавлен tests/test_git_history.py: в его первом же черновике
+# оказались иероглифы (тот самый класс, что ловит CJK-детектор) и латинское
+# слово в русском комментарии. Guard, который проверяет чужие тексты, обязан
+# сам стоять под тем же сканом, иначе он написан вслепую.
 HYGIENE_FILES = ('panels.py', 'common.py', 'logs.py',
                  'tests/test_panels.py', 'tests/support.py',
                  'tests/test_common.py', 'tests/test_logs.py',
-                 'tests/test_text_hygiene.py', 'CHANGELOG.md', 'README.md')
+                 'tests/test_text_hygiene.py', 'tests/test_git_history.py',
+                 'CHANGELOG.md', 'README.md')
 
 # Приманки собраны из кусков ('код' + 'igl'), иначе этот файл находил бы
 # СОБСТВЕННЫЙ текст приманки при скане и горел бы вечно.
