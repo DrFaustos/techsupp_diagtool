@@ -764,15 +764,286 @@ class TestFastpanelPackageStatus:
         c = FakeSSH(routes=[('dpkg -l', 'ii  fastpanel2  2.14  amd64')])
         assert panels_mod.fastpanel_package_status(c) == \
             'ii  fastpanel2  2.14  amd64'
-        assert c.find('rpm -qa') is None
+        assert c.find('rpm') is None
 
     def test_rpm_fallback_for_red_hat_family(self):
-        c = FakeSSH(routes=[('rpm -qa', 'fastpanel2-2.14-1.el8.x86_64')])
+        # rpm зовётся как `rpm -q` (см. PKG_TOOLS), а не `rpm -qa`.
+        c = FakeSSH(routes=[('rpm -q', 'fastpanel2-2.14-1.el8.x86_64')])
         assert panels_mod.fastpanel_package_status(c) == \
             'fastpanel2-2.14-1.el8.x86_64'
 
     def test_absent_package(self):
+        # Инвариант совместимости ПУБЛИЧНОЙ формы (она обязана оставаться
+        # строкой). Различение «пакета нет» и «мы не смогли спросить» — в
+        # TestFastpanelPackageStates: именно его терял consumer.
         assert panels_mod.fastpanel_package_status(FakeSSH()) == ''
+
+
+# ============ ПАКЕТ ПАНЕЛИ: «НЕ НАЙДЕН» против «НЕ ПРОВЕРЕН» ================
+class TestFastpanelPackageStates:
+    """Таблица состояний пакетного менеджера.
+
+    Прежний вид (panels.py):
+
+        dpkg -l 2>/dev/null | grep -i 'fastpanel2' | head -3
+
+    терял ДВЕ вещи сразу — ровно как 1.28.0 на systemctl и 1.29.0 на grep'е
+    конфигов: `2>/dev/null` глушил причину, а пайп забирал код возврата
+    (конвейер отдаёт rc `head`, он доволен всегда). Замер живьём (этот хост,
+    uid=1000, реальный /bin/bash + controlled fake-бинарники в PATH):
+
+        есть пакет            rc=0  'ii  fastpanel2-engine 1.2-3 …'
+        пакета нет (реальный) rc=1  'dpkg-query: no packages found matching …'
+        бинарника нет         rc=127 'bash: dpkg: command not found'
+        упал (нет прав)       rc=2  'dpkg: error: cannot access repository lock…'
+
+    ПРЕЖНЯЯ команда на последних трёх давала rc=0 и пустой вывод — идентично
+    «пакета нет», а `fastpanel_diag` подписывал это «типичная причина 404 на
+    :8888 … apt install fastpanel2». По этой строке решают про переустановку
+    панели — самый дорогой вид лжи в серии.
+
+    Локализация (замерено): в русской локали dpkg пишет «шаблону fastpanel2*
+    не соответствует ни один пакет» при ТОМ ЖЕ rc=1. Значит текстовым
+    маркером быть не может: решение — по rc, а `LC_ALL=C` нужен только чтобы
+    ЦИТАТА для оператора была читаемой на любой локали хоста.
+    """
+
+    DPKG_FOUND = ('ii  fastpanel2-engine   2.14  amd64   FastPanel engine\n',
+                  '', 0)
+    DPKG_ABSENT = ('', 'dpkg-query: no packages found matching fastpanel2*\n', 1)
+    NO_BINARY = ('', 'bash: dpkg: command not found\n', 127)
+    DPKG_DENIED = ('', 'dpkg: error: cannot access repository lock: '
+                       'Permission denied\n', 2)
+    RU_LOCALIZED = ('', 'dpkg-query: шаблону fastpanel2* не соответствует '
+                        'ни один пакет\n', 1)
+    # rc=0 без вывода для `dpkg -l шаблон` не бывает (успех обязан
+    # совпадением) — значит ответ оборвался.
+    TRUNCATED = ('', '', 0)
+    RPM_FOUND = ('fastpanel2-2.14-1.el8.x86_64\n', '', 0)
+    # `rpm -q` (PKG_TOOLS) на «не установлен» отвечает rc=1, как dpkg, — обе
+    # ветки делят одну таблицу. Пустой вывод при rc=0 — это обрыв (см. ниже),
+    # а не «пакета нет»: различить их нельзя, поэтому вердикт по пустоте.
+    RPM_ABSENT = ('', 'package fastpanel2* is not installed\n', 1)
+    # rpm об ошибке (битая БД, нет прав) — rc != 0,1; rc=1 у rpm это ровно
+    # «не установлен», поэтому ошибка обязана нести ДРУГОЙ код.
+    RPM_DENIED = ('', 'rpm: error: cannot open Packages index: Permission '
+                      'denied\n', 2)
+
+    # --- решение принимается по rc, а не по тексту -------------------------
+
+    def test_found_is_found(self):
+        c = FakeSSH(routes=[('dpkg', self.DPKG_FOUND)])
+        pkg, kind, note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'found' and 'fastpanel2-engine' in pkg
+        assert note == ''
+
+    def test_honest_absent_is_absent_not_unchecked(self):
+        # «Пакета нет» — ответ системы, его надо назвать прямо: именно этот
+        # случай и есть настоящая причина 404 из KB FastPanel.
+        c = FakeSSH(routes=[('dpkg', self.DPKG_ABSENT)])
+        _pkg, kind, note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'absent'
+        assert note == ''
+
+    def test_localized_answer_is_still_absent(self):
+        # Тот же rc=1, но текст по-русски (реальная ru-локаль хоста). Если бы
+        # классификатор искал 'no packages found', локализованный хост слеп бы
+        # и получил «не проверено» вместо честного «пакета нет».
+        c = FakeSSH(routes=[('dpkg', self.RU_LOCALIZED)])
+        _pkg, kind, _note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'absent'
+
+    def test_missing_binary_is_never_absent_package(self):
+        # Хост без dpkg (RHEL/Alpine): «dpkg не выполнен» — это НЕ «пакета
+        # нет». Прежний код именно здесь врал всего чаще.
+        c = FakeSSH(routes=[('dpkg', self.NO_BINARY), ('rpm', self.RPM_FOUND)])
+        pkg, kind, note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'found' and 'fastpanel2' in pkg   # второй инструмент отработал
+
+    def test_both_tools_unavailable_is_unchecked(self):
+        # Ни один менеджер не выполнен → отчёт обязан признать пробел.
+        c = FakeSSH(routes=[('dpkg', self.NO_BINARY), ('rpm', self.NO_BINARY)])
+        _pkg, kind, note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'unchecked'
+        assert note and 'не провер' in note.lower()
+        assert 'НЕ найден' not in note and 'apt install' not in note
+
+    def test_permission_denied_is_unchecked_and_quotes_the_answer(self):
+        # Ответ системы цитируется, а не подменяется удобным диагнозом.
+        c = FakeSSH(routes=[('dpkg', self.DPKG_DENIED), ('rpm', self.DPKG_DENIED)])
+        _pkg, kind, note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'unchecked'
+        assert 'не провер' in note.lower()
+        assert 'Permission denied' in note
+
+    def test_dpkg_truncated_and_rpm_unavailable_is_unchecked(self):
+        # dpkg при rc=0 обязан совпадать (замер: нет совпадений -> rc=1),
+        # поэтому rc=0 без строк — обрыв ответа, а не «пакета нет». Вердикт
+        # не вынесен НИ ОДНИМ инструментом: rpm тоже недоступен.
+        c = FakeSSH(routes=[('dpkg', self.TRUNCATED), ('rpm', self.NO_BINARY)])
+        _pkg, kind, note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'unchecked'
+        assert 'не провер' in note.lower()
+        assert 'apt install' not in note
+
+    def test_second_tool_may_give_the_verdict(self):
+        # ПАРНЫЙ кейс: обрыв dpkg (rc=0 пусто) не отменяет вердикт второго
+        # инструмента. `rpm -q` на «не установлен» отвечает rc=1 — как dpkg, —
+        # и именно rc=1 даёт absent (не пустой вывод: та же пустота была бы
+        # обрывом канала и обязана остаться пробелом).
+        # Поведение rpm на этом хосте НЕ замерено (rpm отсутствует) — форма
+        # взята из документации; заперт фиксирует решение, а не замер.
+        c = FakeSSH(routes=[('dpkg', self.TRUNCATED), ('rpm', self.RPM_ABSENT)])
+        _pkg, kind, _note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'absent'
+
+    def test_rpm_is_asked_only_when_dpkg_gave_no_verdict(self):
+        # DPKG нашёл — второй инструмент не зовём (заперто и раньше).
+        c = FakeSSH(routes=[('dpkg', self.DPKG_FOUND)])
+        panels_mod.fastpanel_package_status_info(c)
+        assert c.find('rpm') is None
+        # DPKG уверенно сказал «пакета нет» (Debian-хост) — rpm тоже не нужен.
+        c2 = FakeSSH(routes=[('dpkg', self.DPKG_ABSENT)])
+        panels_mod.fastpanel_package_status_info(c2)
+        assert c2.find('rpm') is None
+        # DPKG не ответил (бинарника нет / упал) — спрашиваем rpm.
+        c3 = FakeSSH(routes=[('dpkg', self.NO_BINARY), ('rpm', self.RPM_ABSENT)])
+        _pkg, kind, _note = panels_mod.fastpanel_package_status_info(c3)
+        assert c3.find('rpm') is not None
+        assert kind == 'absent'
+
+    def test_silence_is_unchecked_not_absent(self):
+        # ИНВЕРТИРОВАННЫЙ КОНТРОЛЬ. Именно этот случай — молчание двойника
+        # (нет маршрутов: rc=0 и пусто) — был дырой, найденной при смене формы
+        # `rpm -qa → rpm -q`: прежняя ветка «у rpm пустой вывод при rc=0 = нет
+        # совпадений» превращала молчание в диагноз, и запертый
+        # test_missing_package_explains_404 проходил по НЕВЕРНОЙ причине —
+        # «apt install fastpanel2» звучал там, где систему не спросили.
+        # Молчание обязано оставаться пробелом (закон серии: «не смогли
+        # посмотреть» != «система ответила: нет»).
+        c = FakeSSH()
+        _pkg, kind, note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'unchecked'
+        assert 'apt install' not in note and 'НЕ найден' not in note
+        out = panels_mod.fastpanel_diag(c)
+        assert 'Пакет fastpanel2 НЕ найден' not in out
+
+    def test_rpm_empty_rc0_is_unchecked_not_absent(self):
+        # КЛЮЧЕВОЙ закон смены формы `rpm -qa → rpm -q`. Пустой вывод при rc=0
+        # НЕ переносит неоднозначность: одинаково выглядят «пакета нет» (так
+        # отвечал прежний `rpm -qa`) и «канал оборвался», а молчание FakeSSH —
+        # именно такое. Различить нельзя никаким маркером (текст rpm содержит
+        # само имя пакета), значит по пустоте вердикт выносить нельзя и вердикт
+        # «пакета нет» переехал на rc=1 (`rpm -q`).
+        c = FakeSSH(routes=[('dpkg', self.NO_BINARY), ('rpm', self.TRUNCATED)])
+        _pkg, kind, _note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'unchecked'
+
+    def test_rpm_error_is_unchecked(self):
+        c = FakeSSH(routes=[('dpkg', self.NO_BINARY), ('rpm', self.RPM_DENIED)])
+        _pkg, kind, note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'unchecked' and 'Permission denied' in note
+
+    # --- публичная форма остаётся строкой ----------------------------------
+
+    def test_plain_form_keeps_string(self):
+        c = FakeSSH(routes=[('dpkg', self.DPKG_FOUND)])
+        assert 'fastpanel2-engine' in panels_mod.fastpanel_package_status(c)
+        c2 = FakeSSH(routes=[('dpkg', self.DPKG_ABSENT)])
+        assert panels_mod.fastpanel_package_status(c2) == ''
+        c3 = FakeSSH(routes=[('dpkg', self.NO_BINARY), ('rpm', self.NO_BINARY)])
+        assert panels_mod.fastpanel_package_status(c3) == ''
+
+    def test_output_is_capped_without_head_pipe(self):
+        # Ограничение в 3 строки было в пайпе (`| head -3`); без пайпа оно
+        # обязано остаться, но на python — иначе rc вернётся не менеджеру.
+        body = '\n'.join(f'ii  fastpanel2-mod{i} 1.0 all x' for i in range(9))
+        c = FakeSSH(routes=[('dpkg', (body + '\n', '', 0))])
+        pkg, kind, _note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'found'
+        assert len(pkg.splitlines()) == 3
+
+    # --- фильтр по имени пакета: он держит отчёт читаемым -------------------
+
+    def test_table_legend_is_not_the_package(self):
+        # Поймано ЖИВЫМ контролем на настоящем dpkg этого хоста: `dpkg -l`
+        # печатает 5 строк табличной ЛЕГЕНДЫ до строк пакетов
+        # ('Desired=Unknown/Install/Remove/Purge/Hold', '||/ Name Version …').
+        # Прежний код отсекал их `grep -i fastpanel2`; снимая пайп ради кода
+        # возврата, я зря снял вместе с ним и фильтрацию — и отчёт печатал
+        # «✅ Пакет панели: Desired=Unknown/…», то есть терял версию пакета,
+        # ради которой строку и читают. Фильтрация обязана вернуться, но на
+        # python: в пайпе она стоила кода возврата (уроки 1.28.0 и 1.29.0).
+        legend = ('Desired=Unknown/Install/Remove/Purge/Hold\n'
+                  '| Status=Not/Inst/Conf-files/Unpacked/halF-conf\n'
+                  '|/ Err?=(none)/Reinst-required (Status,Err: uppercase=bad)\n'
+                  '||/ Name           Version         Architecture Description\n'
+                  '+++-==============-===============-============-======\n'
+                  'ii  fastpanel2-engine 2.14 amd64 FastPanel engine\n')
+        c = FakeSSH(routes=[('dpkg', (legend, '', 0))])
+        pkg, kind, _note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'found'
+        assert 'Desired=' not in pkg and '||/ Name' not in pkg
+        assert 'fastpanel2-engine' in pkg
+
+    def test_success_without_the_package_name_is_unchecked(self):
+        # ПАРНЫЙ кейс: rc=0, текст есть, но НИ ОДНОЙ строки про fastpanel2 —
+        # значит это не ответ на наш шаблон (обрыв, чужой вывод). Выдать его
+        # за «найденный пакет» — показать оператору чужие строки как панель;
+        # этот ответ обязан быть признан пробелом.
+        junk = ('some daemon chatter\n'
+                'another line without the name\n')
+        c = FakeSSH(routes=[('dpkg', (junk, '', 0)),
+                            ('rpm', TestFastpanelPackageStates.NO_BINARY)])
+        _pkg, kind, note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'unchecked'
+        assert 'fastpanel2' in note.lower()
+
+    def test_rpm_output_is_filtered_by_the_name_too(self):
+        # rpm выводит только имена, но фильтр держим одинаковым для обоих
+        # инструментов: он же — источник строки пакета в отчёте.
+        out = 'nginx-1.20-1.el8.x86_64\nfastpanel2-2.14-1.el8.x86_64\n'
+        c = FakeSSH(routes=[('dpkg', self.NO_BINARY), ('rpm', (out, '', 0))])
+        pkg, kind, _note = panels_mod.fastpanel_package_status_info(c)
+        assert kind == 'found'
+        assert pkg == 'fastpanel2-2.14-1.el8.x86_64'
+
+    # --- замок команды: rc обязан принадлежать менеджеру пакетов -----------
+
+    def test_command_gives_rc_to_the_package_manager(self):
+        c = FakeSSH(routes=[('dpkg', self.DPKG_ABSENT)])
+        panels_mod.fastpanel_package_status(c)
+        cmd = c.find('dpkg')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd, 'причина пустоты снова в /dev/null'
+        assert '2>&1' in cmd
+        for part in ('| grep', '| head', '| awk', '| sed'):
+            assert part not in cmd, f'в команде остался пайп {part!r}'
+
+    def test_template_is_quoted_against_glob_expansion(self):
+        # Замер живьём: без кавычек shell раскрывает fastpanel2* в имена
+        # ФАЙЛОВ из cwd, и dpkg отвечает «no packages found matching
+        # /…/fastpanel2x» с rc=0 — ложное «пакета нет» при УСТАНОВЛЕЕННОМ
+        # пакете. Шаблон обязан дойти до dpkg в кавычках.
+        c = FakeSSH(routes=[('dpkg', self.DPKG_ABSENT)])
+        panels_mod.fastpanel_package_status(c)
+        cmd = c.find('dpkg')
+        assert "'fastpanel2*'" in cmd, cmd
+
+    def test_citation_language_is_pinned_with_lc_all(self):
+        # На ru-локали цитата dpkg выходит по-русски (замер). rc от локали не
+        # зависит, но оператор должен читать одно и то же на любом хосте.
+        c = FakeSSH(routes=[('dpkg', self.DPKG_ABSENT)])
+        panels_mod.fastpanel_package_status(c)
+        assert 'LC_ALL=C' in c.find('dpkg')
+
+    def test_price_is_one_or_two_commands(self):
+        c = FakeSSH(routes=[('dpkg', self.DPKG_FOUND)])
+        panels_mod.fastpanel_package_status(c)
+        assert len(c.commands) == 1
+        c2 = FakeSSH(routes=[('dpkg', self.NO_BINARY), ('rpm', self.RPM_FOUND)])
+        panels_mod.fastpanel_package_status(c2)
+        assert len(c2.commands) == 2
 
 
 class TestFastpanelDiag:
@@ -798,17 +1069,48 @@ class TestFastpanelDiag:
 
     def test_missing_package_explains_404(self):
         # Грабля из KB FASTPANEL: 404 на :8888 = снятый пакет панели.
-        # Переформулировано объявленно (1.28.0): раньше «юнита нет» подменялся
-        # молчанием (FakeSSH без маршрутов = «не проверено»), и тест запирал
-        # ложь как эталон. Теперь система обязана ОТВЕТИТЬ «юнита нет» — и
-        # «не найдена» заперта именно за честным ответом; молчание признаётся
-        # в test_diag_names_the_blocker. Все остальные ассерты сохранены.
-        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT)])
+        # Переформулировано объявленно (1.28.0 — для юнита, 1.30.0 — для
+        # пакета): раньше тест запирал «пакета нет» за МОЛЧАНИЕМ двойника
+        # (FakeSSH без маршрута dpkg = «не проверено»), и «apt install»
+        # проходил по неверной причине — через rpm-ветку пустоты при rc=0.
+        # Теперь заперт держится за ЧЕСТНЫЙ ответ dpkg (rc=1); молчание
+        # признаётся пробелом в test_package_unchecked_is_not_apt_install.
+        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT),
+                            ('dpkg', TestFastpanelPackageStates.DPKG_ABSENT)])
         out = panels_mod.fastpanel_diag(c)
         assert '❌ Служба панели не найдена' in out
         assert 'Пакет fastpanel2 НЕ найден' in out
         assert 'apt install fastpanel2' in out
         assert 'Порт 8888 не отвечает' in out
+
+    def test_package_unchecked_is_not_apt_install(self):
+        # Решающий случай слайса. Решающий он потому, что ЭТА строка —
+        # самое дорогое решение в отчёте: по ней оператор переустанавливает
+        # панель. Прежний fastpanel_diag звал plain-форму (строка или '') и
+        # на пустоте печатал «❌ Пакет fastpanel2 НЕ найден — типичная причина
+        # 404 … Вернуть: apt install fastpanel2». Пустота же возникала и
+        # тогда, когда менеджер пакетов не удалось ВЫПОЛНИТЬ (rc=127 — хост
+        # без dpkg, rc=2 — нет прав на базу/lock): замер живьём показал, что
+        # прежняя команда на них давала rc=0 и пустой вывод, то есть совет
+        # переустанавливать панель звучал на хосте с ЦЕЛОЙ панелью.
+        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT),
+                            ('dpkg', TestFastpanelPackageStates.NO_BINARY),
+                            ('rpm', TestFastpanelPackageStates.NO_BINARY)])
+        out = panels_mod.fastpanel_diag(c)
+        assert 'не провер' in out.lower()
+        assert 'Пакет fastpanel2 НЕ найден' not in out
+        assert 'apt install' not in out
+
+    def test_honest_absent_package_still_explains_404(self):
+        # Найденное нельзя терять ради признания (закон 1.19–1.29): когда
+        # менеджер пакетов ЧЕСТНО ответил «пакета нет» (rc=1 у dpkg), это и
+        # есть настоящая причина 404 из KB FastPanel — совет обязан остаться.
+        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT),
+                            ('dpkg', TestFastpanelPackageStates.DPKG_ABSENT)])
+        out = panels_mod.fastpanel_diag(c)
+        assert 'Пакет fastpanel2 НЕ найден' in out
+        assert 'apt install fastpanel2' in out
+        assert 'не провер' in out.lower()
 
     def test_hostname_without_dot_hint(self):
         c = FakeSSH(routes=[('systemctl cat', '[Unit]'),
