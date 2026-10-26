@@ -1,5 +1,5 @@
 """Управление панелями: ISPmanager (mgrctl) и FastPanel (systemd-юниты)."""
-from common import q, create_backup
+from common import q, create_backup, find_files_info
 
 
 # ==================== УПРАВЛЕНИЕ ISPmanager ====================
@@ -93,33 +93,188 @@ FASTPANEL_LOGS = [
 ]
 
 
-def fastpanel_unit(checker):
-    """Первый установленный systemd-юнит панели (или None).
+# Ответ systemctl на «юнита нет» и на «systemctl нечем говорить» — РАЗНЫЕ
+# диагнозы с противоположным лечением (ставить панель против чинить systemd /
+# смотреть в контейнере). Маркеры собраны по замерам живьём и по текстам
+# systemd (systemd №229+): см. docstring systemd_unit_state.
+SYSTEMD_DEAD_MARKS = (
+    'not been booted with systemd',   # 'System has not been booted ... Can't operate.'
+    'failed to connect to bus',       # 'Failed to connect to bus: Host is down'
+    'failed to connect to dbus',
+    'could not connect to dbus',
+    'talk to init daemon',            # 'Failed to talk to init daemon.'
+    'running in a chroot',
+    'cannot communicate with',
+)
+SYSTEMD_ABSENT_MARKS = (
+    'no such file or directory',      # 'Failed to get unit file list for X.unit: ...'
+    'could not be found',             # 'Unit X.service could not be found.'
+    'not-found',
+    'no unit file',
+    'loaded not-found',
+)
 
-    `systemctl cat` спрашиваем вместо `is-active`: нам важно, что юнит
-    существует, а не что он запущен (панель как раз могла упасть).
-    """
-    for unit in FASTPANEL_UNITS:
+UNIT_UNCHECKED_NOTE = (
+    "⚠️ Наличие службы панели проверить не удалось — состояние не проверено: "
+    "«{why}». Это НЕ «юнита нет»: ответьте на причину (права, systemd, PATH) и "
+    "повторите, а не ставьте панель")
+
+
+def systemd_unit_state(out, err, rc):
+    """(состояние, причина) ответа `systemctl cat <юнит>` -> unit|absent|unknown.
+
+    Прежний вид:
+
         out, _, _ = checker.run(f'systemctl cat {q(unit)} 2>/dev/null | head -1')
         if out.strip():
             return unit
-    return None
+
+    Тут терялись ДВЕ вещи сразу. `2>/dev/null` глушил единственную строку, где
+    написано ПОЧЕМУ пусто. А `| head -1` ещё и забирал себе код возврата: пайп
+    отдаёт rc последней команды, то есть `head`, а он доволен всегда. Замер
+    живьём (этот хост, PID1=bwrap, systemd нет):
+
+        systemctl cat fastpanel2-engine 2>/dev/null | head -1  -> rc=0 stdout=''
+        systemctl cat definitely-no-such-unit    ... | head -1 -> rc=0 stdout=''
+        systemctl cat fastpanel2-engine 2>&1                   -> rc=1
+            'System has not been booted with systemd as init system (PID 1).
+             Can't operate. / Failed to connect to bus: Host is down'
+
+    То есть «юнита нет», «systemctl говорить не может» и «сервер вообще не
+    ответил» давали ОДИН ответ — None, и вызывающий код (`fastpanel_restart`)
+    писал «Служба панели не найдена» и отказывался перезапускать. Оператор шёл
+    переустанавливать панель на хосте, где нужно было смотреть systemd.
+
+    Поэтому команда меняется (rc обязан принадлежать systemctl), а состояния
+    различаются так:
+
+        rc=0 + непустой stdout -> 'unit'    (юнит есть — это ответ системы)
+        rc=127                 -> 'unknown' (бинарника systemctl нет)
+        rc!=0 + DEAD-маркер    -> 'unknown' (systemctl/bus мёртв)
+        rc!=0 + ABSENT-маркер  -> 'absent'  (юнита нет — это ответ системы)
+        всё остальное          -> 'unknown'
+
+    ПОРЯДОК проверок критичен: rc=127 даёт текст «No such file or directory»
+    (его печатает оболочка, а не systemd). Если сначала смотреть маркеры
+    отсутствия, «systemctl нет» станет «юнита нет» — ровно та подмена, из-за
+    которой оператор пойдёт ставить панель вместо починки PATH.
+
+    'unknown' — это «не проверено»: его обязан признать отчёт (закон серии
+    1.19–1.27), 'absent' — честный диагноз, признания не требует.
+    """
+    text = f'{out or ""} {err or ""}'.lower()
+    why = next((line.strip() for line in (err or out or '').splitlines()
+                if line.strip()), '')[:200] or f'код возврата {rc}'
+    if rc == 127:
+        return 'unknown', why
+    if rc == 0:
+        if (out or '').strip():
+            return 'unit', ''
+        # Молчаливый успех: команда прошла, вывода нет — мы ничего не узнали.
+        return 'unknown', 'systemctl cat вернул пустой вывод без ошибки'
+    if any(mark in text for mark in SYSTEMD_DEAD_MARKS):
+        return 'unknown', why
+    if any(mark in text for mark in SYSTEMD_ABSENT_MARKS):
+        return 'absent', ''
+    return 'unknown', why
+
+
+def fastpanel_unit_info(checker):
+    """(юнит панели | None, признание | None).
+
+    `systemctl cat` спрашиваем вместо `is-active`: нам важно, что юнит
+    существует, а не что он запущен (панель как раз могла упасть).
+
+    Второе поле — не «причина отсутствия», а признание НЕПРОВЕРЕННОСТИ: его нет,
+    когда система ответила (найден юнит или ответила «его нет»), и оно есть,
+    когда спросить не получилось. Складывать их в одно значение нельзя:
+    `fastpanel_restart` по-разному лечит «панели нет» и «мы не смогли посмотреть».
+    """
+    unknown = ''
+    for unit in FASTPANEL_UNITS:
+        out, err, rc = checker.run(f'systemctl cat {q(unit)} 2>&1')
+        state, why = systemd_unit_state(out, err, rc)
+        if state == 'unit':
+            # Нашли — признаний нет: вопрос закрыт ответом системы.
+            return unit, None
+        if state == 'unknown' and not unknown:
+            unknown = why
+    if unknown:
+        return None, UNIT_UNCHECKED_NOTE.format(why=unknown)
+    return None, None
+
+
+def fastpanel_unit(checker):
+    """Первый установленный systemd-юнит панели (или None).
+
+    None здесь значит и «юнита нет», и «мы не смогли посмотреть». Отчёт обязан
+    звать fastpanel_unit_info — иначе он повторит враньё 1.27 и ниже.
+    """
+    return fastpanel_unit_info(checker)[0]
+
+
+def find_fastpanel_logs_info(checker, limit=10):
+    """(логи панели, notes): список И чем объяснена пустота.
+
+    Прежний вид:
+
+        out, _, _ = checker.run(f'ls -1 {pattern} 2>/dev/null | head -{limit}')
+
+    `2>/dev/null` выбрасывал ровно ту строку, где написано, почему пусто: «нет
+    прав на /var/log/fastpanel2» и «каталога нет» — два противоположных действия
+    (поднимать права против проверять раскладку панели), а оператор читал одно
+    «Логи панели не найдены». Замер живьём на несуществующем пути:
+
+        прежняя команда                     -> rc=0 stdout='' (та же пустота и
+                                               при закрытом каталоге)
+        find_files_info (примитив 1.20)     -> dirs=[('missing','/var/log/fastpanel2')]
+                                               total=0, note «Каталога ... нет на
+                                               сервере — искать в нём негде»
+
+    Паттерны — ровные пути без звёздочек, поэтому примитиву достаточно проверить
+    их родительский каталог; команду это не удорожает: ОДНА на путь, как и было.
+    """
+    found = []
+    notes = []
+    asked = 0
+    confirmed = 0
+    for pattern in FASTPANEL_LOGS:
+        info = find_files_info(checker, pattern, limit)
+        asked += 1
+        found.extend(info['paths'])
+        if info['dirs'] or info['total'] is not None:
+            confirmed += 1
+        for note in info['notes']:
+            if note not in notes:
+                notes.append(note)
+    if asked and not confirmed:
+        # Сервер не подтвердил просмотр ни одного каталога: «не проверено», а не
+        # «логов нет». Одна строка на прогон — причина общая, а N одинаковых
+        # предупреждений оператор прочитает как N разных бед.
+        notes.append(f"⚠️ Поиск логов панели не завершён: ни один из {asked} "
+                     f"путей не подтверждён сервером — это «не проверено», а не "
+                     f"«логов нет»")
+    return found, notes
 
 
 def find_fastpanel_logs(checker, limit=10):
-    """Существующие логи панели (glob'ы намеренно без q())."""
-    found = []
-    for pattern in FASTPANEL_LOGS:
-        out, _, _ = checker.run(f'ls -1 {pattern} 2>/dev/null | head -{limit}')
-        found.extend(f.strip() for f in out.splitlines() if f.strip())
-    return found
+    """Существующие логи панели (причины пустоты — в find_fastpanel_logs_info)."""
+    return find_fastpanel_logs_info(checker, limit)[0]
 
 
 def fastpanel_restart(checker):
     lines = ["=== ПЕРЕЗАПУСК ПАНЕЛИ FASTPANEL ==="]
-    unit = fastpanel_unit(checker)
+    unit, unchecked = fastpanel_unit_info(checker)
     if not unit:
-        lines.append("❌ Служба панели не найдена (fastpanel2-engine / fastpanel)")
+        # Отказ обязан называть своё основание. «Не найдена» и «не посмотрели» —
+        # разные действия: в первом случае панель ставят, во втором чинят доступ
+        # к systemd. Прежний текст одинаково врал обоим, причём на хосте без
+        # systemd — всегда вторым.
+        if unchecked:
+            lines.append("❌ Перезапуск не отправлен: " + unchecked)
+        else:
+            lines.append("❌ Служба панели не найдена "
+                         "(fastpanel2-engine / fastpanel)")
         return "\n".join(lines)
 
     lines.append(f"Юнит панели: {unit}")
@@ -137,9 +292,20 @@ def fastpanel_restart(checker):
 
 def fastpanel_logs(checker):
     lines = ["=== ЛОГИ ПАНЕЛИ FASTPANEL ==="]
-    logs = find_fastpanel_logs(checker)
+    logs, gaps = find_fastpanel_logs_info(checker)
     if not logs:
-        lines.append("⚠️ Логи панели не найдены по путям: " + ", ".join(FASTPANEL_LOGS))
+        if gaps:
+            # «Не проверено» не имеет права печататься как «не найдены» (закон
+            # 1.19–1.27). Прежняя строка «Логи панели не найдены по путям»
+            # оставалась в выводе и после правки — т.е. ложь просто переехала бы
+            # в соседнюю строку того же отчёта. Пути просмотра при этом обязаны
+            # остаться: по ним и чинят (заперто тестом).
+            lines.extend(gaps)
+            lines.append("   Смотрели по путям: " + ", ".join(FASTPANEL_LOGS))
+        else:
+            # Просмотр подтверждён, файлов нет — это честный ответ, а не пробел.
+            lines.append("⚠️ Логи панели не найдены по путям: "
+                         + ", ".join(FASTPANEL_LOGS))
         return "\n".join(lines)
 
     for path in logs:
@@ -153,10 +319,15 @@ def fastpanel_status(checker):
     """Состояние панели, её nginx/php-fpm и доступность веб-интерфейса."""
     lines = ["=== СОСТОЯНИЕ ПАНЕЛИ FASTPANEL ==="]
 
-    unit = fastpanel_unit(checker)
+    unit, unchecked = fastpanel_unit_info(checker)
     if unit:
         out, _, _ = checker.run(f'systemctl is-active {q(unit)} 2>&1')
         lines.append(f"Служба панели {unit}: {out.strip() or 'unknown'}")
+    elif unchecked:
+        # Тот же закон, что в 1.19–1.27: «не проверено» не имеет права
+        # печататься как «не найдена». Здесь это ещё и дежурный ответ на
+        # любом хосте без systemd (контейнер, chroot, сломанный bus).
+        lines.append(unchecked)
     else:
         lines.append("⚠️ Служба панели не найдена")
 
@@ -608,7 +779,7 @@ def fastpanel_diag(checker):
     """Панель не открывается / 404: юнит, journal, пакет, порт, лог, hostname."""
     lines = ["=== ДИАГНОСТИКА ПАНЕЛИ FASTPANEL ==="]
 
-    unit = fastpanel_unit(checker)
+    unit, unchecked = fastpanel_unit_info(checker)
     if unit:
         out, _, _ = checker.run(f'systemctl is-active {q(unit)} 2>&1')
         status = out.strip() or 'unknown'
@@ -619,6 +790,13 @@ def fastpanel_diag(checker):
         if out.strip():
             lines.append(f"--- journal {unit} (последние 15 строк) ---")
             lines.append(out.strip())
+    elif unchecked:
+        # «Панель не открывается» — самый ответственный отчёт серии: по нему
+        # оператор решает, переустанавливать ли панель. Прежняя строка
+        # «Служба панели не найдена» на хосте без systemd (контейнер, chroot,
+        # мёртвый bus) была ложью ВСЕГДА, потому что `2>/dev/null | head -1`
+        # не умеет отвечать «не смогли посмотреть» в принципе.
+        lines.append("❌ " + unchecked)
     else:
         lines.append("❌ Служба панели не найдена (fastpanel2-engine / fastpanel)")
 
@@ -638,11 +816,16 @@ def fastpanel_diag(checker):
     if code in ('000', ''):
         lines.append("⚠️ Порт 8888 не отвечает — смотрите статус службы и journal выше.")
 
-    logs = find_fastpanel_logs(checker, limit=1)
+    logs, log_gaps = find_fastpanel_logs_info(checker, limit=1)
     for path in logs[:1]:
         out, _, _ = checker.run(f'tail -n 20 {q(path)} 2>&1')
         lines.append(f"\n--- {path} (последние 20 строк) ---")
         lines.append(out.strip() or "(файл пуст)")
+    if not logs and log_gaps:
+        # Пустой список логов в отчёте «панель не открывается» оператор читает
+        # как «логировать нечего»; закрытый каталог логов — другой ответ и
+        # другое лечение (права), и здесь он обязан быть назван.
+        lines.extend(log_gaps)
 
     out, _, _ = checker.run('hostname -f 2>/dev/null')
     host_f = out.strip()
