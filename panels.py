@@ -1,4 +1,6 @@
 """Управление панелями: ISPmanager (mgrctl) и FastPanel (systemd-юниты)."""
+import re
+
 from common import q, create_backup, find_files_info
 
 
@@ -116,8 +118,8 @@ SYSTEMD_ABSENT_MARKS = (
 
 UNIT_UNCHECKED_NOTE = (
     "⚠️ Наличие службы панели проверить не удалось — состояние не проверено: "
-    "«{why}». Это НЕ «юнита нет»: ответьте на причину (права, systemd, PATH) и "
-    "повторите, а не ставьте панель")
+    "«{why}». Это пробел, а не диагноз: ответьте на причину (права, systemd, "
+    "PATH) и повторите, а не ставьте панель")
 
 
 def systemd_unit_state(out, err, rc):
@@ -315,14 +317,220 @@ def fastpanel_logs(checker):
     return "\n".join(lines)
 
 
+# Службы, которыми управляет FastPanel.
+#
+# Прежняя форма спрашивала их одной сбор строкой
+#
+#     systemctl is-active nginx 2>/dev/null; systemctl is-active php-fpm
+#     2>/dev/null; systemctl is-active mysql 2>/dev/null || systemctl
+#     is-active mariadb 2>/dev/null
+#
+# в ней терялось ВСЁ сразу: код возврата сборки принадлежал ПОСЛЕДНЕЙ команде,
+# stdout четырёх служб шёл в один поток без разделителей («active active» —
+# непонятно, чей), `2>/dev/null` глушил единственную строку с причиной, а
+# `|| mariadb` вообще молча пропускал mariadb, когда mysql «ответил».
+#
+# Замер живьём на хосте без systemd (настоящий /bin/bash, PID1 не systemd):
+#
+#     for s in nginx php-fpm mysql mariadb; do printf "@%s\n" "$s";
+#     LC_ALL=C systemctl is-active "$s"; done
+#       stdout: '@nginx\n@php-fpm\n@mysql\n@mariadb\n'   (тел — НЕТ)
+#       stderr: 'System has not been booted with systemd as init system
+#                (PID 1). Can't operate.'
+#
+# То есть система ничего не ответила про службы, но прежний отчёт на этом
+# печатал «nginx / php-fpm / mysql(mariadb): unknown», и оператор читал его как
+# «стек мёртв». Пустое ТЕЛО под маркером и есть признак «не проверено».
+#
+# Известное ограничение, которое здесь СОЗНАТЕЛЬНО не чинится (записано в
+# «остаточное враньё»): `systemctl is-active` для несуществующей службы
+# печатает 'inactive' — «юнита нет» и «стоит, но остановлена» через is-active
+# неразличимы. Различает их `systemctl cat` (примитив 1.28.0), но это +1 запрос
+# на службу; здесь важна подмена «не проверено» → «не работает», она снята.
+PANEL_STACK_UNITS = ('nginx', 'php-fpm', 'mysql', 'mariadb')
+
+# Порт веб-интерфейса панели. Литерал 8888 до этого был вшит в код в трёх
+# местах (здесь, в fastpanel_diag и в комментарии); с появлением параметра
+# `port=` он обязан стать константой — по образцу ISP_PANEL_PORT. Старые сборки
+# FastPanel слушают 4444, но менять значение под них нельзя: это другой хост, а
+# не другая ветка кода (проверка живьём делалась на 8888/8899).
+FASTPANEL_PORT = 8888
+
+# Схемы, которыми спрашивают панель: HTTPS первой, потому что панель отдаёт
+# именно https, а HTTP-ответ на 8888 — отдельный диагноз (редирект или
+# голый порт).
+# Протокол `v=$(curl …); echo "rc=$? code=$v"` — единственный замеренный
+# способ сохранить И HTTP-код, И код возврата: любой промежуточный `echo`
+# крадёт $? (замер: 'rc=0 code=000' вместо честного 'rc=7 code=000').
+PANEL_SCHEMES = ('https', 'http')
+
+# Коды возврата curl, которые являются ОТВЕТОМ системы (а не отказом
+# отвечать). 127 здесь нет намеренно: это «бинарника curl нет» — пробел.
+CURL_RC_ANSWER = {
+    6: 'не разрешился хост',
+    7: 'отказ в соединении (порт не слушает)',
+    28: 'таймаут',
+    35: 'слушает, но не по TLS — стучимся не туда',
+}
+
+STACK_NO_ANSWER = 'не проверено'
+ENDPOINT_NO_ANSWER = 'не проверено'
+
+STACK_UNCHECKED_NOTE = (
+    "⚠️ Состояние служб не проверено ({n} из {total}): systemctl ответил про "
+    "канал, а не про службы — «{why}». Это пробел, а не диагноз службам: "
+    "чинить доступ к systemd, а не перезапускать панель")
+
+# Общий закон серии: признание НЕ имеет права называть диагноз, против
+# которого оно предупреждает. Прежний текст «Это НЕ «порт не отвечает»» делал
+# непроверяемым сам контроль «в строке эндпоинта нет «не отвечает»» — он падал
+# на тексте признания, а не на подмене. Класс заперт сторожем
+# TestNotesDoNotQuoteDiagnoses (tests/test_panels.py).
+ENDPOINT_UNCHECKED_NOTE = (
+    "⚠️ Веб-интерфейс :{port} не проверен ({n} из {total}): curl не выполнен — "
+    "«{why}». Это пробел, а не диагноз порту: без curl проверка невозможна")
+
+
+def parse_marker_sections(out):
+    """Разобрать stdout с маркерами '@метка' в {метка: [непустые строки]}.
+
+    Маркеры нужны потому, что вывод нескольких команд в один поток неразличим:
+    без них не понять, где кончается ответ одной службы и начинается другой.
+    Метка заводится printf'ом НАМЕРЕННО — это единственный способ сохранить
+    структуру, не раздувая число SSH-запросов.
+    """
+    sections = {}
+    key = None
+    for line in (out or '').splitlines():
+        if line.startswith('@'):
+            key = line[1:].strip()
+            sections.setdefault(key, [])
+            continue
+        if key is not None and line.strip():
+            sections[key].append(line.strip())
+    return sections
+
+
+def _first_line(text):
+    return next((ln.strip() for ln in (text or '').splitlines()
+                 if ln.strip()), '')[:200]
+
+
+def panel_stack_view(out, err):
+    """(строка служб, признание|None) по маркерному ответу `is-active`.
+
+    Различение — по КАНАЛУ, а не по тексту: сообщение про bus локализуется так
+    же, как вывод dpkg (урок 1.28.0). Пустое тело при непустом stderr = ответ
+    про канал; пустое тело при пустом stderr = обрыв. Оба — «не проверено».
+    """
+    sections = parse_marker_sections(out)
+    why = _first_line(err)
+    parts, missing = [], 0
+    for unit in PANEL_STACK_UNITS:
+        body = sections.get(unit) or []
+        if body:
+            parts.append(f'{unit}: {body[0]}')
+        else:
+            parts.append(f'{unit}: {STACK_NO_ANSWER}')
+            missing += 1
+    note = None
+    if missing:
+        note = STACK_UNCHECKED_NOTE.format(
+            n=missing, total=len(PANEL_STACK_UNITS),
+            why=why or 'systemctl вернул пустой вывод')
+    return ' / '.join(parts), note
+
+
+def panel_endpoint_view(out, err, port=FASTPANEL_PORT):
+    """({схема: ответ}, признание|None) по маркерному curl-дуэту.
+
+    Замер живьём (настоящий curl и настоящий http.server на 127.0.0.1):
+
+        живой порт          -> '@https\\nrc=0 code=200'
+        порт закрыт         -> 'rc=7 code=000'      — ОТВЕТ (порт не слушает)
+        http-порт под https -> 'rc=35 code=000'     — порт СЛУШАЕТ, но не TLS
+        бинарника curl нет  -> 'rc=127 code=…: command not found' — ПРОБЕЛ
+
+    Прежний `curl … 2>/dev/null` на последней строке давал пустоту и в отчёте
+    звучало «не отвечает»: оператор шёл перезапускать панель вместо того, чтобы
+    поставить curl. Поэтому rc=127 и отсутствие секции — пробел, а всё
+    остальное — ответ системы.
+    """
+    sections = parse_marker_sections(out)
+    answers, missing = {}, 0
+    why = _first_line(err)
+    for scheme in PANEL_SCHEMES:
+        body = sections.get(scheme) or []
+        if not body:
+            answers[scheme] = ENDPOINT_NO_ANSWER
+            missing += 1
+            why = why or 'curl не ответил'
+            continue
+        head = body[0]
+        rc_m = re.search(r'rc=(\d+)', head)
+        # `.*$`, а НЕ `\S*`: HTTP-код идёт без пробелов, но на
+        # НЕвыполненном curl в это поле попадает ответ системы целиком, а он
+        # через пробелы. Замер живьём (отсутствующий бинарник, настоящий
+        # /bin/bash):
+        #   'rc=127 code=/bin/bash: line 1: curl: command not found'
+        #     \S*  -> '/bin/bash:'                    (огрызок)
+        #     .*   -> '/bin/bash: line 1: curl: command not found'
+        # Признание, обрезанное до первого слова, ничего оператору не говорит:
+        # та же болезнь (диагноз системы потерян по дороге в отчёт), против
+        # которой написан весь слайс.
+        code_m = re.search(r'code=(.*)$', head)
+        rc = int(rc_m.group(1)) if rc_m else None
+        code = (code_m.group(1) if code_m else '').strip()
+        if rc == 127:
+            answers[scheme] = ENDPOINT_NO_ANSWER
+            missing += 1
+            why = _first_line(code) or why or 'curl не выполнен'
+        elif rc == 0:
+            answers[scheme] = code or 'rc=0 без HTTP-кода'
+        elif rc in CURL_RC_ANSWER:
+            answers[scheme] = CURL_RC_ANSWER[rc]
+        elif rc is None:
+            answers[scheme] = ENDPOINT_NO_ANSWER
+            missing += 1
+            why = why or head
+        else:
+            answers[scheme] = f'код curl {rc}' + (f' ({code})' if code else '')
+    note = None
+    if missing:
+        note = ENDPOINT_UNCHECKED_NOTE.format(
+            port=port, n=missing, total=len(PANEL_SCHEMES),
+            why=why or 'менеджер не ответил')
+    return answers, note
+
+
+def _stack_probe_cmd():
+    """Одна SSH-команда, спрашивающая все службы стека с маркерами."""
+    names = ' '.join(q(unit) for unit in PANEL_STACK_UNITS)
+    return ('for s in %s; do printf "@%%s\\n" "$s"; '
+            'LC_ALL=C systemctl is-active "$s"; done' % names)
+
+
+def _endpoint_probe_cmd(port=FASTPANEL_PORT, schemes=PANEL_SCHEMES):
+    """Одна SSH-команда, меряющая HTTPS и HTTP с сохранением rc каждого."""
+    names = ' '.join(q(s) for s in schemes)
+    return ('for p in %s; do printf "@%%s\\n" "$p"; '
+            'v=$(curl -sk -m 5 -o /dev/null -w "%%{http_code}" '
+            '"$p://127.0.0.1:%d/" 2>&1); echo "rc=$? code=$v"; done'
+            % (names, port))
+
+
 def fastpanel_status(checker):
     """Состояние панели, её nginx/php-fpm и доступность веб-интерфейса."""
     lines = ["=== СОСТОЯНИЕ ПАНЕЛИ FASTPANEL ==="]
 
     unit, unchecked = fastpanel_unit_info(checker)
     if unit:
-        out, _, _ = checker.run(f'systemctl is-active {q(unit)} 2>&1')
-        lines.append(f"Служба панели {unit}: {out.strip() or 'unknown'}")
+        out, err, _ = checker.run(f'systemctl is-active {q(unit)} 2>&1')
+        # stdout и stderr разделены намеренно: у остановленной службы stdout
+        # = 'inactive' (ответ системы), а при мёртвом bus stdout пуст, а текст
+        # живёт в stderr (замер) — 'unknown' смешивал эти два случая.
+        status = out.strip() or f'не проверено ({_first_line(err) or "пустой ответ"})'
+        lines.append(f"Служба панели {unit}: {status}")
     elif unchecked:
         # Тот же закон, что в 1.19–1.27: «не проверено» не имеет права
         # печататься как «не найдена». Здесь это ещё и дежурный ответ на
@@ -331,23 +539,25 @@ def fastpanel_status(checker):
     else:
         lines.append("⚠️ Служба панели не найдена")
 
-    out, _, _ = checker.run(
-        'systemctl is-active nginx 2>/dev/null; '
-        'systemctl is-active php-fpm 2>/dev/null; '
-        'systemctl is-active mysql 2>/dev/null || systemctl is-active mariadb 2>/dev/null'
-    )
-    lines.append("nginx / php-fpm / mysql(mariadb): " + (out.strip().replace("\n", " / ") or "unknown"))
+    out, err, _ = checker.run(_stack_probe_cmd())
+    stack, stack_note = panel_stack_view(out, err)
+    lines.append(" / ".join(PANEL_STACK_UNITS) + ": " + stack)
+    if stack_note:
+        lines.append(stack_note)
 
     # Панель FastPanel слушает 8888 (или 4444 в старых сборках) — проверяем локально.
-    out, _, _ = checker.run(
-        "curl -sk -m 5 -o /dev/null -w '%{http_code}' https://127.0.0.1:8888/ 2>/dev/null; "
-        "echo; curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8888/ 2>/dev/null"
-    )
-    codes = [c.strip() for c in out.split("\n") if c.strip()]
-    lines.append(f"Веб-интерфейс :8888 (https/http коды): {' / '.join(codes) or 'не отвечает'}")
+    out, err, _ = checker.run(_endpoint_probe_cmd())
+    answers, endpoint_note = panel_endpoint_view(out, err)
+    lines.append(f"Веб-интерфейс :{FASTPANEL_PORT} (https/http): "
+                 + ' / '.join(f'{s}={answers[s]}' for s in PANEL_SCHEMES))
+    if endpoint_note:
+        lines.append(endpoint_note)
 
-    out, _, _ = checker.run('nginx -t 2>&1 | tail -3')
-    lines.append(f"Синтаксис nginx: {out.strip() or 'нет вывода'}")
+    # `| tail -3` уехал на python: пайп забирал себе код возврата nginx -t
+    # (он отдаёт rc=1 при битом конфиге — tail доволен всегда).
+    out, _, _ = checker.run('LC_ALL=C nginx -t 2>&1')
+    shown = '\n'.join(out.strip().splitlines()[-3:])
+    lines.append(f"Синтаксис nginx: {shown or 'нет ответа'}")
     return "\n".join(lines)
 
 
@@ -766,8 +976,8 @@ def ispmanager_license_activate(checker, key):
 # меняется через mogwai chpasswd (docs.fastvps.ru FAQ).
 
 PKG_UNCHECKED_NOTE = (
-    "пакет fastpanel2 не проверен: «{why}». Это НЕ «пакета нет»: лечение — "
-    "права/PATH на хосте, а не переустановка панели")
+    "пакет fastpanel2 не проверен: «{why}». Это пробел, а не диагноз пакету: "
+    "лечение — права/PATH на хосте, а не переустановка панели")
 
 
 # Формы без пайпа: rc=127 (бинарника нет) и rc=2 (база/lock недоступны) при
@@ -898,28 +1108,156 @@ def fastpanel_package_status(checker):
     return fastpanel_package_status_info(checker)[0]
 
 
+# ==================== Журнал, FQDN, состояние службы (1.31.0) ==============
+#
+# Замеры живьём (этот хост: journalctl и hostname есть, bus мёртв):
+#
+#   journalctl -u nginx -n 15 --no-pager 2>&1   -> rc=0, '-- No entries --'
+#   journalctl -u networ-such-unit-xyz ...      -> rc=0, '-- No entries --'
+#   hostname -f 2>/dev/null  (бинарника нет)    -> rc=127 + ПУСТО
+#   hostname -f 2>&1         (бинарника нет)    -> rc=127 + 'command not found'
+#
+# Первая строка замера — главное ОГРАНИЧЕНИЕ, а не победа: journalctl не
+# различает «записей нет», «юнита нет» и «bus мёртв» — на всех трёх он печатает
+# '-- No entries --' при rc=0. Выдумывать различение, которого система не даёт,
+# нельзя (закон серии), поэтому здесь честный ОДИН ответ: «записей нет» с
+# цитатой системы. Различима ДРУГАЯ подмена, против которой и написан слайс:
+# прежний `journalctl … 2>/dev/null` на rc=127 и на любой ошибке давал пустоту,
+# а пустота в diag означала МОЛЧАНИЕ — строки журнала просто не было. Молчание
+# в отчёте «панель не открывается» читается оператором как «проверили, чисто».
+#
+# LC_ALL=C здесь обязателен: '-- No entries --' локализуется, а разбор идёт по
+# этой строке (текст как маркер допустим ТОЛЬКО при зафиксированной локали,
+# иначе — урок 1.28.0 про ru-локаль вывод dpkg).
+JOURNAL_NO_ENTRIES = '-- no entries --'
+
+JOURNAL_UNCHECKED_NOTE = (
+    "⚠️ Журнал {unit} не проверен: journalctl не ответил — «{why}». Это "
+    "пробел, а не диагноз журналу: сначала бинарник и доступ, потом выводы о "
+    "панели")
+
+JOURNAL_EMPTY_ANSWER = (
+    "ℹ️ Журнал {unit}: записей нет — ответ системы «{quote}»")
+
+FQDN_UNCHECKED_NOTE = (
+    "⚠️ FQDN не проверен (hostname -f): «{why}». Это пробел, а не диагноз "
+    "имени: совет про hostnamectl был бы выдумкой")
+
+# Коды возврата curl, которые означают «порту от нас ничего не дошло» — то есть
+# имеют право назваться «не отвечает». 127 здесь нет НАМЕРЕННО: это «бинарника
+# curl нет» — пробел, а не диагноз порту (решающий случай слайса).
+CURL_RC_SILENT = (6, 7, 28)
+
+
+def panel_journal_lines(out, err, rc, unit):
+    """Строки отчёта о журнале службы: ТРИ состояния вместо прежних двух.
+
+    Прежний код знал только «не пусто -> печатать»:
+
+        out, _, _ = checker.run(f'journalctl -u {unit} -n 15 --no-pager'
+                                ' 2>/dev/null')
+        if out.strip():
+            lines.append(...)
+
+    Поэтому «журнал пуст», «journalctl не выполнен» (rc=127 — хост без
+    journalctl) и «journalctl упал» (нет места на диске) сливались в ОТСУТСТВИЕ
+    строки, то есть в «всё в порядке». Здесь:
+
+        rc != 0                      -> признание с цитатой ответа
+        rc == 0 + пустой вывод       -> признание (так journalctl не отвечает)
+        rc == 0 + '-- No entries --' -> ответ системы: записей нет
+        rc == 0 + строки             -> сами строки (найденное не теряется)
+    """
+    why = _first_line(err or out)
+    if rc != 0:
+        return [JOURNAL_UNCHECKED_NOTE.format(
+            unit=unit, why=why or f'код возврата {rc}')]
+    body = [ln.strip() for ln in (out or '').splitlines() if ln.strip()]
+    if not body:
+        return [JOURNAL_UNCHECKED_NOTE.format(
+            unit=unit, why='journalctl вернул успех с пустым выводом')]
+    if len(body) == 1 and body[0].lower() == JOURNAL_NO_ENTRIES:
+        return [JOURNAL_EMPTY_ANSWER.format(unit=unit, quote=body[0])]
+    return [f'--- Журнал {unit} (последние 15 строк) ---'] + body
+
+
+def panel_fqdn_lines(out, err, rc):
+    """Строки отчёта про FQDN: три состояния вместо прежних двух.
+
+    Прежний `hostname -f 2>/dev/null` при отсутствующем hostname давал rc=127 и
+    пустоту, а пустота означала «молчать»: оператор не узнавал, что имя вообще
+    не посмотрели — и что совета про hostnamectl нет не потому, что имя в
+    порядке, а потому что проверять было нечем.
+    """
+    if rc != 0:
+        return [FQDN_UNCHECKED_NOTE.format(
+            why=_first_line(err or out) or f'код возврата {rc}')]
+    fqdn = _first_line(out)
+    if not fqdn:
+        return [FQDN_UNCHECKED_NOTE.format(
+            why='hostname -f ответил пусто при rc=0')]
+    if '.' in fqdn:
+        return []
+    return [f"\n⚠️ hostname «{fqdn}» без точки — ProFTPD и выпуск",
+            "   сертификатов могут ругаться. Лечение:",
+            "   hostnamectl hostname www.example.com"]
+
+
+def panel_service_state_lines(out, err, rc, unit):
+    """Строка состояния службы панели: ответ системы против пробела.
+
+    Прежняя форма `out.strip() or 'unknown'` с иконкой ❌ печатала «unknown» и
+    когда служба реально остановлена (stdout='inactive', rc=3 — ОТВЕТ), и когда
+    systemctl не ответил ничего (мёртвый bus: stdout пуст, текст в stderr —
+    ПРОБЕЛ). Первое — диагноз, второе признанием обязано назваться; 'unknown'
+    с ❌ стирал разницу, и оператор шёл перезапускать панель там, где надо
+    смотреть systemd.
+    """
+    state = _first_line(out)
+    if state:
+        icon = '✅' if state == 'active' else '❌'
+        return [f'{icon} Служба {unit}: {state}']
+    why = _first_line(err or out)
+    return [f'⚠️ Служба {unit}: не проверено — '
+            f'«{why or f"пустой ответ systemctl (rc={rc})"}»']
+
+
+def panel_endpoint_rcs(out):
+    """{схема: код возврата curl} по маркерному ответу дуэта.
+
+    Нужны именно коды, а не тексты: решение «имеет ли право прозвучать «порт
+    не отвечает»» обязано опираться на rc. Формулировка как признак не
+    годится — она локализуется (урок 1.28.0).
+    """
+    rcs = {}
+    for scheme, body in parse_marker_sections(out).items():
+        m = re.search(r'rc=(\d+)', body[0]) if body else None
+        rcs[scheme] = int(m.group(1)) if m else None
+    return rcs
+
+
 def fastpanel_diag(checker):
     """Панель не открывается / 404: юнит, journal, пакет, порт, лог, hostname."""
     lines = ["=== ДИАГНОСТИКА ПАНЕЛИ FASTPANEL ==="]
 
     unit, unchecked = fastpanel_unit_info(checker)
     if unit:
-        out, _, _ = checker.run(f'systemctl is-active {q(unit)} 2>&1')
-        status = out.strip() or 'unknown'
-        icon = '✅' if status == 'active' else '❌'
-        lines.append(f"{icon} Служба {unit}: {status}")
-        out, _, _ = checker.run(
-            f'journalctl -u {q(unit)} -n 15 --no-pager 2>/dev/null')
-        if out.strip():
-            lines.append(f"--- journal {unit} (последние 15 строк) ---")
-            lines.append(out.strip())
+        out, err, rc = checker.run(f'systemctl is-active {q(unit)} 2>&1')
+        lines.extend(panel_service_state_lines(out, err, rc, unit))
+        out, err, rc = checker.run(
+            f'LC_ALL=C journalctl -u {q(unit)} -n 15 --no-pager 2>&1')
+        lines.extend(panel_journal_lines(out, err, rc, unit))
     elif unchecked:
         # «Панель не открывается» — самый ответственный отчёт серии: по нему
         # оператор решает, переустанавливать ли панель. Прежняя строка
         # «Служба панели не найдена» на хосте без systemd (контейнер, chroot,
         # мёртвый bus) была ложью ВСЕГДА, потому что `2>/dev/null | head -1`
         # не умеет отвечать «не смогли посмотреть» в принципе.
-        lines.append("❌ " + unchecked)
+        # Иконка ❌ сюда НЕ ставится: само признание уже помечено ⚠️, а «❌ ⚠️»
+        # читается как две противоречащие метки — диагноз и пробел одновременно
+        # (дефект, который внёл прошлый слайс; заперт
+        # test_unit_unchecked_has_no_error_icon).
+        lines.append(unchecked)
     else:
         lines.append("❌ Служба панели не найдена (fastpanel2-engine / fastpanel)")
 
@@ -944,13 +1282,26 @@ def fastpanel_diag(checker):
         # доступ к менеджеру пакетов» — противоположные действия.
         lines.append(f"\n⚠️ {pkg_note}")
 
-    out, _, _ = checker.run(
-        "curl -sk -m 5 -o /dev/null -w '%{http_code}' "
-        "https://127.0.0.1:8888/ 2>/dev/null")
-    code = out.strip() or '000'
-    lines.append(f"\nВеб-интерфейс :8888 (https с localhost): {code}")
-    if code in ('000', ''):
-        lines.append("⚠️ Порт 8888 не отвечает — смотрите статус службы и journal выше.")
+    # Тот же протокол, что в fastpanel_status: одна SSH-команда, код возврата
+    # каждой схемы сохранён явно. Прежняя форма глушила причину через
+    # `2>/dev/null`, а пустоту читала как '000' — из-за чего «curl не
+    # установлен», «порт закрыт» и обрыв канала давали ОДНУ строку «Порт 8888
+    # не отвечает», и оператор перезапускал панель вместо того, чтобы поставить
+    # curl.
+    out, err, _ = checker.run(_endpoint_probe_cmd())
+    answers, endpoint_note = panel_endpoint_view(out, err)
+    lines.append(f"\nВеб-интерфейс :{FASTPANEL_PORT} (https/http): "
+                 + ' / '.join(f'{sch}={answers[sch]}'
+                              for sch in PANEL_SCHEMES))
+    if endpoint_note:
+        # Пробел назван: «перезапустить панель» и «поставить curl» —
+        # противоположные действия.
+        lines.append(endpoint_note)
+    elif panel_endpoint_rcs(out).get('https') in CURL_RC_SILENT:
+        # Найденный факт не теряется (закон серии): при честном отказе строка
+        # «порт не отвечает» обязана остаться — это ответ системы, а не пробел.
+        lines.append(f"⚠️ Порт {FASTPANEL_PORT} не отвечает — смотрите статус "
+                     f"службы и журнал выше.")
 
     logs, log_gaps = find_fastpanel_logs_info(checker, limit=1)
     for path in logs[:1]:
@@ -963,12 +1314,11 @@ def fastpanel_diag(checker):
         # другое лечение (права), и здесь он обязан быть назван.
         lines.extend(log_gaps)
 
-    out, _, _ = checker.run('hostname -f 2>/dev/null')
-    host_f = out.strip()
-    if host_f and '.' not in host_f:
-        lines.append(f"\n⚠️ hostname «{host_f}» без точки — ProFTPD и выпуск")
-        lines.append("   сертификатов могут ругаться. Лечение:")
-        lines.append("   hostnamectl hostname www.example.com")
+    # `2>&1`, а не `2>/dev/null`: на отсутствующем hostname прежняя форма
+    # давала rc=127 и пустоту, а пустота означала «молчать» — оператор считал,
+    # что FQDN в порядке (замер живьём).
+    out, err, rc = checker.run('hostname -f 2>&1')
+    lines.extend(panel_fqdn_lines(out, err, rc))
     return "\n".join(lines)
 
 
