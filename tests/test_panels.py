@@ -128,8 +128,17 @@ class TestFastpanelStatus:
         assert 'successful' in out
 
     def test_status_without_unit(self):
-        out = panels_mod.fastpanel_status(FakeSSH())
+        # Переформулировано объявленно (1.28.0). Было заперто: МОЛЧАНИЕ сервера
+        # (FakeSSH без маршрутов = «мы не посмотрели») как «Служба панели не
+        # найдена» — ровно та ложь, которую чинит слайс (закон 1.19–1.27:
+        # «не проверено» ≠ «нет»). Инвариант усилен, а не ослаблен: честный
+        # ответ системы «юнита нет» обязан и впредь называться «не найдена»,
+        # а молчание — признаться.
+        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT)])
+        out = panels_mod.fastpanel_status(c)
         assert 'Служба панели не найдена' in out
+        out2 = panels_mod.fastpanel_status(FakeSSH())
+        assert 'не проверено' in out2 and 'не найдена' not in out2
 
 
 # ==================== php_fpm_units ====================
@@ -788,8 +797,13 @@ class TestFastpanelDiag:
         assert 'hostnamectl' not in out
 
     def test_missing_package_explains_404(self):
-        # Грабля из KB FASTPANEL: 404 на :8888 = снятый пакет панели
-        c = FakeSSH()
+        # Грабля из KB FASTPANEL: 404 на :8888 = снятый пакет панели.
+        # Переформулировано объявленно (1.28.0): раньше «юнита нет» подменялся
+        # молчанием (FakeSSH без маршрутов = «не проверено»), и тест запирал
+        # ложь как эталон. Теперь система обязана ОТВЕТИТЬ «юнита нет» — и
+        # «не найдена» заперта именно за честным ответом; молчание признаётся
+        # в test_diag_names_the_blocker. Все остальные ассерты сохранены.
+        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT)])
         out = panels_mod.fastpanel_diag(c)
         assert '❌ Служба панели не найдена' in out
         assert 'Пакет fastpanel2 НЕ найден' in out
@@ -839,3 +853,214 @@ class TestFastpanelResetPassword:
         c = FakeSSH(default=('', 'mogwai: only root', 1))
         out = panels_mod.fastpanel_reset_password(c, 'LongEnough1')
         assert '❌ Не удалось (rc=1): mogwai: only root' in out
+
+
+# ==================== fastpanel_unit: «НЕ ПРОВЕРЕНО» ≠ «ЮНИТА НЕТ» ==========
+# Живой репро (этот хост, PID1=bwrap, systemd нет). Прежняя команда
+#
+#     systemctl cat UNIT 2>/dev/null | head -1
+#
+# давала rc=0 и ПУСТОЙ stdout и на «юнита нет», и на мёртвый systemd, и на
+# отсутствующий бинарник: пайп с head забирает себе код возврата, а
+# 2>/dev/null глушит единственную строку с причиной. Замер:
+#
+#     fastpanel2-engine        rc=0 out=''   err=''
+#     definitely-no-such-unit  rc=0 out=''   err=''
+#     systemctl cat ... 2>&1   rc=1 'System has not been booted with systemd
+#                                    as init system (PID 1). Can't operate.'
+#
+# То есть fastpanel_unit возвращал None на ЛЮБОМ хосте без живого systemd, а
+# fastpanel_restart по этому «неванию» писал «Служба панели не найдена» и НЕ
+# отправлял systemctl restart — оператор лечил отсутствие панели там, где
+# нужно было смотреть доступ к systemd.
+UNIT_OK = '[Unit]\nDescription=FastPanel 2 engine\n'
+UNIT_ABSENT = ('', 'Failed to get unit file list for fastpanel2-engine.unit: '
+                   'No such file or directory', 1)
+UNIT_DEAD = ('', "System has not been booted with systemd as init system "
+                 "(PID 1). Can't operate.\nFailed to connect to bus: Host is down",
+             1)
+# Грабельный кейс: rc=127 даёт текст «No such file or directory». Если смотреть
+# только на текст, «systemctl нет» станет «юнита нет» — ровно та подмена, из-за
+# которой оператор пойдёт ставить панель вместо починки PATH.
+UNIT_NO_BINARY = ('', 'bash: line 1: systemctl: command not found', 127)
+
+
+class TestSystemdUnitState:
+    """Классификатор ответов systemctl — три разных диагноза вместо None."""
+
+    @pytest.mark.parametrize('out, err, rc, want', [
+        (UNIT_OK, '', 0, 'unit'),
+        ('', UNIT_ABSENT[1], 1, 'absent'),
+        ('', UNIT_DEAD[1], 1, 'unknown'),
+        ('', UNIT_NO_BINARY[1], 127, 'unknown'),
+        ('', '', 0, 'unknown'),          # сервер молчит: это не «юнита нет»
+        ('', 'в чём-то незнакомом', 1, 'unknown'),   # не выдумываем диагноз
+    ])
+    def test_states(self, out, err, rc, want):
+        assert panels_mod.systemd_unit_state(out, err, rc)[0] == want
+
+    def test_missing_binary_wins_over_its_own_text(self):
+        # Текст rc=127 содержит «No such file or directory»; проверка по rc
+        # обязана идти ДО разбора маркеров отсутствия юнита.
+        out, err = panels_mod.systemd_unit_state('', 'sh: systemctl: not found',
+                                                127)
+        assert out == 'unknown'
+
+
+class TestFastpanelUnitDistinguishesStates:
+    def test_live_unit_is_found_without_confession(self):
+        c = FakeSSH(routes=[('systemctl cat', UNIT_OK)])
+        unit, why = panels_mod.fastpanel_unit_info(c)
+        assert unit == 'fastpanel2-engine' and why is None
+
+    def test_true_absence_is_honest_and_silent(self):
+        # Система ОТВЕТИЛА «юнита нет» — это диагноз, а не пробел: признание
+        # не нужно, иначе оно обесценит настоящие.
+        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT)])
+        unit, why = panels_mod.fastpanel_unit_info(c)
+        assert unit is None and why is None
+
+    def test_dead_systemd_is_not_reported_as_absent_unit(self):
+        c = FakeSSH(routes=[('systemctl cat', UNIT_DEAD)])
+        unit, why = panels_mod.fastpanel_unit_info(c)
+        assert unit is None
+        assert why and 'не проверено' in why
+        assert 'booted' in why or 'bus' in why
+
+    def test_missing_systemctl_binary_is_unknown_not_absent(self):
+        c = FakeSSH(routes=[('systemctl cat', UNIT_NO_BINARY)])
+        unit, why = panels_mod.fastpanel_unit_info(c)
+        assert unit is None and why is not None
+        assert 'не проверено' in why
+
+    def test_silent_server_is_not_reported_as_absent_unit(self):
+        unit, why = panels_mod.fastpanel_unit_info(FakeSSH())
+        assert unit is None and why is not None and 'не проверено' in why
+
+    def test_second_unit_still_found_after_unknown_first(self):
+        # Первый юнит — «не посмотрели», второй ответил «его нет»: находка
+        # есть, признания быть не должно.
+        c = FakeSSH(routes=[('systemctl cat fastpanel2-engine', UNIT_DEAD),
+                            ('systemctl cat fastpanel', UNIT_OK)])
+        unit, why = panels_mod.fastpanel_unit_info(c)
+        assert unit == 'fastpanel' and why is None
+
+    def test_command_leaves_rc_with_systemctl(self):
+        c = FakeSSH()
+        panels_mod.fastpanel_unit_info(c)
+        cmd = c.find('systemctl cat')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd, 'причина пустоты снова в /dev/null'
+        assert '2>&1' in cmd
+        assert '| head' not in cmd, 'пайп обнуляет rc systemctl'
+
+    def test_wrapper_keeps_plain_shape(self):
+        c = FakeSSH(routes=[('systemctl cat', UNIT_OK)])
+        assert panels_mod.fastpanel_unit(c) == 'fastpanel2-engine'
+        assert panels_mod.fastpanel_unit(FakeSSH(routes=[('systemctl cat',
+                                                          UNIT_ABSENT)])) is None
+
+
+class TestFastpanelRefusalsNameTheirGround:
+    """Отказ обязан называть своё основание: «не найдена» и «не посмотрели» —
+    разные решения оператора (ставить панель против чинить systemd)."""
+
+    def test_restart_with_dead_systemd_does_not_claim_absence(self):
+        c = FakeSSH(routes=[('systemctl cat', UNIT_DEAD)])
+        out = panels_mod.fastpanel_restart(c)
+        assert '❌' in out
+        assert c.find('systemctl restart') is None
+        assert 'не проверено' in out
+        assert 'не найдена' not in out
+
+    def test_restart_on_true_absence_still_says_absent(self):
+        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT)])
+        out = panels_mod.fastpanel_restart(c)
+        assert '❌' in out and 'не найдена' in out
+        assert c.find('systemctl restart') is None
+
+    def test_status_without_a_view_says_unchecked(self):
+        c = FakeSSH(routes=[('systemctl cat', UNIT_DEAD)])
+        out = panels_mod.fastpanel_status(c)
+        assert 'не проверено' in out and 'не найдена' not in out
+
+    def test_diag_names_the_blocker(self):
+        c = FakeSSH(routes=[('systemctl cat', UNIT_DEAD)])
+        out = panels_mod.fastpanel_diag(c)
+        assert 'не проверено' in out and 'не найдена' not in out
+
+
+# ==================== Логи панели: примитив 1.20 вместо слепого ls =========
+def _ff(paths=(), dirs=()):
+    """Реалистичный ответ примитива поиска: FFDIR-состояния + paths + FFCOUNT.
+
+    Двойник обязан говорить языком системы (урок 1.27.0): 'exists\\n' описывал
+    ответ, которого ls не выдаёт никогда, и 1492 теста были зелёными над
+    мёртвой функцией.
+    """
+    out = [f'FFDIR {st} {p}' for st, p in dirs] + list(paths)
+    out.append(f'FFCOUNT {len(paths)}')
+    return '\n'.join(out) + '\n'
+
+
+NOTHING = [('FFCOUNT', 'FFCOUNT 0\n')]
+
+
+class TestFastpanelLogsExplainsGaps:
+    def test_closed_log_dir_is_not_reported_as_absent(self):
+        c = FakeSSH(routes=[('/var/log/fastpanel2/engine.log',
+                             _ff(dirs=[('noperm', '/var/log/fastpanel2')]))]
+                    + NOTHING)
+        logs, notes = panels_mod.find_fastpanel_logs_info(c)
+        assert logs == []
+        assert notes and 'прав' in ' '.join(notes)
+        assert 'нет на сервере' not in ' '.join(notes)
+
+    def test_missing_log_dir_names_the_path(self):
+        c = FakeSSH(routes=[('/var/log/fastpanel2/engine.log',
+                             _ff(dirs=[('missing', '/var/log/fastpanel2')]))]
+                    + NOTHING)
+        logs, notes = panels_mod.find_fastpanel_logs_info(c)
+        assert logs == []
+        assert '/var/log/fastpanel2' in ' '.join(notes)
+        assert 'нет на сервере' in ' '.join(notes)
+        assert 'прав' not in ' '.join(notes)
+
+    def test_found_logs_make_no_complaint(self):
+        c = FakeSSH(routes=[('/var/log/fastpanel2/engine.log',
+                             _ff(paths=['/var/log/fastpanel2/engine.log'],
+                                 dirs=[('ok', '/var/log/fastpanel2')]))]
+                    + NOTHING)
+        logs, notes = panels_mod.find_fastpanel_logs_info(c)
+        assert logs == ['/var/log/fastpanel2/engine.log'] and notes == []
+
+    def test_unconfirmed_search_is_confessed_once(self):
+        # Пустой ответ без FFDIR/FFCOUNT — «не проверено», а не «логов нет».
+        logs, notes = panels_mod.find_fastpanel_logs_info(FakeSSH())
+        assert logs == []
+        assert len(notes) == 1 and 'не' in notes[0]
+
+    def test_report_carries_the_reason_and_the_paths(self):
+        c = FakeSSH(routes=[('/var/log/fastpanel2/engine.log',
+                             _ff(dirs=[('noperm', '/var/log/fastpanel2')]))]
+                    + NOTHING)
+        out = panels_mod.fastpanel_logs(c)
+        assert '⚠️' in out
+        assert 'прав' in out
+        # заперто ранее: пути просмотра обязаны остаться — по ним и чинят
+        assert '/var/log/fastpanel2/engine.log' in out
+
+    def test_no_command_blinds_stderr(self):
+        c = FakeSSH()
+        panels_mod.find_fastpanel_logs_info(c)
+        assert c.commands
+        for cmd in c.commands:
+            assert '2>/dev/null' not in cmd
+
+    def test_wrapper_keeps_plain_list(self):
+        c = FakeSSH(routes=[('/var/log/fastpanel2/engine.log',
+                             _ff(paths=['/var/log/fastpanel2/engine.log'],
+                                 dirs=[('ok', '/var/log/fastpanel2')]))]
+                    + NOTHING)
+        assert panels_mod.find_fastpanel_logs(c) == \
+            ['/var/log/fastpanel2/engine.log']
