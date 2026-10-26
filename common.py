@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.5"
+__version__ = "1.32.6"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -474,6 +474,69 @@ def find_files_info(checker, pattern, limit=20):
     # константой, а не с повторной единицей.
     return {'paths': paths, 'dirs': dirs, 'total': total, 'notes': notes,
             'trunc_note': trunc_note, 'ls_rc': ls_rc}
+
+
+# ==================== ПРИЗНАК SYSTEMD-ЮНИТА (1.32.6) ====================
+# Тот же класс, что у счётчика find ниже, но носитель — признак, а не число.
+# Замер живьём на хосте без systemd (каталог /run/systemd/system отсутствует,
+# bus мёртв): ЛЮБОЙ `systemctl is-active ЮНИТ` отвечает пустым stdout при rc=1,
+# а причина («System has not been booted with systemd as init system (PID 1).
+# Can't operate.») живёт в stderr. Прежние носители глушили stderr через
+# 2>/dev/null и решали по пустой строке «не активно» — молчание сервера
+# превращалось в измеренный факт, а отчёт печатал «служба не запущена» там,
+# где система ничего не ответила.
+#
+# Тем же прогоном снято обратное, запрещающее брать признак из кода возврата:
+# `systemctl is-system-running` даёт «offline» ПРИ rc=1, то есть ответ системы
+# бывает и при ненулевом коде. Значит признак — непустота stdout, а код годится
+# только на «команды нет вовсе». Различие держится КАНАЛАМИ: текст сообщения
+# локализуется (урок 1.28.0), поэтому разбирать его как признак нельзя.
+UNIT_UNCHECKED_NOTE = ('⚠️ Состояние службы не проверено: «{why}». Это «мы не '
+                       'спросили», а не «служба не запущена»: система без '
+                       'systemd, недоступный bus либо обрыв канала')
+
+
+def unit_status_cmd(unit):
+    """Одна команда, спрашивающая состояние systemd-юнита.
+
+    Ни 2>/dev/null, ни 2>&1: пустой stdout обязан оставаться различимым, а
+    stderr — оставаться объяснением. Склейка каналов убила бы то самое
+    различие, из-за которого этот раздел и появился. Имя юнита экранируется:
+    здесь это имя, а не glob (в отличие от паттернов find_files_cmd).
+    """
+    return f'systemctl is-active {q(unit)}'
+
+
+def parse_unit_status(out, err, rc):
+    """(статус | None, признание | None) из ответа systemctl is-active.
+
+    Непустой stdout — ОТВЕТ системы, даже при rc != 0 (замер: inactive и
+    offline возвращают rc=1). Пустой stdout — ответа не было: статус None, и
+    подставлять ему «inactive» нельзя, это и есть подмена «не проверено».
+
+    Причина берётся первая строкой stderr: второй строкой systemctl обычно
+    повторяет то же самое, а оператору нужно то, с чего начинается лечение.
+    """
+    text = (out or '').strip()
+    if text:
+        return text.splitlines()[0].strip(), None
+    lines = (err or '').strip().splitlines()
+    why = lines[0][:200] if lines else f'пустой вывод (rc={rc})'
+    return None, UNIT_UNCHECKED_NOTE.format(why=why)
+
+
+def unit_status_info(checker, unit):
+    """Состояние юнита и СИЛА ответа: {'unit', 'status', 'checked', 'note'}.
+
+    checked=False — система ничего не ответила. По такому ответу нельзя
+    утверждать ни «активна», ни «не запущена»: вызывающий обязан сказать «не
+    проверено» (закон серии 1.16-1.19: «не проверено» не имеет права
+    печататься как факт).
+    """
+    out, err, rc = checker.run(unit_status_cmd(unit))
+    status, note = parse_unit_status(out, err, rc)
+    return {'unit': unit, 'status': status, 'checked': status is not None,
+            'note': note}
 
 
 # ==================== СЧЁТЧИК find (1.32.5) ====================

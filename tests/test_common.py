@@ -418,6 +418,73 @@ class TestFindFiles:
         assert info['count'] == 0 and info['complete'] is True
         assert info['note'] is None
 
+    # ===== 1.32.6: признак systemd-юнита обязан иметь силу =====
+    # Тот же класс дефекта, что у счётчика выше, но носитель — признак, а не
+    # число. Замер живьём на хосте без systemd (каталог /run/systemd/system
+    # отсутствует, bus мёртв): `systemctl is-active ЛЮБОЙ_юнит` отвечает пустым
+    # stdout при rc=1, а причина («System has not been booted with systemd as
+    # init system (PID 1). Can't operate.») живёт в stderr. Прежний код глушил
+    # stderr и решал по пустой строке «не активно».
+    # Тем же прогоном снято обратное, что запрещает брать признак из кода
+    # возврата: `systemctl is-system-running` даёт «offline» при rc=1 — ответ
+    # системы при ненулевом коде. Значит признак — непустота stdout, а канал
+    # stderr остаётся объяснением. Тот же способ, что уже лечил panels.py.
+    NO_SYSTEMD_ERR = ("System has not been booted with systemd as init "
+                      "system (PID 1). Can't operate.")
+
+    def test_unit_status_command_keeps_channels_apart(self):
+        cmd = common.unit_status_cmd('redis-server')
+        assert 'is-active' in cmd and 'redis-server' in cmd, cmd
+        assert '2>/dev/null' not in cmd, 'причина отказа снова тонет: %r' % cmd
+        # 2>&1 запрещён не ради формы: он склеивает причину с ответом, и
+        # «пустой stdout» перестаёт быть различимым. Различие держится
+        # каналами (урок panels.py и 1.28.0 про локализованный текст).
+        assert '2>&1' not in cmd, cmd
+
+    def test_unit_status_cmd_quotes_unit_names_with_spaces(self):
+        # Тот же закон, что у find-счётчика: q() есть shlex.quote, и кавычки
+        # обязательны там, где имя со спецсимволом.
+        cmd = common.unit_status_cmd('php 8.2-fpm')
+        assert "'php 8.2-fpm'" in cmd, cmd
+
+    def test_parse_unit_status_answer_is_a_channel_not_rc(self):
+        assert common.parse_unit_status('active\n', '', 0) == ('active',
+                                                                None)
+        # Ответ системы при ненулевом rc остаётся ОТВЕТОМ (замер: offline, rc=1;
+        # inactive systemctl тоже возвращает rc=1).
+        assert common.parse_unit_status('inactive\n', '', 3) == ('inactive',
+                                                                 None)
+        assert common.parse_unit_status('offline\n', '', 1) == ('offline',
+                                                                None)
+
+    def test_parse_unit_status_empty_stdout_is_not_a_status(self):
+        status, note = common.parse_unit_status('', self.NO_SYSTEMD_ERR, 1)
+        assert status is None
+        assert note and 'не проверено' in note, note
+        assert 'systemd' in note, 'причина обязана доехать до оператора'
+        # Оба канала пусты (обрыв, чужая реализация): тоже «не проверено»,
+        # а не «не активно».
+        status, note = common.parse_unit_status('', '', 1)
+        assert status is None and note and 'не проверено' in note, note
+
+    def test_parse_unit_status_no_answer_at_all(self):
+        assert common.parse_unit_status(None, None, None)[0] is None
+
+    def test_unit_status_info_carries_the_reason(self):
+        c = FakeSSH(routes=[('is-active', ('', 'Failed to connect to bus: '
+                                           'Host is down', 1))])
+        info = common.unit_status_info(c, 'redis-server')
+        assert info['status'] is None and info['checked'] is False
+        assert 'не проверено' in info['note'] and 'bus' in info['note']
+
+    def test_unit_status_info_real_answer_is_checked(self):
+        # Контрпример: настоящий ответ остаётся ответом. Выдумывать ему
+        # неполноту нельзя, иначе «не проверено» обесценит настоящие находки.
+        c = FakeSSH(routes=[('is-active', 'active\n')])
+        info = common.unit_status_info(c, 'redis-server')
+        assert info['status'] == 'active' and info['checked'] is True
+        assert info['note'] is None
+
     def test_rc_two_is_not_relabelled_as_argv_flood(self):
         # Второй обязательный контрпример. Замер живьём: «глоб не раскрылся»,
         # «каталога нет» и «нет прав» дают rc=2, а argv-голод — rc=126. Глотнуть

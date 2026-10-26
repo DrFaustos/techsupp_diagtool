@@ -11,7 +11,13 @@ from datetime import datetime, timezone
 
 from common import (q, save_crontab_backup, write_remote_file,
                     prepare_secret_file, remove_remote_path,
-                    count_find_info)
+                    count_find_info,
+                    # Признак юнита спрашивает ОДНА функция на весь проект
+                    # (1.32.6): у is-active пустой stdout означает «система не
+                    # ответила», а не «служба лежит», и решать это вправе только
+                    # одно место — иначе носители разъезжаются (panels.py уже
+                    # решал его по-своему, metrics.py — по-третьему).
+                    unit_status_info)
 # Почтовый лог читает ОДНА функция на весь проект (logs.read_mail_log): у нас
 # уже были парные реализации, которые разъехались бы «в одном отчёте лог есть,
 # в другом — логов нет». Здесь же закрывается и Debian: раньше читался только
@@ -1109,13 +1115,35 @@ def detect_cache_backends(text):
             if f"'{name}'" in low or f'"{name}"' in low]
 
 
-def first_active_unit(checker, names):
-    """Первый запущенный systemd-юнит из candidates (или None)."""
+def first_active_unit_info(checker, names):
+    """Первый активный юнит из names и СИЛА ответа: {'unit','checked','note'}.
+
+    Прежняя версия спрашивала `systemctl is-active UNIT 2>/dev/null` и верила
+    любой пустой строке. Замер живьём на хосте без systemd (каталог
+    /run/systemd/system отсутствует, bus мёртв): ЛЮБОЙ is-active отвечает
+    пустым stdout при rc=1, а причина («System has not been booted with
+    systemd as init system») живёт в stderr — тот канал и заглушался. Отчёт на
+    таком хосте печатал «❌ служба не запущена»: диагноз, которого не могло
+    быть, потому что система ничего не ответила.
+
+    checked=False означает «мы не спросили». unit при этом None, но по нему
+    нельзя утверждать ни «активна», ни «не запущена» — тот же закон серии, что
+    запретил отказу становиться нулём в 1.32.5.
+
+    Отказ хотя бы на одном юните не отменяется остальными ответами: что было
+    под отказом — неизвестно, поэтому полным считается только случай, когда
+    каждый юнит ответил.
+    """
+    note = None
     for unit in names:
-        out, _, _ = checker.run(f'systemctl is-active {q(unit)} 2>/dev/null')
-        if out.strip() == 'active':
-            return unit
-    return None
+        info = unit_status_info(checker, unit)
+        if info['status'] == 'active':
+            return {'unit': unit, 'checked': True, 'note': None}
+        if info['status'] is None and note is None:
+            note = info['note']
+    if note:
+        return {'unit': None, 'checked': False, 'note': note}
+    return {'unit': None, 'checked': True, 'note': None}
 
 
 def bitrix_cache_report(checker):
@@ -1134,7 +1162,8 @@ def bitrix_cache_report(checker):
 
     for backend in ('redis', 'memcached'):
         units = CACHE_UNITS[backend]
-        unit = first_active_unit(checker, units)
+        info = first_active_unit_info(checker, units)
+        unit = info['unit']
         if unit:
             lines.append(f'✅ {backend}: служба {unit} активна')
             if backend == 'redis':
@@ -1144,8 +1173,19 @@ def bitrix_cache_report(checker):
                     mark = '✅' if 'PONG' in pong.upper() else '⚠️'
                     lines.append(f'{mark} redis-cli ping: {pong}')
         elif backend in backends:
-            lines.append(f'❌ {backend} в .settings.php указан, но служба не '
-                         f'запущена ({", ".join(units)})')
+            # Тот же закон серии, что запретил отказу стать нулём в 1.32.5:
+            # «не проверено» не имеет права печататься как «не запущена». На
+            # хосте без systemd прежний отчёт утверждал, что служба лежит, —
+            # диагноз, которого не могло быть, потому что система ничего не
+            # ответила (замер: пустой stdout + причина в stderr).
+            if not info['checked']:
+                lines.append(f'⚠️ {backend} в .settings.php указан, но '
+                             f'состояние службы ({", ".join(units)}) не '
+                             f'проверено')
+                lines.append(info['note'])
+            else:
+                lines.append(f'❌ {backend} в .settings.php указан, но служба '
+                             f'не запущена ({", ".join(units)})')
         else:
             lines.append(f'• {backend}: не используется')
 
@@ -1160,8 +1200,23 @@ def bitrix_cache_report(checker):
 # ==================== ПОЧТА ====================
 def bitrix_mail_report(checker):
     lines = ['=== ОТПРАВКА ПОЧТЫ (postfix) ===']
-    out, _, _ = checker.run('systemctl is-active postfix 2>&1 | head -1')
-    lines.append(f'Служба postfix: {out.strip() or "unknown"}')
+    # Состояние postfix считает ОДНА функция на весь проект (1.32.6). Прежняя
+    # строка была вторым способом мерить тот же признак: `is-active postfix
+    # 2>&1 | head -1`. Замер живьём на хосте без systemd: в stdout попадает
+    # текст про bus, и отчёт печатал «Служба postfix: System has not been
+    # booted with systemd as init system (PID 1). Can't operate.» — текст
+    # ошибки вместо статуса. Подстраховка «or "unknown"» тут бессильна: строка
+    # НЕ пустая. Плюс head -1 присваивает конвейеру свой rc, так что код
+    # возврата systemctl был потерян ещё до разбора.
+    status = unit_status_info(checker, 'postfix')
+    if status['status'] is not None:
+        lines.append(f"Служба postfix: {status['status']}")
+    else:
+        # «не проверено» не имеет права печататься как «unknown» — под этим
+        # словом оператор понимает «служба лежит», а система ничего не ответила
+        # (закон серии 1.16-1.19).
+        lines.append('Служба postfix: не проверено')
+        lines.append(status['note'])
 
     out, _, _ = checker.run('mailq 2>&1')
     count = parse_mailq_count(out)

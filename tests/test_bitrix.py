@@ -902,10 +902,18 @@ class TestCache:
             ('is-active redis-server', 'active\n'),
             ('is-active redis', 'inactive\n'),
         ])
-        assert bx.first_active_unit(c, ('redis', 'redis-server')) == 'redis-server'
+        info = bx.first_active_unit_info(c, ('redis', 'redis-server'))
+        assert info['unit'] == 'redis-server', info
+        assert info['checked'] is True, info
 
-    def test_first_active_unit_none(self):
-        assert bx.first_active_unit(FakeSSH(), ('redis',)) is None
+    def test_first_active_unit_silence_is_unchecked(self):
+        # Бывший «None» проверял только имя. Заглушка без маршрутов отвечает
+        # пустотой — это молчание сервера, и оно обязано остаться пробелом,
+        # а не диагнозом «не запущена» (тот же закон, что в 1.32.5 запретил
+        # отказу становиться нулём).
+        info = bx.first_active_unit_info(FakeSSH(), ('redis',))
+        assert info['unit'] is None
+        assert info['checked'] is False, 'пустой ответ — не ответ'
 
     def test_report_redis_ok(self):
         c = FakeSSH(routes=[
@@ -925,6 +933,58 @@ class TestCache:
         c = FakeSSH(routes=[('cat', SETTINGS_REDIS), ('is-active', 'inactive')])
         out = bx.bitrix_cache_report(c)
         assert '❌ redis в .settings.php указан, но служба не запущена' in out
+
+    # ============ 1.32.6: «не проверено» не имеет права быть «не запущена" ===
+    # first_active_unit спрашивал `systemctl is-active UNIT 2>/dev/null` и
+    # верил любой пустой строке. Замер живьём на хосте без systemd
+    # (/run/systemd/system отсутствует, bus мёртв): ЛЮБОЙ is-active даёт пустой
+    # stdout при rc=1, а причина («System has not been booted with systemd as
+    # init system (PID 1). Can't operate.») живёт в stderr — тот самый канал,
+    # который 2>/dev/null и выбрасывал. Отчёт на таком хосте печатал «❌ redis в
+    # .settings.php указан, но служба не запущена»: диагноз, которого не могло
+    # быть. Класс тот же, что у 1.32.5 (там отказ стал нулём), а носитель —
+    # признак, а не число.
+    # ТЕМИ ЖЕ замерами снято обратное, запрещающее брать признак из кода
+    # возврата: `systemctl is-system-running` даёт 'offline' при rc=1, т.е.
+    # ответ системы бывает и при ненулевом коде. Признак — непустота stdout.
+    NO_SYSTEMD = ('', "System has not been booted with systemd as init "
+                      "system (PID 1). Can't operate.", 1)
+
+    def test_cache_report_without_systemd_says_unchecked(self):
+        c = FakeSSH(routes=[('cat', SETTINGS_REDIS),
+                            ('is-active', self.NO_SYSTEMD)])
+        out = bx.bitrix_cache_report(c)
+        assert '✅ redis: служба' not in out, out
+        assert 'но служба не запущена' not in out, out
+        assert 'не проверено' in out, out
+
+    def test_real_inactive_keeps_its_red_verdict(self):
+        # Контрпример: настоящий ответ inactive обязан сохранить прежний
+        # красный вердикт и без всякого «не проверено", иначе guard обесценит
+        # настоящие находки (запрещающий guard обязан иметь контрпример).
+        c = FakeSSH(routes=[('cat', SETTINGS_REDIS),
+                            ('is-active', 'inactive')])
+        out = bx.bitrix_cache_report(c)
+        assert '❌ redis в .settings.php указан, но служба не запущена' in out, out
+        assert 'не проверено' not in out, out
+
+    def test_real_active_needs_no_apology(self):
+        # Второй контрпример: полный ответ active — зелёный без признаний.
+        c = FakeSSH(routes=[('cat', SETTINGS_REDIS),
+                            ('is-active redis', 'active\n'),
+                            ('redis-cli ping', 'PONG')])
+        out = bx.bitrix_cache_report(c)
+        assert '✅ redis: служба redis активна' in out, out
+        assert 'не проверено' not in out, out
+
+    def test_is_active_is_no_longer_blinded(self):
+        # Поведенческий замок: причина отказа обязана доходить до разбора,
+        # значит 2>/dev/null в этой команде быть не может.
+        c = FakeSSH(routes=[('is-active redis', 'active\n')])
+        assert bx.first_active_unit_info(c, ('redis',))['unit'] == 'redis'
+        cmd = c.find('is-active')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd, cmd
 
     def test_report_ping_not_pong(self):
         c = FakeSSH(routes=[
@@ -1323,6 +1383,50 @@ class TestMailLogSingleImplementation:
         assert c.count('for __p in') == 1
         assert c.count('tail -n 50 /var/log/maillog') == 0
         assert c.count('journalctl -u postfix -n 50') == 0
+
+
+class TestMailUnitStatus:
+    """Состояние postfix считает ОДНА функция, а не вторая реализация.
+
+    Прежняя строка спрашивала `systemctl is-active postfix 2>&1 | head -1` и
+    склеивала каналы. Замер живьём на хосте без systemd: в stdout попадает
+    текст про bus, и отчёт печатает «Служба postfix: System has not been
+    booted with systemd as init system (PID 1). Can't operate.» — текст
+    ошибки вместо статуса. Подстраховка «or unknown» тут бессильна: строка
+    НЕ пустая, и именно это отличает данный носитель от 2>/dev/null-версий.
+    Тот же признак в этом же файле уже считает unit_status_info — второй
+    способ обязан исчезнуть (закон серии: посчитанный дважды разъезжается).
+    """
+
+    NO_SYSTEMD = ('', 'System has not been booted with systemd as init '
+                      "system (PID 1). Can't operate.", 1)
+
+    def test_silent_systemd_is_not_a_status(self):
+        c = FakeSSH(routes=[('is-active postfix', self.NO_SYSTEMD),
+                            ('mailq', 'Mail queue is empty')])
+        out = bx.bitrix_mail_report(c)
+        assert 'Служба postfix: System has not been booted' not in out, out
+        assert 'не проверено' in out, out
+
+    def test_real_status_is_printed_verbatim(self):
+        # Контрпример: ответ системы остаётся ответом и печатается дословно.
+        c = FakeSSH(routes=[('is-active postfix', 'inactive'),
+                            ('mailq', 'Mail queue is empty')])
+        out = bx.bitrix_mail_report(c)
+        assert 'Служба postfix: inactive' in out, out
+        assert 'не проверено' not in out, out
+
+    def test_channels_are_not_glued(self):
+        # Замок на форму команды: 2>&1 возвращает склейку каналов (и потому
+        # лишает пустой stdout различимости), а head -1 крадёт у конвейера
+        # код возврата systemctl — rc будет принадлежать head.
+        c = FakeSSH(routes=[('is-active postfix', 'active'),
+                            ('mailq', 'Mail queue is empty')])
+        bx.bitrix_mail_report(c)
+        cmd = c.find('is-active postfix')
+        assert cmd is not None
+        assert '2>&1' not in cmd and '2>/dev/null' not in cmd, cmd
+        assert 'head -1' not in cmd, cmd
 
 
 class TestMailLogDebianPath:
