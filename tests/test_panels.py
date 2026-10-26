@@ -116,16 +116,30 @@ class TestFastpanelLogs:
 # ==================== fastpanel_status ====================
 class TestFastpanelStatus:
     def test_status_collects_stack_and_endpoint(self):
+        # Переформулировано объявленно (1.31.0). Прежние роуты описывали
+        # вывод, которого настоящие команды не выдают НИКОГДА:
+        # 'active\nactive\nactive' — цикл печатает между службами маркеры,
+        # а '200\n000' — ответ без rc, по которому новый парсер ОБЯЗАН
+        # признать пробел. Тест проходил по НЕВЕРНОЙ причине.
+        # Инвариант усилен, а не ослаблен: при честных ответах ни одна
+        # строка отчёта не имеет права притворяться пробелом.
+        stack = '\n'.join('@' + u + '\nactive'
+                          for u in panels_mod.PANEL_STACK_UNITS) + '\n'
+        endpoint = '\n'.join(['@https', 'rc=0 code=200',
+                              '@http', 'rc=0 code=200']) + '\n'
         c = FakeSSH(routes=[
             ('systemctl cat fastpanel2-engine', '[Unit]\n'),
-            ('is-active nginx', 'active\nactive\nactive\n'),
-            ('curl', '200\n000'),
+            ('is-active fastpanel2-engine', 'active\n'),
+            ('for s in', stack),
+            ('for p in', endpoint),
             ('nginx -t', 'nginx: configuration file /etc/nginx/nginx.conf test is successful\n'),
         ])
         out = panels_mod.fastpanel_status(c)
         assert 'fastpanel2-engine' in out
-        assert '8888' in out and '200' in out
+        assert 'Веб-интерфейс :' + str(panels_mod.FASTPANEL_PORT) in out
+        assert '200' in out
         assert 'successful' in out
+        assert 'не провер' not in out, out
 
     def test_status_without_unit(self):
         # Переформулировано объявленно (1.28.0). Было заперто: МОЛЧАНИЕ сервера
@@ -139,6 +153,186 @@ class TestFastpanelStatus:
         assert 'Служба панели не найдена' in out
         out2 = panels_mod.fastpanel_status(FakeSSH())
         assert 'не проверено' in out2 and 'не найдена' not in out2
+
+
+# ===== Состояния стека и эндпоинта: «не проверено» ≠ «не работает» =========
+# Живой замер (настоящий /bin/bash этого хоста, systemd-мёртвый WSL):
+#   `systemctl is-active nginx`      -> out='' + err='System has not been
+#                                       booted…' + rc=1, а у РЕАЛЬНО
+#                                       остановленной службы out='inactive'.
+#   `curl -w %{http_code} …`         -> refused: rc=7 code=000;
+#                                       TLS на http-порту: rc=35 code=000
+#                                       (порт СЛУШАЕТ — другое лечение!);
+#                                       живой: rc=0 code=200;
+#                                       бинарника curl нет: rc=127 + пусто.
+# Прежний код с `2>/dev/null` глушил и bus-ошибку, и причину отказа, а сборная
+# строка через `;` отдавала код возврата последней команде: на этом хосте
+# отчёт печатал «nginx / php-fpm / mysql(mariadb): unknown» и «не отвечает».
+def _report_line(out, needle):
+    """Первая строка отчёта, содержащая needle (или '').
+
+    Ассерт обязан таргетить СТРОКУ, о которой идёт речь. Признание
+    НЕПРОВЕРЕННОСТИ от соседа (юнит панели, стек) законно содержит
+    «не проверено», поэтому проверка «во всём отчёте этого слова нет» ловила
+    бы собственный текст признания, а не подмену — тот же закон, что
+    «само-проверка обязана таргетить HEAD».
+    """
+    for line in (out or '').splitlines():
+        if needle in line:
+            return line
+    return ''
+
+
+def _report_lines(out, needle):
+    """Все строки отчёта с needle, склеенные переводом строки.
+
+    Признание НЕПРОВЕРЕННОСТИ печатается отдельной строкой сразу за
+    значением, поэтому `_report_line` для эндпоинта давал неполный ответ:
+    ассерт «признание цитирует ответ системы» падал, хотя цитата в отчёте
+    была. Проверяем секцию целиком — иначе проверка меряет свою же слепоту.
+    """
+    return '\n'.join(ln for ln in (out or '').splitlines() if needle in ln)
+
+
+class TestFastpanelStackStates:
+    # Двойник обязан говорить ЯЗЫКОМ новой команды (урок 1.27.0): стек
+    # спрашивается одним циклом с маркерами '@имя', эндпоинт — протоколом
+    # 'rc=N code=NNN'. Прежние роуты ('active\nactive\nactive', '200\n000')
+    # описывали вывод, которого настоящая команда не выдаёт никогда, и тесты
+    # проходили по НЕВЕРНОЙ причине.
+    # Текст уходит именно в stderr: у цикла при мёртвом bus stdout НЕ пуст
+    # (в нём маркеры '@nginx'), поэтому ответ собирается как
+    # (маркерный_stdout, ЭТОТ_текст, 1) — так двойник повторяет замер.
+    BUS_ERR = ("System has not been booted with systemd as init system "
+               "(PID 1). Can't operate.\nFailed to connect to bus: "
+               "Host is down")
+    STACK = 'for s in'
+    ENDPOINT = 'for p in'
+
+    @staticmethod
+    def _stack(states):
+        """Маркерный ответ цикла is-active по {служба: тело}; '' = без тела.
+
+        Пустое тело под маркером — ровно то, что живой цикл даёт при мёртвом
+        bus (замер: stdout = '@nginx @php-fpm @mysql @mariadb', текст в
+        stderr). Так двойник говорит правду о форме ответа, а не о желаемой.
+        """
+        lines = []
+        for unit in panels_mod.PANEL_STACK_UNITS:
+            lines.append('@' + unit)
+            if states.get(unit):
+                lines.append(states[unit])
+        return '\n'.join(lines) + '\n'
+
+    @staticmethod
+    def _endpoint(*answers):
+        """Маркерный ответ curl-дуэта по ('схема', rc, 'HTTP-код')."""
+        lines = []
+        for scheme, rc, code in answers:
+            lines.extend([f'@{scheme}', f'rc={rc} code={code}'])
+        return '\n'.join(lines) + '\n'
+
+    def test_dead_bus_is_unchecked_not_unknown(self):
+        # «unknown» в строке отчёта оператор читает как «служба не работает».
+        # Здесь система НЕ ОТВЕТИЛА про службу: она ответила, что говорить не
+        # может. Различение — по КАНАЛУ: живой цикл при мёртвом bus даёт
+        # stdout '@nginx\n@php-fpm\n@mysql\n@mariadb' (тел НЕТ) и текст в
+        # stderr (замер). По тексту различать нельзя: bus-сообщение
+        # локализуется так же, как вывод dpkg (урок 1.28.0).
+        c = FakeSSH(routes=[(self.STACK, (self._stack({}), self.BUS_ERR, 1))])
+        out = panels_mod.fastpanel_status(c)
+        line = _report_line(out, 'nginx:')
+        assert 'не проверено' in line, line
+        assert 'unknown' not in out
+
+    def test_real_inactive_is_still_called_inactive(self):
+        # Найденное нельзя терять ради признания (закон 1.19–1.30): система
+        # ОТВЕТИЛА «inactive» — это диагноз, а не пробел. Таретим строку
+        # службы: признание юнита панели (его тут нет) законно содержит
+        # «не проверено», проверка всего отчёта ловила бы чужой текст.
+        all_inactive = {u: 'inactive' for u in panels_mod.PANEL_STACK_UNITS}
+        c = FakeSSH(routes=[(self.STACK, (self._stack(all_inactive), '', 0))])
+        out = panels_mod.fastpanel_status(c)
+        line = _report_line(out, 'nginx:')
+        assert 'inactive' in line, line
+        assert 'не провер' not in line, line
+
+    def test_stack_asked_once_per_unit_with_markers(self):
+        # Сборная строка `is-active a; is-active b` не различима в принципе:
+        # rc принадлежит последней команде, а stdout четырёх служб свален без
+        # разделителей. Новый замок: ОДИН вызов is-active внутри цикла с
+        # printf-маркерами; `;` запрещать нельзя — он законен в `for …; do`.
+        all_active = {u: 'active' for u in panels_mod.PANEL_STACK_UNITS}
+        c = FakeSSH(routes=[(self.STACK, (self._stack(all_active), '', 0))])
+        out = panels_mod.fastpanel_status(c)
+        cmd = c.find('systemctl is-active')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd, 'причина снова в /dev/null'
+        assert cmd.count('systemctl is-active') == 1, 'сборная строка: rc чужой'
+        assert 'for s in' in cmd and 'printf' in cmd, 'маркеров нет — свалка'
+        line = _report_line(out, 'nginx:')
+        assert 'nginx: active' in line and 'php-fpm: active' in line, line
+        assert 'не провер' not in line, line
+
+    def test_endpoint_refused_is_not_unchecked(self):
+        # rc=7 — ОТВЕТ системы (соединение отказано): это «порт закрыт», и
+        # такое название обязано остаться. Пробел — только когда curl не
+        # удалось выполнить. Таретим строку эндпоинта (см. _report_line).
+        c = FakeSSH(routes=[(self.ENDPOINT,
+                             (self._endpoint(('https', 7, '000'),
+                                             ('http', 7, '000')), '', 0))])
+        out = panels_mod.fastpanel_status(c)
+        line = _report_lines(out, 'Веб-интерфейс')
+        assert 'отказ' in line, line
+        assert 'не провер' not in line, line
+
+    def test_missing_curl_is_unchecked_not_no_answer(self):
+        # Решающий случай. Прежний код: `curl … 2>/dev/null` на отсутствующем
+        # бинарнике дал rc=127 и пустоту => в отчёте «не отвечает». Оператор
+        # идёт перезапускать панель, хотя надо поставить curl. Язык ответа
+        # — из замера: rc=127 и текст 'command not found' в поле code.
+        notfound = 'bash: line 1: curl: command not found'
+        c = FakeSSH(routes=[(self.ENDPOINT,
+                             (self._endpoint(('https', 127, notfound),
+                                             ('http', 127, notfound)), '', 0))])
+        out = panels_mod.fastpanel_status(c)
+        line = _report_lines(out, 'Веб-интерфейс')
+        assert 'не проверен' in line, line
+        assert 'not found' in line, 'признание обязано цитировать ответ: ' + line
+        assert 'не отвечает' not in line, line
+
+    def test_endpoint_whole_command_unexecuted_is_unchecked(self):
+        # Второй путь к тому же пробелу: не выполнен ВЕСЬ цикл (SSH-канал,
+        # shell). Ответа нет ни у одной схемы — признание обязано быть и по
+        # этому пути тоже, а не только по rc=127 внутри маркеров.
+        c = FakeSSH(routes=[(self.ENDPOINT, ('', 'bash: curl: command not '
+                                                 'found', 127))])
+        out = panels_mod.fastpanel_status(c)
+        line = _report_lines(out, 'Веб-интерфейс')
+        assert 'не проверен' in line, line
+
+    def test_tls_on_plain_port_is_its_own_answer(self):
+        # Замер: http-порт панели под https даёт rc=35 (не 7). Это «порт
+        # СЛУШАЕТ, но не по TLS» — стучимся не туда, а не «панель мертва».
+        c = FakeSSH(routes=[(self.ENDPOINT,
+                             (self._endpoint(('https', 35, '000'),
+                                             ('http', 0, '200')), '', 0))])
+        out = panels_mod.fastpanel_status(c)
+        line = _report_lines(out, 'Веб-интерфейс')
+        assert '200' in line and 'TLS' in line, line
+        assert 'не провер' not in line, line
+
+    def test_endpoint_codes_are_parsed_from_the_rc_protocol(self):
+        # Замок протокола: `c=$(curl …); echo rc=$? code=$c` — единственный
+        # найденный способ сохранить и HTTP-код, и rc (любой промежуточный
+        # echo его крадёт — замер).
+        c = FakeSSH(routes=[('curl', '@https\nrc=0 code=200\n'
+                                    '@http\nrc=7 code=000\n')])
+        panels_mod.fastpanel_status(c)
+        cmd = c.find('curl')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd
+        assert 'rc=$?' in cmd
 
 
 # ==================== php_fpm_units ====================
@@ -1053,7 +1247,7 @@ class TestFastpanelDiag:
             ('systemctl is-active', 'active'),
             ('journalctl', 'engine started'),
             ('dpkg -l', 'ii  fastpanel2'),
-            ('127.0.0.1:8888', '200'),
+            ('for p in', '@https\nrc=0 code=200\n@http\nrc=0 code=200\n'),
             ('ls -1 /var/log/fastpanel2', '/var/log/fastpanel2/engine.log\n'),
             ('tail -n 20', 'engine.log line'),
             ('hostname -f', 'www.example.com'),
@@ -1062,7 +1256,13 @@ class TestFastpanelDiag:
         assert '✅ Служба fastpanel2-engine: active' in out
         assert 'engine started' in out
         assert '✅ Пакет панели: ii  fastpanel2' in out
-        assert ':8888 (https с localhost): 200' in out
+        # Переформулировано объявленно (1.31.0): было заперто «(https с
+        # localhost): 200» — строку без кода возврата, то есть ровно тот
+        # формат, который не умел отличать «curl не выполнен» от «порт молчит».
+        # Заперт усилен: код обязан быть подписан схемой, а пробел — отсутство-
+        # вать при честных rc=0.
+        assert 'Веб-интерфейс :8888 (https/http): https=200' in out
+        assert 'не провер' not in out, out
         assert 'engine.log line' in out
         # FQDN в порядке — совет про hostnamectl не к месту
         assert 'hostnamectl' not in out
@@ -1075,8 +1275,17 @@ class TestFastpanelDiag:
         # проходил по неверной причине — через rpm-ветку пустоты при rc=0.
         # Теперь заперт держится за ЧЕСТНЫЙ ответ dpkg (rc=1); молчание
         # признаётся пробелом в test_package_unchecked_is_not_apt_install.
+        # Переформулировано объявленно (1.31.0). Прежняя строка
+        # «Порт 8888 не отвечает» запиралась МОЛЧАНИЕМ двойника: без роута
+        # curl двойник давал пустоту, прежний код читал её как '000' и кричал
+        # «не отвечает» — тест проходил по НЕВЕРНОЙ причине (та же пустота
+        # возникала и когда curl не был установлен). Теперь заперт держится за
+        # честный rc=7 — ОТВЕТ системы; молчание признаётся пробелом в
+        # test_endpoint_curl_missing_is_unchecked_not_no_answer.
         c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT),
-                            ('dpkg', TestFastpanelPackageStates.DPKG_ABSENT)])
+                            ('dpkg', TestFastpanelPackageStates.DPKG_ABSENT),
+                            ('for p in', '@https\nrc=7 code=000\n'
+                                         '@http\nrc=7 code=000\n')])
         out = panels_mod.fastpanel_diag(c)
         assert '❌ Служба панели не найдена' in out
         assert 'Пакет fastpanel2 НЕ найден' in out
@@ -1119,11 +1328,183 @@ class TestFastpanelDiag:
         assert 'hostname «srv123» без точки' in out
         assert 'hostnamectl hostname' in out
 
+    # ===== diag: журнал, эндпоинт, hostname: «не проверено» ≠ «не было» ====
+    # Замеры живьём (этот хост, bus мёртв, journalctl/hostname есть):
+    #   journalctl -u <любой> -n 15 --no-pager 2>&1 -> rc=0, '-- No entries --'
+    #       (и для существующего юнита, и для выдуманного: журнал НЕ различает
+    #        «записей нет» и «bus мёртв» — выдумывать различение нельзя);
+    #   hostname -f 2>/dev/null  -> rc=127 + ПУСТО (бинарника нет)
+    #   hostname -f 2>&1         -> rc=127 + 'command not found' целиком
+    # Прежний diag на пустоте МОЛЧАЛ: строки журнала просто не было, и
+    # оператор не узнавал, что журнал вообще не смотрели. Молчание в отчёте
+    # «панель не открывается» читается как «проверили — чисто».
+    def test_journal_binary_missing_is_unchecked_not_silence(self):
+        notfound = 'bash: line 1: journalctl: command not found'
+        c = FakeSSH(routes=[('systemctl cat', '[Unit]\n'),
+                            ('journalctl', ('', notfound, 127))])
+        out = panels_mod.fastpanel_diag(c)
+        line = _report_lines(out, 'журнал') or _report_lines(out, 'Журнал')
+        assert line, 'о молчании журнал-проверки ничего не says: ' + out
+        assert 'не проверен' in line, line
+        assert 'not found' in line, 'признание обязано цитировать ответ: ' + line
+
+    def test_journal_no_entries_is_reported_as_answer(self):
+        # rc=0 + '-- No entries --' — ОТВЕТ journalctl (замер: он такой и для
+        # несуществующего юнита). Прежний код на этой строке молчал, и
+        # «журнал пуст» было неотличимо от «мы не смотрели».
+        c = FakeSSH(routes=[('systemctl cat', '[Unit]\n'),
+                            ('journalctl', ('-- No entries --\n', '', 0))])
+        out = panels_mod.fastpanel_diag(c)
+        line = _report_lines(out, 'журнал') or _report_lines(out, 'Журнал')
+        assert 'записей нет' in line, line
+        assert 'No entries' in line, 'ответ системы обязан быть процитирован'
+        assert 'не проверен' not in line, line
+
+    def test_journal_real_entries_are_not_lost(self):
+        # Найденное нельзя терять ради признания (закон 1.19–1.30).
+        c = FakeSSH(routes=[('systemctl cat', '[Unit]\n'),
+                            ('journalctl', ('engine started\noom killed\n',
+                                            '', 0))])
+        out = panels_mod.fastpanel_diag(c)
+        assert 'engine started' in out and 'oom killed' in out
+
+    def test_journal_failing_is_unchecked_with_quote(self):
+        c = FakeSSH(routes=[('systemctl cat', '[Unit]\n'),
+                            ('journalctl', ('', 'No space left on device', 1))])
+        out = panels_mod.fastpanel_diag(c)
+        line = _report_lines(out, 'журнал') or _report_lines(out, 'Журнал')
+        assert 'не проверен' in line, line
+        assert 'No space left' in line, line
+
+    def test_endpoint_refused_keeps_no_answer_words(self):
+        # rc=7 — ОТВЕТ системы: «порт не отвечает» обязано остаться (закон:
+        # найденный факт не теряется). Прежний тест держался за МОЛЧАНИЕ
+        # двойника — здесь заперт пересажен на честный rc=7.
+        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT),
+                            ('for p in', '@https\nrc=7 code=000\n'
+                                         '@http\nrc=7 code=000\n')])
+        out = panels_mod.fastpanel_diag(c)
+        assert 'Порт 8888 не отвечает' in out
+
+    def test_endpoint_curl_missing_is_unchecked_not_no_answer(self):
+        # Решающий случай diag. Прежний `curl … 2>/dev/null` на отсутствующем
+        # curl дал пустоту => code='' => «Порт 8888 не отвечает»: оператор
+        # перезапускает панель, хотя надо поставить curl.
+        notfound = 'bash: line 1: curl: command not found'
+        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT),
+                            ('for p in', '@https\nrc=127 code=' + notfound +
+                                         '\n@http\nrc=127 code=' + notfound +
+                                         '\n')])
+        out = panels_mod.fastpanel_diag(c)
+        line = _report_lines(out, 'Веб-интерфейс')
+        assert 'не проверен' in line, line
+        assert 'not found' in line, line
+        assert 'не отвечает' not in line, line
+
+    def test_hostname_missing_is_unchecked_not_silence(self):
+        notfound = 'bash: line 1: hostname: command not found'
+        c = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT),
+                            ('hostname -f', ('', notfound, 127))])
+        out = panels_mod.fastpanel_diag(c)
+        line = _report_lines(out, 'FQDN') or _report_lines(out, 'hostname')
+        assert 'не провер' in line, line
+        assert 'not found' in line, line
+
+    def test_unit_unchecked_has_no_error_icon(self):
+        # Косметическая ложь, которую внёл сам прошлый слайс: «❌ » + признание,
+        # уже начинавшийся с ⚠️, давал «❌ ⚠️ Наличие службы…» — две метки,
+        # противоречащие друг другу (❌ = диагноз, ⚠️ = пробел).
+        c = FakeSSH(routes=[('systemctl cat', UNIT_DEAD)])
+        out = panels_mod.fastpanel_diag(c)
+        assert '❌ ⚠️' not in out, out
+        # ИНВЕРТИРОВАННЫЙ КОНТРОЛЬ: честный ответ «юнита нет» обязан и впредь
+        # иметь ❌ — диагноз терять нельзя.
+        c2 = FakeSSH(routes=[('systemctl cat', UNIT_ABSENT)])
+        assert '❌ Служба панели не найдена' in panels_mod.fastpanel_diag(c2)
+
+    def test_service_state_unchecked_is_not_unknown_or_cross(self):
+        # Строка службы в diag страдала тем же, что и в status: пустой stdout
+        # при мёртвом bus печатался как «unknown» с ❌ (диагноз вместо пробела).
+        c = FakeSSH(routes=[('systemctl cat', '[Unit]\n'),
+                            ('systemctl is-active',
+                             ('', "Failed to connect to bus: Host is down", 1))])
+        out = panels_mod.fastpanel_diag(c)
+        line = _report_line(out, 'Служба fastpanel2-engine:')
+        assert 'не проверено' in line, line
+        assert 'unknown' not in line, line
+        assert not line.startswith('❌'), line
+
     def test_empty_log_reported_as_empty(self):
         c = FakeSSH(routes=[('ls -1 /var/log/fastpanel2',
                              '/var/log/fastpanel2/engine.log\n'),
                             ('tail -n 20', '')])
         assert '(файл пуст)' in panels_mod.fastpanel_diag(c)
+
+# ========== Признания не цитируют диагноз: сторож всего класса ============
+# Инвертированный контроль («на молчании сервера в отчёте не должно быть
+# ни одного диагноза») упал на тексте ПРИЗНАНИЯ: «…Это НЕ «имя без точки»».
+# То есть признание оправдывалось словами диагноза и делало саму проверку
+# невыполнимой. Детектор по всем константам-признаниям нашёл то же в пакете,
+# журнале, юните и стеке — значит лечать надо класс, а не строку.
+DIAGNOSIS_WORDS = ('не отвечает', 'журнал пуст', 'без точки', 'юнита нет',
+                   'не найдена', 'не найдено', 'НЕ найден', 'не работа',
+                   'остановлена', 'пакета нет', 'не запущена')
+
+UNCHECKED_NOTES = ('UNIT_UNCHECKED_NOTE', 'STACK_UNCHECKED_NOTE',
+                   'ENDPOINT_UNCHECKED_NOTE', 'PKG_UNCHECKED_NOTE',
+                   'JOURNAL_UNCHECKED_NOTE', 'FQDN_UNCHECKED_NOTE')
+
+
+def _quoted_diagnoses(text):
+    """Какие диагнозы названы внутри текста признания (должно быть пусто)."""
+    return [w for w in DIAGNOSIS_WORDS if w in (text or '')]
+
+
+class TestNotesDoNotQuoteDiagnoses:
+    def test_detector_sees_the_traps(self):
+        # ПЕРВЫМ делом — контрпример. Ноль нарушений в стороже без него
+        # неотличим от слепого детектора (урок: guard обязан измерять
+        # ВИДИМОСТЬ детектора, а не пустой результат).
+        traps = ('⚠️ FQDN не проверен. Это НЕ «имя без точки»',
+                 '⚠️ Служба не проверена. Это НЕ «юнита нет»',
+                 'пакет не проверен. Это НЕ «пакета нет»',
+                 '⚠️ Журнал не проверен. Это НЕ «журнал пуст»',
+                 '⚠️ Состояние не проверено: это значит, что службы не работают')
+        for trap in traps:
+            assert _quoted_diagnoses(trap), 'ДЕТЕКТОР СЛЕПОЙ: ' + trap
+
+    def test_no_unchecked_note_quotes_a_diagnosis(self):
+        bad = []
+        for name in UNCHECKED_NOTES:
+            hits = _quoted_diagnoses(getattr(panels_mod, name))
+            if hits:
+                bad.append('%s -> %s' % (name, hits))
+        assert not bad, 'признание оправдывается диагнозом: ' + '; '.join(bad)
+
+    def test_every_note_still_admits_the_gap(self):
+        # Обратная сторона того же закона: убирая диагноз, нельзя потерять
+        # само признание — «не проверено» обязано звучать.
+        missing = [n for n in UNCHECKED_NOTES
+                   if 'не провер' not in getattr(panels_mod, n)]
+        assert not missing, 'признание перестало называться пробелом: %s' % (
+            ', '.join(missing))
+
+    def test_silence_produces_no_diagnoses(self):
+        # ИНВЕРТИРОВАННЫЙ КОНТРОЛЬ всего слайса, тот самый, что нашёл болезнь:
+        # полный молчаливый сервер => отчёты обязаны признать пробелы и НЕ
+        # иметь ни одного выдуманного диагноза.
+        forbidden = ('Порт 8888 не отвечает', 'записей нет', 'без точки',
+                     'nginx: active', 'nginx: inactive', 'nginx: stopped',
+                     'Служба панели не найдена', 'Пакет fastpanel2 НЕ найден',
+                     '✅')
+        for fn in (panels_mod.fastpanel_status, panels_mod.fastpanel_diag):
+            out = fn(FakeSSH())
+            for phrase in forbidden:
+                assert phrase not in out, (
+                    '%s: молчание стало диагнозом: %r\n%s'
+                    % (fn.__name__, phrase, out))
+            assert out.count('не провер') >= 3, (
+                '%s: молчание не признано пробелом:\n%s' % (fn.__name__, out))
 
 
 class TestFastpanelResetPassword:
