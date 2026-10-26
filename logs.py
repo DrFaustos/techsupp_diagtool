@@ -5,7 +5,7 @@ from collections import Counter
 from common import (DOMAIN_PATHS, q, find_files, find_files_info,
                     read_file_content, read_file_info,
                     domains_from_configs_info, DOMAIN_CONFIG_LIMIT,
-                    DOMAIN_TRUNCATED_NOTE)
+                    DOMAIN_TRUNCATED_NOTE, LS_E2BIG_RC)
 from metrics import detect_panel  # noqa: F401 (реэкспорт для удобства)
 
 
@@ -959,7 +959,15 @@ def get_domains_info(checker, panel_type):
         # пуст), поэтому срезка перестала быть ценовой и осталась чистой
         # ложью: замер 40 реальных конфигей - оператор видел 10 доменов.
         info = find_files_info(checker, pattern, DOMAIN_CONFIG_LIMIT)
-        if info['dirs'] or info['total'] is not None:
+        # 1.32.3: «проверено» решается ДОШЕДШИМ СПИСКОМ, а не состоянием
+        # каталога. Замер живьём (парк 20 000 конфигов, ulimit -s 1024): ls не
+        # исполнилась — список аргументов не влез (rc=126), — а примитив вернул
+        # FFDIR ok + FFCOUNT 0 при rc конвейера 0. Прежняя строка решала по
+        # FFDIR ok и подписывала «домены не найдены» как успешную проверку.
+        # Сравнение с LS_E2BIG_RC (та же константа, что в примитиве), а не с
+        # единицей и не разбором текста заметки (закон 1.31.0).
+        list_failed = info.get('ls_rc') == LS_E2BIG_RC
+        if not list_failed and (info['dirs'] or info['total'] is not None):
             checked = True
         # Признание о срезке изымается ПО ПОЛЮ trunc_note, а не сравнением
         # или поиском по тексту: разбор localized формулировки однажды

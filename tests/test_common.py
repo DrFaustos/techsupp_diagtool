@@ -263,6 +263,95 @@ class TestFindFiles:
         assert 'head -' not in cmd          # срезка больше не молчит
         assert 'PIPESTATUS' not in cmd      # dash: «Bad substitution»
 
+    # ============ 1.32.3: глоб не влез в argv (E2BIG) =====================
+    # Замер живьём (парк 20 000 файлов конфигураций, ulimit -s 1024): боевая
+    # команда давала rc=0, FFDIR ok, FFCOUNT 0 и в stderr
+    # «Argument list too long». Отчёт говорил «файлов нет, проверено» там, где
+    # ls даже не запустилась: код возврата конвейера принадлежит awk, а не ls.
+    # Различает случай только rc самой ls — 126 (замерено в bash и dash, при
+    # LC_ALL=C и C.UTF-8), тогда как «глоб не раскрылся» — это rc=2.
+    # Порядок строк СПИСАН С ЖИВОГО ЗАМЕРА (probe1323.py, bash и dash дают
+    # одинаково): 'FFRC 126\nFFCOUNT 0\n'. Маркер идёт ДО FFCOUNT, потому что
+    # печатается в канал до END-блока awk. Первая версия фикстуры была написана
+    # с обратным порядком - по представлению о выводе, а не по замеру.
+    E2BIG = ('FFDIR ok /etc/nginx/conf.d\n'
+             'FFRC 126\n'
+             'FFCOUNT 0\n')
+    E2BIG_ERR = '/bin/sh: line 1: /usr/bin/ls: Argument list too long'
+
+    def test_ls_that_never_ran_is_not_reported_as_no_files(self):
+        # Главный кейс слайса: каталог существует и читается (FFDIR ok), но
+        # список не был получен. Прежний вывод был неотличим от честной пустоты,
+        # а лечение противоположное: не «домена нет», а «сужайте паттерн».
+        c = FakeSSH(routes=[('ls -1', (self.E2BIG, self.E2BIG_ERR, 0))])
+        info = common.find_files_info(c, '/etc/nginx/conf.d/*.conf', 20)
+        assert info['paths'] == []
+        # total обязан стать None, а не 0: выдуманное число — закон 1.16-1.19.
+        assert info['total'] is None, (
+            'total=0 при несостоявшейся ls — это число, которого мы не видели')
+        note = ' '.join(info['notes'])
+        assert note, 'пустота без объяснения: оператор прочитает её как «нет файлов»'
+        assert 'слишком много' in note.lower(), note
+        assert 'не найдено' not in note and 'не найдены' not in note, note
+        # Список от примитива тоже не имеет права притворяться списком.
+        assert [f for f in common.find_files(c, '/etc/nginx/conf.d/*.conf', 20)
+                if not f.startswith('⚠️')] == []
+
+    def test_rc_marker_is_not_a_path(self):
+        # Контрпример новой строке протокола. Маркер, который парсер не знает,
+        # уезжает в paths — и оператор читает «FFRC 126» как имя домена или
+        # лога. Тот же класс, что двойник, заговоривший старым языком (1.32.0).
+        paths, dirs, total, ls_rc = common.parse_find_answer(self.E2BIG)
+        assert paths == [], paths
+        assert any(st == 'ok' for st, _p in dirs), dirs
+        assert total is None
+        # Код обязан доходить до парсера: без него «ls не исполнилась»
+        # неотличимо от «файлов нет», и весь слайс теряет предмет.
+        assert ls_rc == 126, ls_rc
+
+    def test_command_captures_ls_rc_before_the_pipeline(self):
+        # Поведенческий замок по ОТПРАВЛЕННОЙ команде. rc конвейера — это rc
+        # awk; поэтому код ls обязан сниматься внутри группы, ДО первой печати
+        # в канал. PIPESTATUS под dash — «Bad substitution» (замерено), значит
+        # единственный POSIX-способ — группа со снятием $?.
+        cmd = common.find_files_cmd('/etc/nginx/conf.d/*.conf', 20)
+        assert 'FFRC' in cmd, 'код возврата ls снова тонет под awk: %r' % cmd
+        assert 'PIPESTATUS' not in cmd
+        assert cmd.index('FFRC') < cmd.index('awk'), (
+            'маркер снимается после awk — то есть уже чужой код')
+        # «не раскрылось» (rc=2) и «не исполнилось» (rc=126) обязаны остаться
+        # различимыми: глотать оба кода нельзя.
+        assert '$?' in cmd
+
+    def test_zero_rc_marker_keeps_the_honest_emptiness(self):
+        # Обратная сторона: FFRC 0 — обычная проверка, и выдумывать ей беду
+        # нельзя (иначе «правильный» guard обесценит настоящие находки).
+        c = FakeSSH(routes=[('ls -1',
+                             'FFDIR ok /var/log/nginx\n'
+                             'FFRC 0\nFFCOUNT 0\n')])
+        info = common.find_files_info(c, '/var/log/nginx/*.log', 20)
+        assert info['paths'] == [] and info['notes'] == []
+        assert info['total'] == 0
+        assert info['ls_rc'] == 0
+        assert info['dirs'][0][0] == 'ok'
+
+    def test_rc_two_is_not_relabelled_as_argv_flood(self):
+        # Второй обязательный контрпример. Замер живьём: «глоб не раскрылся»,
+        # «каталога нет» и «нет прав» дают rc=2, а argv-голод — rc=126. Глотнуть
+        # оба кода одной веткой значило бы переврать три честных диагноза
+        # (лечение у них противоположное: менять раскладку против сужать шаблон).
+        # Диагноз rc=2 несут строки FFDIR и stderr — здесь проверям, что
+        # «неправильная» ветка к ним не приклеилась.
+        c = FakeSSH(routes=[('ls -1',
+                             'FFDIR ok /var/log/nginx\n'
+                             'FFRC 2\n'
+                             'FFCOUNT 0\n')])
+        info = common.find_files_info(c, '/var/log/nginx/*.log', 20)
+        note = ' '.join(info['notes'])
+        assert 'слишком много' not in note.lower(), note
+        assert info['ls_rc'] == 2
+        assert info['total'] == 0
+
     def test_glob_is_not_quoted_on_purpose(self):
         # pattern — shell-glob: его нельзя экранировать, иначе ls ничего не
         # найдёт. Прежний замок искал «ls -1 /var/log/nginx/*.log» буквально и

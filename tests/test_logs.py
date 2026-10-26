@@ -73,7 +73,13 @@ class TestFindLogs:
             # включая служебную часть (её пишем мы сами — она обязана быть чистой).
             assert '$(' not in cmd and '`' not in cmd
             if 'ls -1 ' in cmd:
-                glob = cmd.split('ls -1 ', 1)[1].split(' |', 1)[0]
+                # Границу glob'а знает двойник (support.FakeSSH.ls_glob), а не
+                # локальный split: с 1.32.3 после glob'а стоит НАША служебная
+                # часть `; echo "FFRC $?"; }`, и прежний split(' |') принимал её
+                # за имя домена — замок краснел не по инъекции, а по форме
+                # команды. Разбор формы в одном месте (тот же закон, что держит
+                # FFDIR/FFCOUNT в одном месте).
+                glob = c.ls_glob(cmd)
                 assert glob, 'glob обязан дойти до ls буквально'
                 for ch in ';$"`|&<>(){}[]*?!\\\'\n':
                     if ch != '*':
@@ -464,6 +470,27 @@ class TestDomainListNotSilentlyTruncated:
             % len(info['domains']))
         assert info['notes'] == [], (
             'всё прочитано — признание о срезке выдумывать нельзя: %s'
+            % info['notes'])
+
+    def test_argv_flood_is_never_reported_as_no_domains(self):
+        # Доменный уровень того же дефекта (1.32.3): примитив обязан довезти
+        # признание до оператора. Замер живьём (20 000 конфигов, ulimit -s
+        # 1024): боевая команда даёт rc=0, FFDIR ok, FFCOUNT 0, stderr
+        # «Argument list too long»,rc ls = 126. Списков файлов мы НЕ получили,
+        # а прежний отчёт говорил «доменов нет»: checked лепился на FFDIR ok,
+        # не спрашивая, дошёл ли список.
+        e2big = 'FFDIR ok /etc/nginx/conf.d\nFFRC 126\nFFCOUNT 0\n'
+        c = FakeSSH(routes=[('ls -1',
+                             (e2big,
+                              '/bin/sh: line 1: /usr/bin/ls: Argument list '
+                              'too long', 0))])
+        info = logs_mod.get_domains_info(c, 'none')
+        assert info['domains'] == []
+        assert info['checked'] is False, (
+            'список файлов не получен, а отчёт подписывает это «проверено»: %s'
+            % info['notes'])
+        assert any('слишком много' in n.lower() for n in info['notes']), (
+            'пустота без объяснения: оператор прочитает её как «доменов нет»: %s'
             % info['notes'])
 
     def test_real_truncation_is_admitted_in_domain_language(self):
