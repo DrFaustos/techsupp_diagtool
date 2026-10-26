@@ -60,6 +60,56 @@ class TestSites:
         out = bx.bitrix_sites_report(c)
         assert 'shop.ru' in out and 'САЙТЫ' in out
 
+    # ============ 1.32.4: закрытый каталог — это НЕ «пустой» ================
+    # Прежний код перечислял каталог так:
+    #
+    #     out, _, _ = checker.run(f'ls -1 {q(directory)} 2>/dev/null')
+    #
+    # Замер живьём (три каталога, мой uid): пустой — rc=0 и пустой stdout;
+    # закрытый (chmod 000) — rc=2 и «Permission denied»; читаемый — rc=0 и
+    # список имён. Различитель СУЩЕСТВОВАЛ — его выбрасывали дважды: заглушкой
+    # stderr и `_, _` для кода возврата. Отчёт называл отсутствие прав
+    # отсутствием сайтов, а лечение у этих случаев противоположное: поднимать
+    # права против искать другой домен. Тот же закон, что закрыт для поиска
+    # файлов в 1.20.0, на новом носителе.
+    CLOSED = ('', "ls: cannot open directory '/etc/nginx/bx/site_avaliable': "
+                  'Permission denied', 2)
+
+    def test_closed_vhost_dir_is_not_called_no_sites(self):
+        c = FakeSSH(routes=[('ls -1', self.CLOSED)])
+        assert bx.bitrix_sites(c) == []
+        rep = bx.bitrix_sites_report(c)
+        assert 'не найдены' not in rep, rep
+        assert 'прав' in rep, rep
+
+    def test_closed_certs_dir_is_not_called_no_certs(self):
+        # Замер живьём: в закрытом каталоге лежал shop.ru, а отчёт утверждал
+        # «сертификаты не выпускались» — оператора это отправляет выпускать
+        # сертификат, которого нельзя коснуться, а не чинить права.
+        c = FakeSSH(routes=[('ls -1', ('', 'ls: cannot open directory: '
+                                           'Permission denied', 2))])
+        rep = bx.bitrix_ssl_report(c)
+        assert 'не выпускались' not in rep, rep
+        assert 'прав' in rep, rep
+
+    def test_honest_emptiness_keeps_its_own_words(self):
+        # Контрпример (закон: запрещающий guard обязан иметь контрпример).
+        # rc=0 и пустой вывод — честная пустота, и выдумывать ей «нет прав»
+        # нельзя: иначе правильный guard обесценит настоящие находки.
+        c = FakeSSH(routes=[('ls -1', ('', '', 0))])
+        rep = bx.bitrix_sites_report(c)
+        assert 'не найдены' in rep, rep
+        assert 'прав' not in rep, rep
+
+    def test_stderr_is_no_longer_thrown_away(self):
+        # Поведенческий замок по ОТПРАВЛЕННОЙ команде (не по исходнику):
+        # 2>/dev/null терял ровно ту строку, где написана причина пустоты.
+        c = FakeSSH(routes=[('ls -1', self.CLOSED)])
+        bx.bitrix_sites(c)
+        cmd = c.find('ls -1')
+        assert cmd is not None, 'перечисление каталога не ушло на сервер'
+        assert '2>/dev/null' not in cmd, cmd
+
 
 # ==================== чистые функции ====================
 class TestPure:

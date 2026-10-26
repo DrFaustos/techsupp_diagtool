@@ -295,31 +295,98 @@ def ident_safe(name):
 
 # ==================== ОКРУЖЕНИЕ И САЙТЫ ====================
 def detect_bitrix_env(checker):
-    """True, если на сервере BitrixVM: есть и /opt/webdir, и /home/bitrix."""
+    """True, если на сервере BitrixVM: есть и /opt/webdir, и /home/bitrix.
+
+    `2>/dev/null` здесь ОСТАВЛЕН осознанно. Замер живьём: `ls -d` закрытого
+    каталога печатает путь с rc=0, несуществующего — пусто и rc=2. То есть
+    `ls -d` делает stat пути, а не чтение содержимого, и «его не видно» тут не
+    маскируется. Править этот запрос в рамках 1.32.4 — значит портить
+    различение, которое работает.
+    """
     out, _, _ = checker.run(f'ls -d {q(WEBDIR)} {q(BITRIX_HOME)} 2>/dev/null')
     found = {line.strip() for line in out.splitlines() if line.strip()}
     return WEBDIR in found and BITRIX_HOME in found
 
 
-def bitrix_sites(checker):
-    """Имена сайтов по конфигам vhost'ов BitrixVM (без служебных файлов)."""
-    sites = []
-    for directory in SITE_DIRS:
+def list_dir_info(checker, directory):
+    """(имена в каталоге, чем объяснена пустота) — различает «пусто» и «нет прав».
+
+    Прежний вид был таким:
+
         out, _, _ = checker.run(f'ls -1 {q(directory)} 2>/dev/null')
-        for line in out.splitlines():
-            name = line.strip()
-            if (not name or name.endswith('.conf')
-                    or name in ('default', 'templates') or name in sites):
+
+    Замер живьём (три каталога, uid оператора): пустой — rc=0 и пустой stdout;
+    закрытый (chmod 000) — rc=2 и «Permission denied»; читаемый — rc=0 и список
+    имён. Различитель СУЩЕСТВОВАЛ и выбрасывался дважды: `2>/dev/null` глушил
+    stderr, `_, _` — код возврата. Отчёт называл отсутствие прав отсутствием
+    сайтов, а лечение у этих случаев противоположное: поднимать права, а не
+    искать другой домен. Тот же закон, что закрыт для поиска файлов в v1.20.0;
+    там rc был одинаковым для всех трёх ответов и различить удавалось только по
+    stderr, здесь rc честный — используем оба признака.
+
+    `stderr` не глушится: в нём единственная строка с причиной пустоты.
+    """
+    out, err, rc = checker.run(f'ls -1 {q(directory)}')
+    names = [ln.strip() for ln in (out or '').splitlines() if ln.strip()]
+    if names or rc == 0:
+        # Каталог прочитан. Пусто там, где система ответила rc=0 и молчала:
+        # выдумывать этому «нет прав» нельзя (контрпример заперт тестом).
+        return names, None
+    why = next((ln.strip() for ln in (err or '').splitlines() if ln.strip()),
+               f'код возврата {rc}')[:160]
+    if 'permission denied' in (err or '').lower():
+        return names, (f'⚠️ Каталог {directory} не читается под этим '
+                       'пользователем: нет прав на каталог (нужны r-x). Записи '
+                       'в нём могут быть — это «мы не увидели», а не «их нет»: '
+                       'прогоните под root или дайте оператору доступ')
+    return names, (f'⚠️ Каталог {directory} не перечислен: «{why}». О его '
+                   'содержимом ничего не известно — это «не проверено», а не '
+                   '«пусто»')
+
+
+def bitrix_sites_info(checker):
+    """Сайты BitrixVM и ЧЕМ объясняется пустота: {'sites','notes','checked'}.
+
+    checked=False — ни один каталог vhost'ов не был прочитан: это «не
+    проверено», а не «сайтов нет» (тот же закон, что в 1.19.0 и 1.20.0).
+    """
+    sites = []
+    notes = []
+    checked = False
+    for directory in SITE_DIRS:
+        names, note = list_dir_info(checker, directory)
+        if note is None:
+            checked = True
+        elif note not in notes:
+            notes.append(note)
+        for name in names:
+            if (name.endswith('.conf') or name in ('default', 'templates')
+                    or name in sites):
                 continue
             sites.append(name)
-    return sites
+    return {'sites': sites, 'notes': notes, 'checked': checked}
+
+
+def bitrix_sites(checker):
+    """Имена сайтов по конфигам vhost'ов (причины пустоты — в bitrix_sites_info)."""
+    return bitrix_sites_info(checker)['sites']
 
 
 def bitrix_sites_report(checker):
     lines = ['=== САЙТЫ В BITRIXVM ===']
-    sites = bitrix_sites(checker)
+    info = bitrix_sites_info(checker)
+    sites = info['sites']
     if not sites:
-        lines.append("⚠️ Конфиги vhost'ов в /etc/nginx/bx не найдены")
+        if info['notes']:
+            # Пустота объяснена: прежняя строка «не найдены» отправила бы
+            # оператора искать другой домен там, где нужны права на каталог.
+            lines.extend(info['notes'])
+            if not info['checked']:
+                lines.append('⚠️ Ни один каталог vhost\'ов не прочитан: о '
+                             'сайтах ничего не известно — это «не проверено», '
+                             'а не «сайтов нет»')
+        else:
+            lines.append("⚠️ Конфиги vhost'ов в /etc/nginx/bx не найдены")
         return '\n'.join(lines)
     for site in sites:
         lines.append(f'• {site}')
@@ -354,9 +421,16 @@ def find_dehydrated_cron(checker):
 def bitrix_ssl_report(checker):
     lines = ["=== SSL LET'S ENCRYPT (dehydrated) ==="]
     certs_dir = f'{DEHYDRATED}/certs'
-    out, _, _ = checker.run(f'ls -1 {q(certs_dir)} 2>/dev/null')
-    domains = [d.strip() for d in out.splitlines() if d.strip()]
-    if not domains:
+    # Тот же дефект, что с каталогом vhost'ов (см. list_dir_info): закрытый
+    # каталог прежний код называл пустым, и отчёт УТВЕРЖДАЛ «сертификаты не
+    # выпускались», хотя оператору требовалось чинить права, а не выпускать
+    # сертификат, которого нельзя коснуться.
+    domains, certs_note = list_dir_info(checker, certs_dir)
+    if certs_note:
+        lines.append(certs_note)
+        lines.append('⚠️ О выпущенных сертификатах ничего не известно — это '
+                     '«не проверено», а не «сертификатов нет»')
+    elif not domains:
         lines.append(f'⚠️ В {certs_dir} пусто — сертификаты не выпускались '
                      '(или BitrixVM старше 7.2)')
 

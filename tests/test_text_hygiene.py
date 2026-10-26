@@ -52,9 +52,16 @@ DETECTORS = (('CJK', CJK_DEFECT),
 # оказались иероглифы (тот самый класс, что ловит CJK-детектор) и латинское
 # слово в русском комментарии. Guard, который проверяет чужие тексты, обязан
 # сам стоять под тем же сканом, иначе он написан вслепую.
-HYGIENE_FILES = ('panels.py', 'common.py', 'logs.py',
+#
+# В 1.32.4 добавлены четыре файла BitrixVM: этот слайс писал в них тексты,
+# которые читает оператор, а под сканом они не стояли — то есть сторож молчал ровно там, где
+# дефект мог быть написан. Расширение разрешено только после замера: ad-hoc
+# проход по всем четырём дал НОЛЬ нарушений, поэтому список не тонет в шуме.
+HYGIENE_FILES = ('panels.py', 'common.py', 'logs.py', 'bitrix.py',
+                 'gui_bitrix.py',
                  'tests/test_panels.py', 'tests/support.py',
                  'tests/test_common.py', 'tests/test_logs.py',
+                 'tests/test_bitrix.py', 'tests/test_gui_bitrix.py',
                  'tests/test_text_hygiene.py', 'tests/test_git_history.py',
                  'CHANGELOG.md', 'README.md')
 
