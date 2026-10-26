@@ -4,7 +4,7 @@ from collections import Counter
 
 from common import (DOMAIN_PATHS, q, find_files, find_files_info,
                     read_file_content, read_file_info,
-                    get_domain_from_config)
+                    domains_from_configs_info)
 from metrics import detect_panel  # noqa: F401 (реэкспорт для удобства)
 
 
@@ -947,6 +947,7 @@ def get_domains_info(checker, panel_type):
                          f"Домены искались по конфигам веб-сервера — список может "
                          f"быть неполным")
 
+    configs = []
     for pattern in DOMAIN_PATHS.get(panel_type, DOMAIN_PATHS['none']):
         info = find_files_info(checker, pattern, 10)
         if info['dirs'] or info['total'] is not None:
@@ -955,7 +956,22 @@ def get_domains_info(checker, panel_type):
             if note not in notes:
                 notes.append(note)
         for config_file in info['paths']:
-            domains.extend(get_domain_from_config(checker, config_file))
+            if config_file not in configs:
+                configs.append(config_file)
+
+    # Чтение конфигов — ОДИН вызов на весь прогон (1.29.0). Прежняя plain-
+    # версия возвращала только список, поэтому «нет прав на конфиг» и «конфига
+    # нет» схлопывались в пустоту, и get_domains_info докладывал «доменов нет»
+    # по файлам, содержимое которых не читал; лечения у них противоположные
+    # (поднимать права против менять раскладку панели). По одному вызову на
+    # файл дало бы обратную беду: признание на каждый файл, и отчёт утонул бы
+    # (замер: 10 конфигов 0000 = 10 одинаковых строк). Агрегатор даёт ОДНУ
+    # строку на основание и называет число файлов.
+    cfg, cfg_notes = domains_from_configs_info(checker, configs)
+    domains.extend(cfg)
+    for note in cfg_notes:
+        if note not in notes:
+            notes.append(note)
 
     return {'domains': list(set(domains)), 'notes': notes, 'checked': checked}
 

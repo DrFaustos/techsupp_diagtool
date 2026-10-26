@@ -553,14 +553,246 @@ def read_file_content(checker, filepath):
     return read_file_info(checker, filepath)['content']
 
 
-def get_domain_from_config(checker, config_path):
-    """Извлекает домены из конфигурационного файла"""
-    cmd = f"grep -h 'server_name' {q(config_path)} 2>/dev/null | sed 's/.*server_name\\s*\\([^;]*\\);.*/\\1/' | tr -s ' ' '\\n' | grep -v '^_' | grep -v '^$' | grep -v 'localhost' | grep -v 'default_server' | grep -v '^\\*'"
-    out, _, _ = checker.run(cmd)
+# Формулировки состояний — теми же словами, что RF_TEXT (1.21.0) и FF_DIR_TEXT
+# (1.20.0): оператор читает один словарь во всех отчётах.
+DOMAIN_GAP_TEXT = {
+    'unreadable': "нет прав на файл конфига — домены по нему НЕ проверены "
+                  "(обычно нужен root или членство в группе файла)",
+    'missing': "файла конфига нет на сервере — проверьте раскладку и тип панели",
+    'isdir': "по этому пути каталог, а не файл конфига",
+}
+DOMAIN_UNCHECKED_NOTE = ("⚠️ Домены по {path} не определены — состояние не "
+                         "проверено: «{why}». Это НЕ «доменов нет»")
+
+
+def domains_from_config_text(text):
+    """Домены из строк `server_name ...;` — чистая функция, без I/O.
+
+    Прежний код вынимал домены пайпом `sed | tr | grep -v` в шелле и терял на
+    этом четыре диагноза (замер живьём на настоящих файлах, uid=1000,
+    /bin/bash):
+
+        '#    server_name uhatil.tld;'          -> ['uhatil.tld']   комментарий
+        '   # server_name staryj.tld;'          -> ['staryj.tld']   комментарий
+        'server_names_hash_bucket_size 128.0;'  -> ['128.0']        НЕ директива
+        'server_name hodovyj.tld; # ...ljevoj;' -> ['ljevoj.tld']   настоящий
+                                                                     домен ПОТЕРЯН
+
+    Последняя строка — двойная ложь: жадный `.*server_name` в sed брал
+    ПОСЛЕДНИЙ server_name строки. По выдуманным именам `check_site_logs` ищет
+    /var/log/nginx/128.0.error.log и рапортует о домене, которого нет.
+
+    Отсюда три правила, которых у шелла не было:
+      1. комментарий — не директива (`#` в начале строки и в её хвосте);
+      2. директива опознаётся по префиксу С ГРАНИЦЕЙ, а не по подстроке, иначе
+         `server_names_hash_bucket_size` становится `server_name`;
+      3. за `server_name` обязаны следовать токены (`server_name;` — ошибка
+         синтаксиса nginx, доменов там нет).
+
+    Фильтр унаследован от прежнего пайпа: `*`-шаблоны, `_`, `localhost`,
+    `default_server` и всё без точки доменами не считаются. Значение без
+    завершающей `;` (слегка побитый конфиг) доменом остаётся: молчать хуже,
+    чем назвать.
+    """
+    found = []
+    for line in (text or '').splitlines():
+        s = line.strip()
+        if s.startswith('#'):
+            continue
+        if '#' in s:
+            s = s.split('#', 1)[0].strip()
+        if not s.startswith('server_name'):
+            continue
+        rest = s[len('server_name'):]
+        if rest[:1] not in ('', ' ', '\t'):
+            continue          # 'server_names_...' — другая директива
+        for tok in rest.strip().rstrip(';').strip().split():
+            tok = tok.strip('"').rstrip(',;')
+            if not tok or tok[0] in ('_', '*'):
+                continue
+            if tok in ('localhost', 'default_server'):
+                continue
+            if '.' in tok:
+                found.append(tok)
+    return sorted(set(found))
+
+
+def _tidy_citation(text, path):
+    """Ответ системы без пути и без «дырок», оставшихся от его вырезания.
+
+    grep печатает путь в каждом сообщении: `grep: /etc/x.conf: Permission
+    denied`. Путь вырезается (иначе десять закрытых файлов дали бы десять
+    разных ключей и сводка рассыпалась), но вырезание оставляет на шве дыру:
+    `grep: : Permission denied`. Первую правку я сделал `replace(' : ', ': ')`
+    и получил `grep:: Permission denied` — то есть сам и прорезал дыру глубже
+    (показал живой контроль на настоящем /bin/bash). Правильно сворачивать
+    сам шов: два разделителя, между которыми не осталось текста, — это один
+    разделитель. Цитата — единственное, что оператор читает как доказательство,
+    поэтому её режут по шву, а не по живому.
+    """
+    t = str(text or '').replace(str(path), '')
+    while ': :' in t:
+        t = t.replace(': :', ':')
+    while '::' in t:
+        t = t.replace('::', ':')
+    while t.startswith(':') or t.startswith(' '):
+        t = t.lstrip(':').lstrip()
+    return ' '.join(t.split())
+
+
+def _domain_config_probe(checker, config_path):
+    """Один конфиг → {'domains', 'kind', 'why'}; kind=None — молчать честно.
+
+    kind: None (файл прочитан, вопрос закрыт) | 'unreadable' | 'missing' |
+    'isdir' | 'unchecked'. Разделение «пробел не закрыт» (kind=None) и
+    «пробел есть» (kind) — закон 1.19–1.28: признание нужно только там, где
+    отчёт иначе врёт.
+
+    'why' — ответ системы (цитируется, а не подменяется удобным диагнозом) с
+    ВЫРЕЗАННЫМ путём. Путь печатается в каждом сообщении grep, и без вырезания
+    десять закрытых файлов дали бы десять РАЗНЫХ ключей — сводка рассыпалась бы
+    на десять строк (замер живьём после первого GREEN этого слайса: 10 конфигов
+    0000 = 10 одинаковых признаний). Разные же ответы системы («memory
+    exhausted» против «input file is also the output») обязаны остаться
+    раздельными: это разные основания.
+    """
+    cmd = f"grep -h 'server_name' {q(config_path)} 2>&1"
+    out, err, rc = checker.run(cmd)
+    text_out = out or ''
+    text_err = err or ''
+    low = (text_out + ' ' + text_err).lower()
+    why = next((line.strip() for line in (text_err or text_out).splitlines()
+                if line.strip()), '')[:200]
+
+    if rc == 0:
+        if text_out.strip():
+            return {'domains': domains_from_config_text(text_out),
+                    'kind': None, 'why': ''}
+        # rc=0 без совпадений для grep не бывает (успех обязан совпадением):
+        # ответ оборвался — это пробел, а не «server_name нет».
+        return {'domains': [], 'kind': 'unchecked',
+                'why': 'grep вернул успех с пустым выводом'}
+
+    if rc == 1 and not text_err.strip():
+        # Штатный ответ grep «файл прочитан, совпадений нет» — ответ системы.
+        return {'domains': [], 'kind': None, 'why': ''}
+
+    kind = None
+    if 'permission denied' in low:
+        kind = 'unreadable'
+    elif 'is a directory' in low:
+        kind = 'isdir'
+    elif 'no such file' in low:
+        kind = 'missing'
+    key = _tidy_citation(why, config_path) or f'код возврата {rc}'
+    return {'domains': [], 'kind': kind or 'unchecked', 'why': key}
+
+
+def domains_from_configs_info(checker, config_paths):
+    """(домены, notes) по СПИСКУ конфигов: одно признание на основание.
+
+    Второй дефект этого же слайса, который показал первый GREEN: причина
+    дошла до оператора — но десятью строками. Десять конфигов с правами 0000
+    давали ДЕСЯТЬ одинаковых «⚠️ Домены по …: нет прав» (замер живьём), и
+    отчёт тонул: признание, которого десять, оператор перестаёт читать. Тот же
+    закон, что лечился «одним признанием на прогон» в 1.28.0 и в сводке
+    каталогов логов 1.20.0.
+
+    Группировка — по (состояние, ответ системы), а НЕ по файлу:
+
+      * «нет прав» и «конфига нет на сервере» НЕ сливаются в одну строку —
+        лечения противоположные (поднимать права против менять раскладку
+        панели);
+      * два разных ответа системы («memory exhausted» и «input file is also
+        the output») тоже не сливаются: это разные основания, и каждое
+        цитируется;
+      * внутри одной группы пути считаются числом: «по 10 файлам (…)» — цифру
+        оператор обязан видеть, иначе сводка врёт о масштабе пробела.
+
+    Найденное при этом не теряется: 9 прочитанных + 1 закрытый дают 9 доменов
+    и одну заметку, а не «доменов нет».
+    """
     domains = []
-    if out.strip():
-        for d in out.split('\n'):
-            d = d.strip()
-            if d and '.' in d and not d.startswith('_') and not d.startswith('*'):
-                domains.append(d)
-    return list(set(domains))
+    groups = {}
+    order = []
+    for path in (config_paths or []):
+        probe = _domain_config_probe(checker, path)
+        domains.extend(probe['domains'])
+        if probe['kind'] is None:
+            continue
+        key = (probe['kind'], probe['why'])
+        if key not in groups:
+            groups[key] = {'kind': probe['kind'], 'why': probe['why'],
+                           'paths': []}
+            order.append(key)
+        groups[key]['paths'].append(str(path))
+
+    notes = []
+    for key in order:
+        group = groups[key]
+        paths = group['paths']
+        if len(paths) == 1:
+            where = paths[0]
+        else:
+            where = (f"{len(paths)} файлам ({paths[0]} "
+                     f"и ещё {len(paths) - 1})")
+        if group['kind'] == 'unchecked':
+            notes.append(DOMAIN_UNCHECKED_NOTE.format(path=where,
+                                                      why=group['why']))
+        else:
+            notes.append(f"⚠️ Домены по {where}: " + DOMAIN_GAP_TEXT[group['kind']]
+                         + (f" ({group['why']})" if group['why'] else ''))
+    return sorted(set(domains)), notes
+
+
+def get_domain_from_config_info(checker, config_path):
+    """(домены, notes): список И чем объяснена пустота.
+
+    Прежний вид:
+
+        grep -h 'server_name' … 2>/dev/null | sed … | tr … | grep -v …
+
+    Терялись ТРИ вещи сразу — ровно как в 1.28.0 на systemctl:
+      1. `2>/dev/null` выбрасывал единственную строку, где написано ПОЧЕМУ
+         пусто;
+      2. пайп **забирал код возврата**: конвейер отдаёт rc последней команды
+         (`grep -v`), а тот сообщает лишь «фильтр что-то пропустил». Про права
+         пайп не говорит НИКОГДА — проверено: на закрытом 0000, отсутствующем
+         файле и каталоге прежняя команда давала rc=1 и пустой вывод,
+         идентичный «server_name нет»;
+      3. вывод был УЖЕ извлечёнными именами, поэтому тестовый двойник описывал
+         ответ, которого grep не выдаёт никогда, и чинить пайп под зелёными
+         тестами было нельзя (урок 1.27.0).
+
+    Замер живьём (этот хост, uid=1000), ОДНА команда
+    `grep -h 'server_name' ПУТЬ 2>&1`, rc принадлежит grep'у:
+
+        читаемый, домены есть     rc=0 'server_name example.com www.example.com;'
+        прочитан, server_name нет rc=1 ''
+        ЗАКРЫТ 0000               rc=2 'grep: ...: Permission denied'
+        ОТСУТСТВУЕТ               rc=2 'grep: ...: No such file or directory'
+        КАТАЛОГ                   rc=2 'grep: ...: Is a directory'
+
+    То есть «нет прав» и «конфига нет» — противоположные действия (поднимать
+    права против менять раскладку панели) — давали один ответ `[]`, и
+    `get_domains_info` докладывал «доменов нет». Цена не выросла: была одна
+    SSH-команда, осталась одна.
+
+    notes пуст и при найденных доменах, и при честном rc=1 («прочитано,
+    совпадений нет») — признание нужно только на пробел (закон 1.19–1.28).
+    """
+    # Один файл — частный случай сводки по списку (domains_from_configs_info):
+    # формулировка при этом остаётся прежней, «⚠️ Домены по <путь>: …», потому
+    # что заперта тестами и привычна оператору. Команда живёт в
+    # _domain_config_probe — одном месте на обе формы.
+    return domains_from_configs_info(checker, [config_path])
+
+
+def get_domain_from_config(checker, config_path):
+    """Домены из конфигурационного файла (причины пустоты — в _info-форме).
+
+    Пустой список здесь значит и «доменов нет», и «мы не смогли посмотреть»:
+    отчёту, которому важно различать, обязан звать
+    get_domain_from_config_info.
+    """
+    return get_domain_from_config_info(checker, config_path)[0]
