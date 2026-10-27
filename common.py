@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.15"
+__version__ = "1.32.16"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -85,13 +85,80 @@ def q(value):
     return shlex.quote(str(value))
 
 
-def ensure_backup_dir(checker):
-    """Создаёт директорию для бэкапов, если её нет"""
-    out, _, rc = checker.run(f'mkdir -p {q(BACKUP_DIR)} 2>/dev/null && echo "created"')
-    for subdir in BACKUP_SUBDIRS.values():
-        checker.run(f'mkdir -p {q(subdir)} 2>/dev/null')
-    return rc == 0 and out.strip() == 'created'
+BACKUP_PROBE = '.wprobe'
 
+
+def _writable_question(path):
+    """Один вопрос о каталоге: создать и ФАКТИЧЕСКИ в него записать.
+
+    Прежняя форма решала по слову-маркеру и прятала причину:
+
+        out, _, rc = checker.run(f'mkdir -p ... 2>/dev/null && echo "created"')
+        for subdir in BACKUP_SUBDIRS.values():
+            checker.run(...)
+        return rc == 0 and out.strip() == 'created'
+
+    Замер живьём (uid=1000, настоящий bash, BACKUP_DIR подменён на временный):
+    в мире «каталог есть, но 0555» mkdir выходит с нулём и печатает «created»,
+    хотя пробная запись в него отклонена — признак не различал «создан» и
+    «не принимает запись». Второй корень: ответы по четырём подкаталогам
+    выбрасывались, поэтому при занятом ФАЙЛОМ пути configs функция возвращала
+    True (mkdir по нему rc=1 со словами о файле, которые глохли в /dev/null).
+
+    Носитель ответа — код возврата ПРОБНОЙ ЗАПИСИ. mkdir остаётся побочным
+    эффектом того же спроса, поэтому цена не растёт: пять каталогов — пять
+    вопросов, как и раньше. Слово-маркера нет, `&&` нет (прежний тест запрещает
+    его в спросах), `;` снимает rc до уборки, а `exit` возвращает именно код
+    записи, а не удаления.
+    """
+    probe = q(path) + '/' + BACKUP_PROBE
+    return ('mkdir -p %s 2>&1; : > %s 2>&1; r=$?; rm -f %s; exit $r'
+            % (q(path), probe, probe))
+
+
+def ensure_backup_dir_info(checker):
+    """Пригодность каталога бэкапов: {ok, note, dirs}.
+
+    dirs — по каждому спрошенному пути: '' (пишет) или почему нет. Право
+    сказать «каталог готов» даёт только удачная пробная запись (закон серии:
+    право на «готово» даёт перечитанный факт, а не обещание команды).
+    """
+    dirs = {}
+    for path in [BACKUP_DIR] + list(BACKUP_SUBDIRS.values()):
+        out, err, rc = checker.run(_writable_question(path))
+        if rc == 0:
+            dirs[path] = ''
+            continue
+        why = _first_line(out) or _first_line(err)
+        dirs[path] = ('не принимает запись (rc=%s)%s'
+                      % (rc, ': ' + why if why else ''))
+    bad = dict((p, w) for p, w in dirs.items() if w)
+    note = '; '.join('%s — %s' % (p, w) for p, w in bad.items())
+    return {'ok': not bad, 'note': note, 'dirs': dirs}
+
+
+def ensure_backup_dir(checker):
+    """Создаёт директорию для бэкапов, если её нет.
+
+    Тонкая обёртка над ensure_backup_dir_info: потребители (files.py,
+    create_backup_info, diagnostic) завязаны на bool и не обязаны знать
+    причины. Кто хочет назвать отказ — берёт ensure_backup_dir_info.
+    """
+    return ensure_backup_dir_info(checker)['ok'] is True
+
+
+def _backup_dir_note(backup_path, dinfo):
+    """Что сказать о каталоге бэкапов, если он не принимает запись.
+
+    Называется именно тот подкаталог, куда должен был лечь бэкап: лечение
+    «каталог не пишет» (права, занятое имя) другое, чем «файл не читается».
+    """
+    if dinfo.get('ok'):
+        return None
+    subdir = os.path.dirname(backup_path)
+    why = dinfo.get('dirs', {}).get(subdir)
+    return ('каталог %s недоступен для записи%s'
+            % (subdir, ': ' + why if why else ''))
 
 def create_backup_info(checker, filepath, backup_type='configs'):
     """Резервная копия файла с временной меткой: {path, state, note}.
@@ -124,7 +191,7 @@ def create_backup_info(checker, filepath, backup_type='configs'):
     отсутствие — по достоверному списку. Маркер-слово из спросов уходит.
     cp не спрашивается ни при absent, ни при unchecked — прежний замок цел.
     """
-    dir_ready = ensure_backup_dir(checker)
+    dinfo = ensure_backup_dir_info(checker)
 
     filename = os.path.basename(filepath)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -147,8 +214,8 @@ def create_backup_info(checker, filepath, backup_type='configs'):
     if rc != 0:
         info['state'] = 'failed'
         parts = ['cp вернул rc=%s%s' % (rc, ': ' + reason if reason else '')]
-        if not dir_ready:
-            parts.append('каталог бэкапов %s не создан' % BACKUP_DIR)
+        if not dinfo['ok']:
+            parts.append(_backup_dir_note(backup_path, dinfo))
         info['note'] = '; '.join(parts)
         return info
 
@@ -157,15 +224,14 @@ def create_backup_info(checker, filepath, backup_type='configs'):
         info['state'] = 'failed'
         parts = ['cp вернул 0, а бэкапа нет: %s' % (reread['note']
                                                   or reread['state'])]
-        if not dir_ready:
-            parts.append('каталог бэкапов %s не создан' % BACKUP_DIR)
+        if not dinfo['ok']:
+            parts.append(_backup_dir_note(backup_path, dinfo))
         info['note'] = '; '.join(parts)
         return info
 
     info['state'] = 'done'
     info['path'] = backup_path
-    info['note'] = '' if dir_ready else ('каталог бэкапов %s не подтверждён'
-                                         % BACKUP_DIR)
+    info['note'] = _backup_dir_note(backup_path, dinfo) or ''
     return info
 
 

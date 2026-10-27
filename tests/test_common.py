@@ -1712,3 +1712,122 @@ class TestCreateBackupInfo:
         info = common.create_backup_info(c, '/etc/x.conf', 'нет-такого-типа')
         assert info['state'] == 'done'
         assert '/configs/x.conf.' in info['path']
+
+# ===== БЭКАП: пригодность каталога обязана быть фактом записи =====
+# Замер живьём (uid=1000, настоящий bash, BACKUP_DIR подменён на временный).
+# Боевая строка
+#
+#     out, _, rc = checker.run(f'mkdir -p {q(BACKUP_DIR)} 2>/dev/null && echo "created"')
+#     for subdir in BACKUP_SUBDIRS.values():
+#         checker.run(f'mkdir -p {q(subdir)} 2>/dev/null')
+#     return rc == 0 and out.strip() == 'created'
+#
+# в мире «каталог есть, но read-only» даёт rc=0 и слово «created», хотя запись
+# в него запрещена: mkdir сам считает уже существующий каталог успехом. Второй
+# корень: ответы по четырём подкаталогам выбрасываются, поэтому при занятом
+# ФАЙЛОМ пути configs функция возвращает True, хотя mkdir по нему rc=1.
+# Слово-маркер и глошение причины через 2>/dev/null — тот же корень, что лечила
+# вся серия 1.32.6 — 1.32.15.
+PROBE_DENIED = ('/root/tech_support/configs/.wprobe: Отказано в доступе',
+                '', 1)
+PROBE_OK = ('', '', 0)
+
+
+class TestEnsureBackupDirInfo:
+    def test_writable_catalog_is_ok(self):
+        # Норма обязана остаться нормой: иначе оператор прочитает «каталог не
+        # пишет» там, где всё в порядке (ложная тревога дороже ложного успеха).
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('.wprobe', PROBE_OK)])
+        info = common.ensure_backup_dir_info(c)
+        assert info['ok'] is True
+        assert info['note'] == ''
+        assert [p for p, why in info['dirs'].items() if why] == [], info['dirs']
+
+    def test_readonly_catalog_is_not_ok_though_mkdir_said_created(self):
+        # ГЛАВНЫЙ RED этого слайса: прежний код возвращал True. mkdir на
+        # существующем read-only каталоге выходит с нулём, а слово печатает
+        # сама команда, то есть признак не различал миры вовсе.
+        c = FakeSSH(routes=[('.wprobe', PROBE_DENIED),
+                            ('mkdir -p', ('created', '', 0))])
+        info = common.ensure_backup_dir_info(c)
+        assert info['ok'] is False
+        assert 'Отказано в доступе' in info['note']
+
+    def test_marker_word_and_devnull_are_gone_from_questions(self):
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('.wprobe', PROBE_OK)])
+        common.ensure_backup_dir_info(c)
+        assert c.commands, 'скан молчит: спросов не было вовсе'
+        for sent in c.commands:
+            assert '&& echo' not in sent, sent
+            assert '2>/dev/null' not in sent, 'причина отказа снова в /dev/null'
+
+    def test_failing_subdir_is_named_by_path(self):
+        # Ответы по подкаталогам прежний код не читал: оператор не узнавал,
+        # какой именно путь не принимает запись.
+        c = FakeSSH(routes=[('configs/.wprobe', PROBE_DENIED),
+                            ('.wprobe', PROBE_OK),
+                            ('mkdir -p', ('', '', 0))])
+        info = common.ensure_backup_dir_info(c)
+        assert info['ok'] is False
+        bad = [p for p, why in info['dirs'].items() if why]
+        assert bad == ['/root/tech_support/configs'], bad
+        assert 'configs' in info['note']
+
+    def test_subdir_taken_by_a_file_is_not_ok(self):
+        # Замер: mkdir по пути, где лежит файл, отвечает rc=1 со словами о
+        # файле; прежний код этот ответ выбрасывал и возвращал True.
+        c = FakeSSH(routes=[
+            ('mkdir -p /root/tech_support/configs',
+             ('mkdir: невозможно создать каталог «configs»: Файл существует',
+              '', 1)),
+            ('mkdir -p', ('', '', 0)),
+            ('.wprobe', PROBE_OK)])
+        info = common.ensure_backup_dir_info(c)
+        assert info['ok'] is False
+        assert 'Файл существует' in info['note']
+
+    def test_missing_utility_is_not_ok_and_names_rc(self):
+        c = FakeSSH(routes=[('mkdir -p',
+                             ('', 'bash: mkdir: command not found', 127))])
+        info = common.ensure_backup_dir_info(c)
+        assert info['ok'] is False
+        assert '127' in info['note']
+
+    def test_price_stays_one_question_per_catalog(self):
+        # Контракт стоимости: ответы по подкаталогам начинают читаться, но цена
+        # не вырастает — пробная запись едет в том же спросе, что и mkdir.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('.wprobe', PROBE_OK)])
+        common.ensure_backup_dir_info(c)
+        want = len(common.BACKUP_SUBDIRS) + 1
+        assert len(c.commands) == want, c.commands
+        assert c.count('mkdir -p') == want, c.commands
+
+    def test_wrapper_stays_a_plain_bool(self):
+        # Обратная совместимость — часть контракта: потребители (files.py,
+        # common.py) и экспорт в diagnostic.py завязаны на bool.
+        ok = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                             ('.wprobe', PROBE_OK)])
+        assert common.ensure_backup_dir(ok) is True
+        ro = FakeSSH(routes=[('.wprobe', PROBE_DENIED),
+                             ('mkdir -p', ('created', '', 0))])
+        assert common.ensure_backup_dir(ro) is False
+        dead = FakeSSH(routes=[('mkdir -p', ('', 'permission denied', 1))])
+        assert common.ensure_backup_dir(dead) is False
+
+    def test_backup_names_the_catalog_that_cannot_write(self):
+        # В этом мире прежний dir_ready был True, поэтому отчёт говорил только
+        # словами cp. Оператор обязан увидеть, что каталог не принимает запись:
+        # это другое лечение (править права), чем «файл не читается».
+        c = FakeSSH(routes=[('.wprobe', PROBE_DENIED),
+                            ('mkdir -p', ('', '', 0)),
+                            ('test -f /etc/nginx/nginx.conf', ('', '', 0)),
+                            ('cp ', ('cp: невозможно создать обычный файл: '
+                                     'Отказано в доступе', '', 1))])
+        info = common.create_backup_info(c, '/etc/nginx/nginx.conf')
+        assert info['state'] == 'failed'
+        assert 'cp вернул rc=1' in info['note']
+        assert 'недоступен для записи' in info['note']
+        assert '/root/tech_support/configs' in info['note']
