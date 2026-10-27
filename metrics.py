@@ -1,5 +1,6 @@
 """Определение панели, системные метрики и базовые отчёты."""
-from common import LOG_PATHS, DOMAIN_PATHS, get_domain_from_config, q
+from common import (LOG_PATHS, DOMAIN_PATHS, get_domain_from_config, q,
+                    command_probe_info)
 
 
 # ==================== ОПРЕДЕЛЕНИЕ ПАНЕЛИ ====================
@@ -87,13 +88,23 @@ def get_metrics(checker):
     out, _ = checker.exec_command('ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null')
     metrics['listening_ports'] = out
 
+    # Доступность спрашивает общий зонд (1.32.11): решение по коду возврата и
+    # каналам, а не по пустоте stdout. Прежняя форма
+    #   cmd 2>/dev/null || echo "not installed"
+    # на этой машине печатала «not installed» и там, где утилиты нет (ufw,
+    # rc=127), и там, где она ЕСТЬ, но отказали права (iptables -L -n rc=4,
+    # nft list ruleset rc=1): три разных мира сходились в одну строку отчёта о
+    # безопасности, по которому оператор решает, нужен ли файрвол. Заглушка
+    # 2>/dev/null глушила единственное доказательство отсутствия бинарника —
+    # «command not found» живёт в stderr у оболочки. Значение остаётся строкой:
+    # словарь уходит в firewall_report и в сводку (reports.py), где его ждут
+    # строки.
     firewall = {}
-    out, _ = checker.exec_command('ufw status 2>/dev/null || echo "ufw not installed"')
-    firewall['ufw'] = out
-    out, _ = checker.exec_command('iptables -L -n 2>/dev/null || echo "iptables not available"')
-    firewall['iptables'] = out
-    out, _ = checker.exec_command('nft list ruleset 2>/dev/null || echo "nftables not available"')
-    firewall['nftables'] = out
+    for name, cmd in (('ufw', 'ufw status'),
+                      ('iptables', 'iptables -L -n'),
+                      ('nftables', 'nft list ruleset')):
+        probe = command_probe_info(checker, cmd)
+        firewall[name] = probe['text'] if probe['state'] == 'ok' else probe['note']
     metrics['firewall'] = firewall
 
     out, _ = checker.exec_command(services_status_cmd())

@@ -147,3 +147,96 @@ class TestWebConfig:
         assert 'nginx: nginx: configuration file' in out
         assert 'apache: Syntax OK' in out
         assert 'не обнаружен' not in out
+
+
+# ============ файрвол: молчание не есть «не установлено» (1.32.11) ============
+# Замер живьём (этот хост, непривилегированный пользователь): iptables и nft
+# УСТАНОВЛЕНЫ (/usr/sbin), но iptables -L -n даёт rc=4 Permission denied,
+# nft list ruleset — rc=1 Operation not permitted, а ufw — rc=127 command not
+# found. Прежняя форма (cmd 2>/dev/null || echo готовое слово) печатала на всех
+# трёх побайтово одно и то же: решение шло по пустоте stdout, а не по коду
+# возврата. Отчёт о безопасности уходит и в сводку (reports.py), поэтому по нему
+# оператор решает, нужен ли на хосте файрвол.
+class TestFirewallProbe:
+    KEYS = ('ufw', 'iptables', 'nftables')
+
+    def _fw(self, routes):
+        c = FakeSSH(routes=routes)
+        return c, metrics_mod.firewall_report(c)
+
+    def _unchecked(self, out):
+        # Строки, ОБЪЯВЛЯЮЩИЕ пробел. Признание печатается отдельной строкой
+        # под заголовком: firewall_report выводит значение как `fw:` + перевод
+        # строки + тело (так его ждёт test_reports.py), и менять этот формат
+        # ради учёта радиус — ломать проверенный контракт ради измерителя.
+        # Поэтому признак — строка с признанием, а не строка заголовка: у
+        # ответившего файрвола такой строки нет вовсе (замок ниже), значит
+        # число строк равно числу файлов, где спрос не состоялся.
+        return [ln for ln in out.splitlines() if 'не проверено' in ln]
+
+    def test_permission_denied_is_unchecked_not_not_installed(self):
+        # Ключевой случай: утилита ЕСТЬ, но спросить не удалось (rc=4, замер).
+        c, out = self._fw([
+            ('ufw status', ('', 'bash: line 1: ufw: command not found', 127)),
+            ('iptables -L', ('', 'Permission denied', 4)),
+            ('nft list', ('', 'Operation not permitted (you must be root)', 1)),
+        ])
+        assert 'iptables not available' not in out, out
+        assert 'nftables not available' not in out, out
+        assert len(self._unchecked(out)) >= 2, out
+        assert 'Permission denied' in out, out
+
+    def test_missing_binary_is_measured_fact_not_guess(self):
+        # «Не установлено» допустимо только при доказательстве: rc=127 (замер).
+        c, out = self._fw([
+            ('ufw status', ('', 'bash: line 1: ufw: command not found', 127)),
+            ('iptables -L', ('Chain INPUT (policy ACCEPT)', '', 0)),
+            ('nft list', ('table inet filter', '', 0)),
+        ])
+        assert 'не установлено' in out, out
+        assert 'Chain INPUT (policy ACCEPT)' in out, out
+        assert len(self._unchecked(out)) == 0, out
+
+    def test_silence_at_rc0_is_unchecked(self):
+        # Пустой вывод при rc=0 — молчание, а не «файрвола нет».
+        c, out = self._fw([
+            ('ufw status', ('', '', 0)),
+            ('iptables -L', ('', '', 0)),
+            ('nft list', ('', '', 0)),
+        ])
+        assert len(self._unchecked(out)) == 3, out
+        assert 'not installed' not in out and 'not available' not in out, out
+
+    def test_real_answers_printed_as_before(self):
+        # Замок от перелома: ответивший файрвол печатается как раньше
+        # (test_reports.py ждёт ufw: + перевод строки + Status: active).
+        c, out = self._fw([
+            ('ufw status', ('Status: active', '', 0)),
+            ('iptables -L', ('Chain INPUT (policy ACCEPT)', '', 0)),
+            ('nft list', ('table inet filter', '', 0)),
+        ])
+        assert 'ufw:\nStatus: active' in out, out
+        assert 'не проверено' not in out, out
+
+    def test_no_probe_blinds_channels_or_adds_default(self):
+        # Поведенческий замок: смотрим ОТПРАВЛЕННЫЕ команды, а не текст
+        # исходника (упоминание не есть вызов — закон 1.32.9).
+        c, out = self._fw([('ufw status', ('Status: active', '', 0))])
+        asked = [cmd for cmd in c.commands
+                 if 'ufw' in cmd or 'iptables' in cmd or 'nft ' in cmd]
+        assert len(asked) == 3, asked
+        for cmd in asked:
+            assert '2>/dev/null' not in cmd, cmd
+            assert '||' not in cmd, cmd
+        # Подстрока обязательна: test_reports.py считает ufw status ровно раз.
+        assert c.count('ufw status') == 1, c.commands
+
+    def test_firewall_values_stay_strings(self):
+        # test_reports.py передаёт готовый словарь со СТРОКАМИ: природу
+        # значения менять нельзя, признанием обязана быть строка.
+        m = metrics_mod.get_metrics(FakeSSH(routes=[
+            ('ufw status', ('', 'Permission denied', 4)),
+        ]))
+        assert set(m['firewall']) == {'ufw', 'iptables', 'nftables'}
+        for key, value in m['firewall'].items():
+            assert isinstance(value, str), (key, type(value))

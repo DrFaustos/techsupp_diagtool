@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.10"
+__version__ = "1.32.11"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -687,6 +687,99 @@ def resolver_probe_info(checker, resolver, probe='google.com'):
     state, note = parse_resolver_probe(out, err, rc)
     return {'resolver': resolver, 'state': state,
             'checked': state != 'unchecked', 'note': note}
+
+
+# ==================== ЗОНД ДОСТУПНОСТИ КОМАНДЫ (1.32.11) ====================
+'''Различение ответа, отсутствующей утилиты и несостоявшегося запроса.
+
+Тот же корень, что у 1.32.6-1.32.10: пустой stdout спросителя читался как
+измеренный факт. Носитель — формы вида «cmd 2>/dev/null || echo готовое
+слово», где решение принималось по пустоте stdout, а не по коду возврата.
+
+Замер живьём (этот хост, от непривилегированного пользователя):
+  ufw status        rc=127, stderr: command not found  (утилиты нет)
+  iptables -L -n    rc=4,   stderr: Permission denied  (утилита ЕСТЬ)
+  nft list ruleset  rc=1,   stderr: Operation not permitted (ЕСТЬ)
+Прежняя форма печатала на всех трёх побайтово одно и то же, поэтому три
+разных мира сходили в отчёте о безопасности в одну строку. Отдельно
+2>/dev/null глушило единственную подсказку про отсутствующий бинарник: она
+живёт в stderr у оболочки, а не в stdout команды.
+
+Эмодзи в признании намеренно нет: различение обязано идти по слову
+«не проверено», а не по знаку (урок серии — замок на символе, собранном по
+памяти, оказывался истинным всегда).
+'''
+COMMAND_UNCHECKED_NOTE = (
+    'Состояние не проверено: «{why}». Это «мы не спросили», а не ответ хоста: '
+    'запрос не состоялся (нет прав, нет бинарника, пустой вывод)')
+
+
+def command_probe_cmd(cmd):
+    '''Форма запроса: сама команда, без заглушек каналов и без ||-дополнения.
+
+    Код возврата обязан принадлежать самой команде, а stderr — доехать как
+    причина. Заглушка канала убивала подсказку про отсутствующий бинарник, а
+    ||-дополнение превращало любой отказ в готовый ответ.
+
+    Форма зачищается ЗДЕСЬ, а не на совести вызывающего: замер показал, что
+    первая версия («просто strip») сохраняла переданную заглушку —
+    command_probe_cmd('  ufw status 2>/dev/null  ') вернул 'ufw status
+    2>/dev/null'. Такой примитив гарантировал бы честный канал только пока
+    вызывающий не забыл заглушку, то есть гарантией не был.
+    '''
+    text = (cmd or '').strip()
+    # ||-дополнение: любой отказ становится готовым словом. Отсекаем хвост,
+    # вместе с ним уходит и echo-ложь (замер: 'X not installed' при rc=0).
+    if '||' in text:
+        text = text.split('||', 1)[0].strip()
+    # Заглушки каналов: подсказка про отсутствующий бинарник живёт в stderr у
+    # оболочки (rc=127/126), заглушив канал, мы теряем единственное доказательство.
+    for blind in ('2>/dev/null', '2>&1', '1>&2', '>/dev/null'):
+        if blind in text:
+            text = text.replace(blind, ' ')
+    return text.strip()
+
+
+def parse_command_probe(out, err, rc):
+    '''('ok' | 'absent' | 'unchecked', признание или None) по замеренным формам.
+
+    'absent' — только при доказательстве отсутствия бинарника (rc=127/126):
+    тогда «не установлено» есть измеренный факт. Отказ прав (rc=4, rc=1 при
+    пустом stdout) и пустой вывод при rc=0 — 'unchecked': спрашивать не чем,
+    значит состояния мы не знаем.
+    '''
+    def first(text):
+        lines = (text or '').strip().splitlines()
+        return lines[0][:200] if lines else ''
+
+    text = (out or '').strip()
+    if rc == 127:
+        return 'absent', first(err) or 'command not found (rc=127)'
+    if rc == 126:
+        return 'absent', first(err) or 'command not executable (rc=126)'
+    if text:
+        return 'ok', None
+    if rc != 0:
+        return 'unchecked', first(err) or first(out) or ('rc=%s' % rc)
+    return 'unchecked', 'пустой вывод (rc=0)'
+
+
+def command_probe_info(checker, cmd):
+    '''Один честный запрос: {command, state, checked, text, note}.
+
+    checked ложно ровно для unchecked: по нему нельзя ни печатать диагноз, ни
+    совершать вылечивающее действие (закон серии: «не проверено» не печатается
+    как факт). text — вывод команды, note — причина отказа или признание.
+    '''
+    out, err, rc = checker.run(command_probe_cmd(cmd))
+    state, why = parse_command_probe(out, err, rc)
+    info = {'command': cmd, 'state': state, 'checked': state != 'unchecked',
+            'text': (out or '').strip(), 'note': why or ''}
+    if state == 'absent':
+        info['note'] = 'не установлено: ' + (why or '')
+    elif state == 'unchecked':
+        info['note'] = COMMAND_UNCHECKED_NOTE.format(why=why or 'молчание')
+    return info
 
 
 # ==================== СЧЁТЧИК find (1.32.5) ====================
