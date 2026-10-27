@@ -2137,3 +2137,115 @@ class TestNoCrontabYetIsNotAFailure:
         c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
                             ('crontab -l >', CR_NOJOB)])
         assert common.save_crontab_backup(c) is None
+
+# ===== 1.32.18-A: запись crontab обязана подтверждаться перечиткой =====
+# Второй независимый потребитель того же корня, что 1.32.17 вылечил в bitrix.py:
+# panels.ispmanager_fix_cron_path. Замер живьём (настоящий bash, подставной
+# crontab с хранилищем заданий, uid=1000):
+#   crontab -l 2>/dev/null | sed 's/^PATH=/#PATH=/' | crontab - 2>&1
+# при НЕЧИТАЕМОМ crontab даёт rc=0 и теряет ВСЕ 3 задания, а кнопка печатает
+# «✅ Переменная PATH закомментирована». Причина Twice: (а) чтение спрятало
+# причину в /dev/null, (б) rc конвейера принадлежит ПОСЛЕДНЕМУ элементу
+# (замер: `false | true` -> rc=0), т.е. успехом засчитывается rc записи, а не
+# прочтения. Отсюда носитель: право на «готово» даёт ПЕРЕЧИТАННЫЙ текст, а не
+# ноль кода возврата (закон 1.32.13).
+#
+# Второй замер, не менее важный: `printf '' | crontab -` выходит с rc=0 и
+# ОПУСТОШАЕТ хранилище. Значит пустое тело нельзя писать вовсе — иначе
+# «ничего не нашёл, нечего менять» превращается в «crontab стёрт».
+CR_WRITE_TEXT = '# PATH=/bin:/usr/bin' + chr(10) + '0 3 * * * /x.sh' + chr(10)
+
+
+class TestCrontabWriteInfo:
+    def test_written_and_reread_text_is_done(self):
+        # Перечитка в том же спросе вернула ровно отправленное => «готово».
+        c = FakeSSH(routes=[('crontab -', (CR_WRITE_TEXT, '', 0))])
+        info = common.crontab_write_info(c, CR_WRITE_TEXT)
+        assert info['state'] == 'done', info
+        assert info['note'] == ''
+
+    def test_zero_rc_without_matching_reread_is_not_done(self):
+        # rc=0, но перечитывание вернуло ДРУГОЕ: верить на слово нельзя.
+        # Прежняя форма именно так и решала (rc конвейера = 0) и рапортовала
+        # успех при стёртом crontab.
+        c = FakeSSH(routes=[('crontab -', ('', '', 0))])
+        info = common.crontab_write_info(c, CR_WRITE_TEXT)
+        assert info['state'] == 'unverified', info
+        assert 'не подтверждено' in info['note'], info['note']
+
+    def test_refusal_names_rc_and_channel(self):
+        c = FakeSSH(routes=[('crontab -',
+                             ('', 'crontab: bad thing happened' + chr(10), 2))])
+        info = common.crontab_write_info(c, CR_WRITE_TEXT)
+        assert info['state'] == 'failed', info
+        assert 'rc=2' in info['note']
+        assert 'bad thing happened' in info['note']
+
+    def test_empty_body_is_never_written(self):
+        # Пустой stdin для `crontab -` = ЗАПИСАТЬ ПУСТОЙ crontab (замер: rc=0,
+        # хранилище опустело). Носитель обязан отказать ДО всякого спроса.
+        c = FakeSSH(routes=[('crontab -', ('', '', 0))])
+        info = common.crontab_write_info(c, '')
+        assert info['state'] == 'failed', info
+        assert c.commands == [], c.commands
+        c = FakeSSH(routes=[('crontab -', ('', '', 0))])
+        assert common.crontab_write_info(c, chr(10) + '   ')[
+            'state'] == 'failed'
+        assert c.commands == [], c.commands
+
+    def test_question_carries_reread_and_hides_nothing(self):
+        # Перечитка едет ТЕМ ЖЕ спросом (цена: один вопрос на правку), а
+        # причина не прячется в /dev/null: ровно там она и отличается.
+        c = FakeSSH(routes=[('crontab -', (CR_WRITE_TEXT, '', 0))])
+        common.crontab_write_info(c, CR_WRITE_TEXT)
+        asked = [s for s in c.commands if 'crontab -' in s]
+        assert len(asked) == 1, c.commands
+        body = asked[0]
+        assert 'crontab -l' in body, body
+        assert '2>/dev/null' not in body and '&&' not in body, body
+
+    def test_body_survives_quoting_byte_for_byte(self):
+        # Тело несёт табуляции, ~, $ и кавычки: shell обязан получить его
+        # целиком, иначе «подтверждённая» правка исказит задания.
+        body = ('0 3 * * * /usr/sbin/logrotate' + chr(9) + '--force' + chr(10)
+                + '@daily echo "$HOME" & ls; cat a\'b`id`~' + chr(10))
+        sent = common._crontab_write_question(body)
+        assert 'printf' in sent and 'crontab -' in sent, sent[:80]
+        assert common.q(body) in sent, sent[-120:]
+
+
+# ===== 1.32.18-B: бэкап обязан нести прочитанный оригинал ===================
+# Панели правят crontab на основании его СОДЕРЖИМОГО. Прежний путь читал его
+# ВТОРЫМ спросом через exec_command (без rc) и складывал в файл-посредник
+# /tmp/crontab_current.txt, который редирект создаёт ДО запуска утилиты:
+# при отказе чтения там лежал нулевой файл, а create_backup_info на нём
+# возвращал state='done' с нулевым «бэкапом» (замер: размер 0 против 104 в
+# здоровом мире). Спрашивать дважды — значит получить два разных ответа;
+# спрос, который уже перечитал файл, обязан отдавать текст потребителю.
+class TestBackupCarriesOriginalText:
+    def test_done_state_carries_the_reread_original(self):
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_DONE)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'done'
+        assert info['text'] == CR_DONE[0], info
+
+    def test_empty_and_failed_states_carry_no_text(self):
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_EMPTY)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'empty' and info['text'] == '', info
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >',
+                             ('', 'crontab: bad thing happened' + chr(10), 2))])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'failed' and info['text'] == '', info
+
+    def test_original_arrives_from_the_same_single_question(self):
+        # Цена: текст бэкапа не имеет права стоить второго спроса.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_DONE)])
+        info = common.save_crontab_backup_info(c)
+        assert info['text'] == CR_DONE[0]
+        assert len([s for s in c.commands if 'crontab -l' in s]) == 1, \
+            c.commands

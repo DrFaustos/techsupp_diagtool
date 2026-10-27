@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.17"
+__version__ = "1.32.18"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -346,7 +346,7 @@ def _crontab_backup_question(path):
 
 
 def save_crontab_backup_info(checker):
-    """Резервная копия текущего crontab: {state, path, note}.
+    """Резервная копия текущего crontab: {state, path, text, note}.
 
     state — 'done' (файл перечитан непустым), 'empty' (crontab достоверно не
     содержит заданий) или 'failed' (причина названа в note). 'empty' и 'failed'
@@ -361,7 +361,7 @@ def save_crontab_backup_info(checker):
     if not dinfo['ok']:
         # Каталог не принимает запись — нечего и соваться: прежний код писал
         # crontab в read-only каталог и печатал путь как успех.
-        return {'state': 'failed', 'path': None,
+        return {'state': 'failed', 'path': None, 'text': '',
                 'note': _backup_dir_note(backup_path, dinfo) or ''}
     out, err, rc = checker.run(_crontab_backup_question(backup_path))
     if rc != 0:
@@ -372,15 +372,18 @@ def save_crontab_backup_info(checker):
         # берётся тот же, что у crontab_read_info (один носитель на проект).
         low = ((err or '') + chr(10) + (out or '')).lower()
         if CRONTAB_ABSENT_MARK in low:
-            return {'state': 'empty', 'path': None, 'note': ''}
+            return {'state': 'empty', 'path': None, 'text': '',
+                'note': ''}
         why = _first_line(err) or _first_line(out) or 'нет вывода'
-        return {'state': 'failed', 'path': None,
+        return {'state': 'failed', 'path': None, 'text': '',
                 'note': 'crontab -l вернул rc=%s: %s' % (rc, why)}
     if not (out or '').strip():
         # rc=0 и перечитывание пустое: заданий нет. Файл убран тем же спросом,
         # поэтому «бэкап создан» тут сказать нечем.
-        return {'state': 'empty', 'path': None, 'note': ''}
-    return {'state': 'done', 'path': backup_path, 'note': ''}
+        return {'state': 'empty', 'path': None, 'text': '',
+                'note': ''}
+    return {'state': 'done', 'path': backup_path, 'text': out or '',
+            'note': ''}
 
 
 def save_crontab_backup(checker):
@@ -392,6 +395,63 @@ def save_crontab_backup(checker):
     """
     info = save_crontab_backup_info(checker)
     return info['path'] if info['state'] == 'done' else None
+
+
+def _crontab_write_question(body):
+    """Один вопрос о ЗАПИСИ crontab: отправить тело и тут же перечитать.
+
+    Прежняя форма панелей решала по нулю кода возврата целого конвейера:
+
+        crontab -l 2>/dev/null | sed 's/^PATH=/#PATH=/' | crontab - 2>&1
+
+    Замер живьём (настоящий bash, подставной crontab с хранилищем заданий):
+    `false | true` выходит нулём, поэтому rc конвейера принадлежит ПОСЛЕДНЕМУ
+    элементу — то есть успехом засчитывался rc записи, а не прочтения. В мире
+    нечитаемого crontab эта форма теряла ВСЕ 3 задания и оставляла оператору
+    «✅ Переменная PATH закомментирована» (замер: rc=0, потеря 3 из 3).
+
+    Второй замер того же спроса: пустой stdin для `crontab -` — это НЕ «ничего
+    не менять», а «записать пустой crontab» (rc=0, хранилище опустело).
+
+    Поэтому тело проверяется до всякого спроса, код возврата принадлежит
+    записи (`exit $w`, а не последней команде), а право на «готово» даёт
+    ПЕРЕЧИТАННЫЙ текст, а не обещание утилиты (закон серии 1.32.13). Слово
+    маркера, `&&` и `2>/dev/null` в спросе нет: причина живёт в канале.
+    """
+    return ('printf %s ' + q(body) + ' | crontab -; w=$?; crontab -l;'
+            ' exit $w')
+
+
+def crontab_write_info(checker, body):
+    """Замена всего crontab телом body: {state, text, note}.
+
+    state — 'done' (перечитанный crontab совпал с отправленным), 'unverified'
+    (утилита вышла нулём, но перечитка НЕ подтвердила результат) или 'failed'
+    (причина названа). Прежде все три мира давали один ответ «rc=0, готово».
+
+    Сравнение побайтовое с одним допущением, снятым замером: cronie оканчивает
+    файл переводом строки, поэтому завершающий перенос не считается различием.
+    'unverified' — мир, которого у прежнего кода не было вовсе: он и есть
+    «оператору показали ✅, а задания пропали».
+    """
+    text = body or ''
+    if not text.strip():
+        # Пустое тело для `crontab -` = стЕРЕТЬ весь crontab (замер: rc=0 и
+        # пустое хранилище). Отказ обязан родиться ДО всякого спроса.
+        return {'state': 'failed', 'text': '',
+                'note': 'не отправлено: пустое тело стёрло бы весь crontab'}
+    out, err, rc = checker.run(_crontab_write_question(text))
+    if rc != 0:
+        why = _first_line(err) or _first_line(out) or 'нет вывода'
+        return {'state': 'failed', 'text': '',
+                'note': 'crontab - вернул rc=%s: %s' % (rc, why)}
+    got = out or ''
+    if got.rstrip(chr(10)) == text.rstrip(chr(10)):
+        return {'state': 'done', 'text': got, 'note': ''}
+    why = _first_line(err)
+    return {'state': 'unverified', 'text': got,
+            'note': 'не подтверждено: перечитанный crontab не совпал с '
+                    'отправленным' + (': ' + why if why else '')}
 
 
 def write_remote_file(checker, filepath, content):

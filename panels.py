@@ -1,8 +1,10 @@
 """Управление панелями: ISPmanager (mgrctl) и FastPanel (systemd-юниты)."""
 import re
 
-from common import (q, create_backup, find_files_info,
-                     file_presence, process_kill, process_probe)
+from common import (q, find_files_info,
+                     file_presence, process_kill, process_probe,
+                     crontab_read_info, save_crontab_backup_info,
+                     crontab_write_info)
 
 
 # ==================== УПРАВЛЕНИЕ ISPmanager ====================
@@ -122,24 +124,91 @@ def ispmanager_disable_geoip(checker):
 
 
 def ispmanager_check_cron_path(checker):
+    """PATH в crontab: «найдена» / «нет» / «прочитать не удалось».
+
+    Прежняя форма:
+
+        out, _ = checker.exec_command('crontab -l 2>/dev/null | grep "^PATH="')
+
+    теряла и код возврата (exec_command отдаёт только каналы), и причину — она
+    глохла в /dev/null. Пустой вывод дают оба мира: «PATH нет» и «crontab не
+    прочитан» (замер живьём: rc=1, вывод пуст). Оператор читал «✅ Переменная
+    PATH не найдена» там, где панель вообще не ответила. Признак спрашивает
+    ОДНА функция на весь проект — crontab_read_info, та же, что у правки.
+    """
     lines = ["=== ПРОВЕРКА CRON PATH ==="]
-    out, _ = checker.exec_command('crontab -l 2>/dev/null | grep "^PATH="')
-    lines.append(f"⚠️ Найдена переменная PATH в crontab:\n{out}" if out.strip() else "✅ Переменная PATH не найдена в crontab")
+    read = crontab_read_info(checker)
+    if read['state'] == 'failed':
+        lines.append("❌ Текущий crontab не прочитан (%s) — проверять PATH "
+                     "нечем" % read['note'])
+        return "\n".join(lines)
+    hits = [ln for ln in (read['text'] or '').splitlines()
+            if ln.startswith('PATH=')]
+    if hits:
+        lines.append("⚠️ Найдена переменная PATH в crontab:\n"
+                     + "\n".join(hits))
+    else:
+        lines.append("✅ Переменная PATH не найдена в crontab")
     return "\n".join(lines)
 
 
 def ispmanager_fix_cron_path(checker):
-    lines = ["=== ИСПРАВЛЕНИЕ CRON PATH ==="]
-    # Сначала сохраняем текущий crontab, потом делаем бэкап файла.
-    checker.exec_command('crontab -l > /tmp/crontab_current.txt 2>/dev/null')
-    backup_path = create_backup(checker, '/tmp/crontab_current.txt', 'crontab')
-    if backup_path:
-        lines.append(f"✅ Резервная копия crontab создана: {backup_path}")
-    else:
-        lines.append("⚠️ Не удалось создать резервную копию crontab")
+    """Комментирует PATH в crontab, только если есть прочитанный оригинал и
+    записанный резерв.
 
-    out, err, rc = checker.run("crontab -l 2>/dev/null | sed 's/^PATH=/#PATH=/' | crontab - 2>&1")
-    lines.append("✅ Переменная PATH закомментирована" if rc == 0 else f"❌ Ошибка (rc={rc}): {err.strip() or out.strip()}")
+    Боевая форма решала по нулю кода возврата целого конвейера:
+
+        crontab -l 2>/dev/null | sed 's/^PATH=/#PATH=/' | crontab - 2>&1
+
+    Замер живьём (настоящий bash, подставной crontab с хранилищем, uid=1000) в
+    мире нечитаемого crontab: rc=0 и ПОТЕРЯНЫ ВСЕ задания, отчёт — «✅
+    Переменная PATH закомментирована». Причина в двух местах: чтение прятало
+    диагноз в /dev/null, а rc конвейера принадлежит ПОСЛЕДНЕМУ элементу
+    (`false | true` даёт 0), то есть успехом считалась запись, а не прочтение.
+    Третья: «резерв» делался из /tmp/crontab_current.txt, который редирект
+    создаёт до запуска утилиты, — при отказе чтения он нулевой (замер: 0 байт
+    против 104 в норме), а нулевой бэкап при откате затирает рабочий crontab.
+
+    Теперь право на запись дают прочитанный оригинал, принятый резерв и
+    ПЕРЕЧИТАННЫЙ после правки текст. Менять нечего — значит ничего не пишем:
+    пустое тело для `crontab -` есть «записать ПУСТОЙ crontab» (замер: rc=0,
+    хранилище опустело).
+    """
+    lines = ["=== ИСПРАВЛЕНИЕ CRON PATH ==="]
+    read = crontab_read_info(checker)
+    if read['state'] == 'failed':
+        lines.append("❌ Текущий crontab не прочитан (%s) — правку отменяю: "
+                     "иначе существующие задания будут стёрты" % read['note'])
+        return "\n".join(lines)
+    original = read['text'] or ''
+    targets = [ln for ln in original.splitlines()
+               if ln.startswith('PATH=')]
+    if not targets:
+        lines.append("ℹ️ Переменная PATH в crontab не найдена — менять нечего,"
+                     " crontab не тронут")
+        return "\n".join(lines)
+
+    info = save_crontab_backup_info(checker)
+    if info['state'] == 'failed':
+        lines.append("❌ Резервная копия crontab не записана: %s — правку "
+                     "отменяю: без отката менять нельзя" % info['note'])
+        return "\n".join(lines)
+    if info['state'] == 'done':
+        lines.append("✅ Резервная копия crontab: %s" % info['path'])
+    else:
+        lines.append("ℹ️ Текущий crontab пуст — бэкап не требуется")
+
+    body = "".join(('#' + ln if ln.startswith('PATH=') else ln) + '\n'
+                   for ln in original.splitlines())
+    written = crontab_write_info(checker, body)
+    if written['state'] == 'done':
+        lines.append("✅ Переменная PATH закомментирована")
+    elif written['state'] == 'unverified':
+        lines.append("❌ Правка не подтверждена: %s — проверьте crontab -l "
+                     "вручную" % written['note'])
+    else:
+        lines.append("❌ crontab не принят (%s) — проверьте crontab -l "
+                     "вручную" % written['note'])
     return "\n".join(lines)
 
 

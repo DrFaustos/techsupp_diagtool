@@ -401,20 +401,142 @@ class TestFastpanelRestartWeb:
 
 
 # ==================== ISPmanager (регрессии существующего поведения) ====
+# ==================== ISPmanager: чтение ДО правки (1.32.18) ================
+# Замер живьём (настоящий bash, подставной crontab с хранилищем, uid=1000):
+# боевая форма кнопки при НЕЧИТАЕМОМ crontab теряла ВСЕ задания, а оператору
+# оставляла «✅ Переменная PATH закомментирована»:
+#
+#     crontab -l 2>/dev/null | sed 's/^PATH=/#PATH=/' | crontab - 2>&1
+#
+#     rc конвейера = 0, потеряно 3 задания из 3
+#
+# Двойной носитель лжи: (а) чтение прятало причину в /dev/null, (б) rc
+# конвейера принадлежит ПОСЛЕДНЕМУ элементу (замер: `false | true` -> rc=0),
+# поэтому успехом засчитывалась запись, а не прочтение. Третья: «резерв»
+# делался из файла-посредника /tmp/crontab_current.txt, который редирект
+# создаёт ДО запуска утилиты (замер: размер 0 при отказе против 104 в норме).
+CR_PATH_ORIG = ('PATH=/bin:/usr/bin' + chr(10)
+                + '0 3 * * * /usr/sbin/logrotate /etc/logrotate.conf' + chr(10))
+CR_PATH_FIXED = ('#PATH=/bin:/usr/bin' + chr(10)
+                 + '0 3 * * * /usr/sbin/logrotate /etc/logrotate.conf' + chr(10))
+CR_IO_FAIL = ('', 'crontab: cannot open: Input/output error' + chr(10), 1)
+
+
+def _writes(c):
+    """Спросы, которые МЕняют crontab (запись тела через stdin)."""
+    return [s for s in c.commands if ' | crontab -' in s]
+
+
 class TestIspmanagerCronFix:
     def test_backup_before_edit(self):
+        # Прежняя фикстура давала ПУСТОЙ прочитанный crontab и требовала «✅»
+        # за резерв из нулевого файла: замер 1.32.18 показал, что ровно эта
+        # «копия» и затирает рабочий crontab при откате. Мир здесь честный:
+        # задания есть, резерв обязан быть, правка обязана быть подтверждена.
         c = FakeSSH(routes=[
-            ('crontab -l >', ('', '', 0)),
-            ('test -f', 'exists'),
-            ('sed', ('', '', 0)),
+            ('crontab -l >', (CR_PATH_ORIG, '', 0)),
+            ('printf', (CR_PATH_FIXED, '', 0)),
+            ('crontab -l', (CR_PATH_ORIG, '', 0)),
         ])
         out = panels_mod.ispmanager_fix_cron_path(c)
-        assert '✅' in out
-        assert c.find('cp') is not None, 'резервная копия не создавалась'
+        assert '✅' in out, out
+        assert 'crontab' in out
+        assert c.find('crontab -l >') is not None, 'резерв не записывался'
+        assert _writes(c), 'правка crontab не уходила'
 
     def test_no_path_variable_is_ok(self):
         out = panels_mod.ispmanager_check_cron_path(FakeSSH())
         assert '✅' in out
+
+
+class TestIspmanagerCronRefusesWithoutProof:
+    """Право на запись — только за прочитанный оригинал и записанный резерв."""
+
+    def test_unreadable_crontab_cancels_edit(self):
+        # Ровно тот мир, где прежний код стёр все задания и показал «✅».
+        c = FakeSSH(routes=[('crontab -l', CR_IO_FAIL)])
+        out = panels_mod.ispmanager_fix_cron_path(c)
+        assert '❌' in out, out
+        assert 'не прочитан' in out, out
+        assert _writes(c) == [], c.commands
+        assert c.find('crontab -l >') is None, c.commands
+
+    def test_backup_failure_cancels_edit(self):
+        # Прежний контракт требовал править ДАЖЕ без резерва. Серия 1.32.6 —
+        # 1.32.17 запрещает: откат дороже отказа, а «⚠️ не удалось» и правка
+        # в одном отчёте = правка без возможности отменить.
+        c = FakeSSH(routes=[
+            ('crontab -l >', ('', 'crontab: bad thing happened' + chr(10), 2)),
+            ('printf', (CR_PATH_FIXED, '', 0)),
+            ('crontab -l', (CR_PATH_ORIG, '', 0)),
+        ])
+        out = panels_mod.ispmanager_fix_cron_path(c)
+        assert '❌' in out, out
+        assert 'Резервная копия' in out, out
+        assert '✅ Переменная PATH закомментирована' not in out, out
+        assert _writes(c) == [], c.commands
+
+    def test_nothing_to_change_is_said_and_not_written(self):
+        # Менять нечего != писать пустое тело: пустой stdin для `crontab -`
+        # — это «записать ПУСТОЙ crontab» (замер: rc=0, хранилище опустело).
+        c = FakeSSH(routes=[('crontab -l',
+                             ('0 3 * * * /usr/sbin/logrotate' + chr(10),
+                              '', 0))])
+        out = panels_mod.ispmanager_fix_cron_path(c)
+        assert 'PATH' in out, out
+        assert _writes(c) == [], c.commands
+
+    def test_unconfirmed_write_is_not_reported_as_ok(self):
+        # rc=0, но перечитанный crontab НЕ совпал с отправленным: прежний код
+        # в этом мире печатал «✅».
+        c = FakeSSH(routes=[
+            ('crontab -l >', (CR_PATH_ORIG, '', 0)),
+            ('printf', ('', '', 0)),
+            ('crontab -l', (CR_PATH_ORIG, '', 0)),
+        ])
+        out = panels_mod.ispmanager_fix_cron_path(c)
+        assert '✅ Переменная PATH закомментирована' not in out, out
+        assert '❌' in out, out
+
+    def test_refusal_of_the_write_tool_is_named(self):
+        c = FakeSSH(routes=[
+            ('crontab -l >', (CR_PATH_ORIG, '', 0)),
+            ('printf', ('', 'crontab: bad minute' + chr(10), 2)),
+            ('crontab -l', (CR_PATH_ORIG, '', 0)),
+        ])
+        out = panels_mod.ispmanager_fix_cron_path(c)
+        assert 'rc=2' in out, out
+        assert 'bad minute' in out, out
+
+
+class TestIspmanagerCronCheckDistinguishesWorlds:
+    """Диагностика: «не прочитали» не имеет права называться «PATH не найдена»."""
+
+    def test_unreadable_is_not_reported_as_absent(self):
+        c = FakeSSH(routes=[('crontab -l', CR_IO_FAIL)])
+        out = panels_mod.ispmanager_check_cron_path(c)
+        assert '✅ Переменная PATH не найдена' not in out, out
+        assert '❌' in out, out
+
+    def test_found_path_is_shown(self):
+        c = FakeSSH(routes=[('crontab -l', (CR_PATH_ORIG, '', 0))])
+        out = panels_mod.ispmanager_check_cron_path(c)
+        assert '⚠️' in out, out
+        assert 'PATH=/bin:/usr/bin' in out, out
+
+    def test_genuinely_empty_crontab_says_not_found(self):
+        # Обратная ветка: достоверная пустота обязана остаться спокойным ✅,
+        # иначе отказ от ложной тревоги превратится в ложную тревогу.
+        c = FakeSSH(routes=[('crontab -l',
+                             ('', 'no crontab for root' + chr(10), 1))])
+        out = panels_mod.ispmanager_check_cron_path(c)
+        assert '✅' in out, out
+
+    def test_read_is_asked_once_without_hiding_the_reason(self):
+        c = FakeSSH(routes=[('crontab -l', (CR_PATH_ORIG, '', 0))])
+        panels_mod.ispmanager_check_cron_path(c)
+        assert len(c.commands) == 1, c.commands
+        assert '2>/dev/null' not in c.commands[0], c.commands[0]
 
 
 # ==================== все команды панелей синтаксически валидны =========
@@ -589,18 +711,6 @@ class TestIspmanagerDisable:
         # чужой coredns не бьёт — замер), поэтому форма сохранена намеренно.
         assert c.find('killall core') is not None
         assert c.find('killall ihttpd') is not None
-
-class TestIspmanagerCronFixBackupFailure:
-    def test_missing_backup_warns_but_fix_still_runs(self):
-        # test -f с rc=1: create_backup возвращает None (ни источника, ни бэкапа)
-        c = FakeSSH(routes=[('crontab -l > /tmp', ('', '', 0)),
-                            ('mkdir -p', ('created', '', 0)),
-                            ('test -f', ('', '', 1)),
-                            ('| sed', ('', '', 0))])
-        out = panels_mod.ispmanager_fix_cron_path(c)
-        assert '⚠️ Не удалось создать резервную копию crontab' in out
-        assert '✅ Переменная PATH закомментирована' in out
-
 
 class TestFastpanelRestartWebNoFpm:
     def test_missing_php_fpm_units_reported(self):
