@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.14"
+__version__ = "1.32.15"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -93,31 +93,93 @@ def ensure_backup_dir(checker):
     return rc == 0 and out.strip() == 'created'
 
 
-def create_backup(checker, filepath, backup_type='configs'):
+def create_backup_info(checker, filepath, backup_type='configs'):
+    """Резервная копия файла с временной меткой: {path, state, note}.
+
+    Прежний вид возвращал путь либо None и решал по СЛОВУ «exists» в stdout:
+
+        out, _, rc = checker.run(f'test -f {q(filepath)} && echo "exists"')
+        if rc != 0 or out.strip() != 'exists':
+            return None
+        _, _, rc = checker.run(f'cp {q(filepath)} {q(backup_path)} 2>&1')
+        if rc != 0:
+            return None
+
+    Замер живьём (uid=1000, настоящий bash, BACKUP_DIR подменён на временный):
+    три РАЗНЫХ мира давали неотличимый None — «файла нет» (cp не спрашивается),
+    «файл есть, но не читается» (cp спрашивается и пишет причину в stdout, потому
+    что команда с 2>&1, а `_, _, rc =` выбрасывает оба канала), «путь непроходим»
+    (cp не спрашивается). Плюс bool от ensure_backup_dir выбрасывался вовсе.
+
+    state:
+    done     — cp вернул 0 И бэкап ПЕРЕЧИТАН (право на «готово» даёт факт, а не
+               цепочка кодов возврата — закон 1.32.13);
+    absent   — отсутствия источника ДОКАЗАНЫ достоверным списком каталога;
+    unchecked — источника не видно (прав не хватило): это «мы не спросили»,
+               его нельзя отчитывать как «файла нет»;
+    failed   — cp отказал или обещанный файл не появился; note держит причину
+               словами и код возврата.
+
+    Носитель присутствия — file_presence (1.32.14): ответ в коде возврата,
+    отсутствие — по достоверному списку. Маркер-слово из спросов уходит.
+    cp не спрашивается ни при absent, ни при unchecked — прежний замок цел.
     """
-    Создаёт резервную копию файла с временной меткой в соответствующей поддиректории.
-    Возвращает путь к бэкапу или None в случае ошибки.
-    """
-    ensure_backup_dir(checker)
+    dir_ready = ensure_backup_dir(checker)
 
     filename = os.path.basename(filepath)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     backup_filename = f"{filename}.{timestamp}.bak"
     backup_path = f"{BACKUP_SUBDIRS.get(backup_type, BACKUP_SUBDIRS['configs'])}/{backup_filename}"
 
-    out, _, rc = checker.run(f'test -f {q(filepath)} && echo "exists"')
-    if rc != 0 or out.strip() != 'exists':
-        return None
+    info = {'path': None, 'state': 'unchecked', 'note': '',
+            'backup_path': backup_path}
+    cache = {}
+    presence = file_presence(checker, filepath, cache)
+    if presence['state'] != 'found':
+        # Ни читать, ни копировать то, чего нет (или чего мы не видели),
+        # запрещено: прежний замок сохранён как есть.
+        info['state'] = presence['state']
+        info['note'] = presence['note']
+        return info
 
-    _, _, rc = checker.run(f'cp {q(filepath)} {q(backup_path)} 2>&1')
+    out, err, rc = checker.run(f'cp {q(filepath)} {q(backup_path)} 2>&1')
+    reason = _first_line(out) or _first_line(err)
     if rc != 0:
-        return None
+        info['state'] = 'failed'
+        parts = ['cp вернул rc=%s%s' % (rc, ': ' + reason if reason else '')]
+        if not dir_ready:
+            parts.append('каталог бэкапов %s не создан' % BACKUP_DIR)
+        info['note'] = '; '.join(parts)
+        return info
 
-    out, _, rc = checker.run(f'test -f {q(backup_path)} && echo "exists"')
-    if rc == 0 and out.strip() == 'exists':
-        return backup_path
-    return None
+    reread = file_presence(checker, backup_path, cache)
+    if reread['state'] != 'found':
+        info['state'] = 'failed'
+        parts = ['cp вернул 0, а бэкапа нет: %s' % (reread['note']
+                                                  or reread['state'])]
+        if not dir_ready:
+            parts.append('каталог бэкапов %s не создан' % BACKUP_DIR)
+        info['note'] = '; '.join(parts)
+        return info
 
+    info['state'] = 'done'
+    info['path'] = backup_path
+    info['note'] = '' if dir_ready else ('каталог бэкапов %s не подтверждён'
+                                         % BACKUP_DIR)
+    return info
+
+
+def create_backup(checker, filepath, backup_type='configs'):
+    """
+    Создаёт резервную копию файла с временной меткой в соответствующей поддиректории.
+    Возвращает путь к бэкапу или None в случае ошибки.
+
+    Тонкая обёртка над create_backup_info: потребители (files.py, dns.py,
+    panels.py) завязаны на path|None и не обязаны знать про состояния. Кто
+    хочет назвать причину — берёт create_backup_info.
+    """
+    info = create_backup_info(checker, filepath, backup_type)
+    return info['path'] if info['state'] == 'done' else None
 
 def save_crontab_backup(checker):
     """Сохраняет текущий crontab в файл бэкапа. Возвращает путь или None."""

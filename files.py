@@ -3,6 +3,7 @@ import ipaddress
 from datetime import datetime
 
 from common import (BACKUP_SUBDIRS, q, ensure_backup_dir, create_backup,
+                    create_backup_info,
                     write_remote_file, RF_TEXT, read_file_info,
                     find_files_info, FF_DIR_TEXT,
                     # Состояние юнита спрашивает ОДНА функция (1.32.6):
@@ -16,15 +17,25 @@ from common import (BACKUP_SUBDIRS, q, ensure_backup_dir, create_backup,
 
 # ==================== РАБОТА С ФАЙЛАМИ (С БЭКАПАМИ) ====================
 def write_file(checker, filepath, content):
-    """Записывает содержимое в файл с созданием резервной копии (через SFTP)."""
+    """Записывает содержимое в файл с созданием резервной копии (через SFTP).
+
+    Прежний вид говорил «⚠️ Не удалось создать резервную копию файла» и молчал
+    о причине, хотя она измерима (замер: cp пишет её в stdout). Оператор обязан
+    увидеть, что именно отказало, и что правка уйдёт без отката; «прав не
+    хватило посмотреть» не имеет права звучать как «файла нет».
+    """
     lines = []
     lines.append(f"=== СОХРАНЕНИЕ ФАЙЛА: {filepath} ===")
 
-    backup_path = create_backup(checker, filepath, 'configs')
-    if backup_path:
-        lines.append(f"✅ Резервная копия создана: {backup_path}")
+    backup = create_backup_info(checker, filepath, 'configs')
+    if backup['state'] == 'done':
+        lines.append(f"✅ Резервная копия создана: {backup['path']}")
     else:
         lines.append("⚠️ Не удалось создать резервную копию файла")
+        if backup['note']:
+            lines.append(("⚠️ " if backup['state'] == 'unchecked'
+                          else "   Причина: ") + backup['note'])
+        lines.append("⚠️ Правка уйдёт без возможности откатить.")
 
     ok, err = write_remote_file(checker, filepath, content)
     if not ok:
@@ -33,7 +44,6 @@ def write_file(checker, filepath, content):
 
     lines.append("✅ Файл сохранён.")
     return "\n".join(lines)
-
 
 def read_file(checker, filepath):
     """Читает файл для редактора: строка с ❌ — только настоящая неудача.

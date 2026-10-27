@@ -57,9 +57,18 @@ DETECTORS = (('CJK', CJK_DEFECT),
 # которые читает оператор, а под сканом они не стояли — то есть сторож молчал ровно там, где
 # дефект мог быть написан. Расширение разрешено только после замера: ad-hoc
 # проход по всем четырём дал НОЛЬ нарушений, поэтому список не тонет в шуме.
+# 1.32.15: в список внесены файлы, которые правит серия, но которые под
+# сканом не стояли (files.py и его тест правились в этом слайсе). Зелёный
+# результат по непросматриваемому файлу неотличим от слепого детектора —
+# тот же закон, из-за которого существует test_scan_actually_scans.
+# Расширение по прежнему правилу сделано после замера: ad-hoc проход по
+# всем кандидатам (files.py, dns.py, metrics.py, diagnostic.py и их тесты)
+# дал НОЛЬ нарушений, поэтому список не тонет в шуме.
 HYGIENE_FILES = ('panels.py', 'common.py', 'logs.py', 'bitrix.py',
+                 'files.py', 'dns.py', 'metrics.py', 'diagnostic.py',
                  'gui_bitrix.py',
                  'tests/test_panels.py', 'tests/support.py',
+                 'tests/test_files.py',
                  'tests/test_common.py', 'tests/test_logs.py',
                  'tests/test_bitrix.py', 'tests/test_gui_bitrix.py',
                  'tests/test_text_hygiene.py', 'tests/test_git_history.py',

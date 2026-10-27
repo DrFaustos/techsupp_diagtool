@@ -44,7 +44,34 @@ class TestWriteFile:
         assert '❌ Ошибка записи' in out
         assert 'Файл сохранён' not in out
 
+    def test_missing_backup_reason_reaches_the_operator(self):
+        # Прежний отчёт говорил «Не удалось создать резервную копию файла» и
+        # молчал о причине, хотя она измерима. Оператор обязан увидеть, что
+        # именно отказало, и что правка уйдёт без отката.
+        client = FakeSftpClient()
+        c = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                            ('test -f /etc/nginx/nginx.conf', ('', '', 0)),
+                            ('cp ', ('cp: невозможно открыть: Отказано в '
+                                     'доступе', '', 1))],
+                    client=client)
+        out = files_mod.write_file(c, '/etc/nginx/nginx.conf', 'x')
+        assert '⚠️ Не удалось создать резервную копию' in out   # прежняя строка
+        assert 'Отказано в доступе' in out                      # причина
+        assert 'без возможности откатить' in out
 
+    def test_unchecked_backup_is_not_reported_as_absent(self):
+        # «Прав не хватило посмотреть» не имеет права звучать как «файла нет»:
+        # это ровно та ложь, с которой начался слайс.
+        client = FakeSftpClient()
+        c = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                            ('test -f /etc/nginx/nginx.conf', ('', '', 1)),
+                            ('ls -1 -p /etc', ('', 'ls: невозможно открыть '
+                                               'каталог', 2))],
+                    client=client)
+        out = files_mod.write_file(c, '/etc/nginx/nginx.conf', 'x')
+        assert 'не проверено' in out
+        assert 'не найден' not in out
+        assert '✅ Файл сохранён.' in out      # политика правки не изменилась
 class TestReadFile:
     """read_file — то, что редактор вставляет в окно, а потом пишет на сервер.
 

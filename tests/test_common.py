@@ -1584,3 +1584,131 @@ class TestFilePresence:
         common.file_presence(c, '/a/b/x.log')
         common.file_presence(c, '/a/b/y.log')
         assert c.count('ls -1 -p /a/b') == 2
+
+# ===== БЭКАП: отказ обязан иметь причину, а не превращаться в None =====
+# Замер живьём (uid=1000, настоящий bash, BACKUP_DIR подменён на временный:
+# с боевым /root/tech_support мир «источник есть» возвращал None и база замера
+# лгала — этот подвох снят отдельно). Прежний код:
+#
+#     out, _, rc = checker.run(f'test -f {q(filepath)} && echo "exists"')
+#     if rc != 0 or out.strip() != 'exists':
+#         return None
+#     _, _, rc = checker.run(f'cp {q(filepath)} {q(backup_path)} 2>&1')
+#     if rc != 0:
+#         return None
+#
+# Три РАЗНЫХ мира (файла нет / файл не читается / путь непроходим) дают
+# неотличимый None. При этом причины измерены и различимы: «не readable»
+# доходит до cp, а cp пишет причину в STDOUT (команда с 2>&1), который боевой
+# код выбрасывает через `_, _, rc =`. Слово-маркер «exists» — тот же признак по
+# пустоте, что лечила вся серия 1.32.6 — 1.32.14.
+NOT_READABLE = ('cp: невозможно открыть \'/etc/x.conf\' для чтения: '
+                'Отказано в доступе', '', 1)
+LIST_EMPTY = ('', '', 0)          # пустой вывод при rc=0 = пустой каталог
+LIST_NO_LS = ('', 'ls: command not found', 127)
+LIST_BLOCKED = ('', 'ls: невозможно открыть каталог', 2)
+
+
+class TestCreateBackupInfo:
+    def test_state_vocabulary_is_four(self):
+        # done | absent | unchecked | failed — четыре, а не «путь или None».
+        c = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                            ('test -f', ('', '', 0)),
+                            ('cp ', ('', '', 0))])
+        info = common.create_backup_info(c, '/etc/nginx/nginx.conf')
+        assert info['state'] in ('done', 'absent', 'unchecked', 'failed')
+        assert info['state'] == 'done'
+        assert info['path'] and info['path'].endswith('.bak')
+
+    def test_success_is_paid_by_rereading_not_by_cps_rc(self):
+        # Право на «готово» даёт ПЕРЕЧИТАННЫЙ факт, а не цепочка rc (закон
+        # 1.32.13 для процессов): cp может вернуть 0 и ничего не создать.
+        # Прежняя редакция этой фикстуры давала перечитыванию rc=0, то есть
+        # «файл есть»: тест с именем про перечитывание мерил бы доверие к rc
+        # cp. Корректный мир: cp вернул 0, а бэкапа в ДОСТОВЕРНОМ списке
+        # каталога нет (пустой вывод при rc=0 — пустой каталог, замер).
+        c = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                            ('test -f /etc/nginx/nginx.conf', ('', '', 0)),
+                            ('cp ', ('', '', 0)),
+                            ('test -f /root/tech_support', ('', '', 1)),
+                            ('ls -1 -p /root/tech_support', LIST_EMPTY)])
+        info = common.create_backup_info(c, '/etc/nginx/nginx.conf')
+        assert info['state'] == 'failed'
+        assert info['path'] is None
+        assert c.find('cp ') is not None   # cp был, но ему не верим
+
+    def test_marker_word_is_gone_from_questions(self):
+        # Ни «exists», ни «&& echo» в спросах присутствовать не должно: именно
+        # слово в stdout было признаком, который нельзя отличить от молчания.
+        c = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                            ('test -f', ('', '', 0)),
+                            ('cp ', ('', '', 0))])
+        common.create_backup_info(c, '/etc/nginx/nginx.conf')
+        for sent in c.commands:
+            if sent.startswith('test -f'):
+                assert 'echo' not in sent, sent
+                assert '&&' not in sent, sent
+
+    def test_measured_absence_does_not_touch_cp(self):
+        # Прежний замок сохранён: читать и копировать то, чего нет, запрещено.
+        c = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                            ('test -f /etc/nope.conf', ('', '', 1)),
+                            ('ls -1 -p /etc', LIST_EMPTY)])
+        info = common.create_backup_info(c, '/etc/nope.conf')
+        assert info['state'] == 'absent'
+        assert c.find('cp ') is None
+        assert 'достоверн' in info['note']
+
+    def test_unreachable_source_is_unchecked_not_absent(self):
+        # Решающее различие слайса: прежний код на этом же мире возвращал
+        # None, неотличимый от «файла нет»; теперь «мы не спросили».
+        c = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                            ('test -f /root/x.conf', ('', '', 1)),
+                            ('ls -1 -p /root', LIST_BLOCKED)])
+        info = common.create_backup_info(c, '/root/x.conf')
+        assert info['state'] == 'unchecked'
+        assert c.find('cp ') is None
+        assert 'невозможно открыть' in info['note']
+
+    def test_failure_carries_the_reason_words(self):
+        # Причина живёт в stdout (cp запущен с 2>&1); прежний код терял оба
+        # канала (`_, _, rc =`). Оператор обязан увидеть, что чинить.
+        c = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                            ('test -f /etc/x.conf', ('', '', 0)),
+                            ('cp ', NOT_READABLE)])
+        info = common.create_backup_info(c, '/etc/x.conf')
+        assert info['state'] == 'failed'
+        assert 'невозможно открыть' in info['note']
+        assert '1' in info['note']          # код возврата тоже назван
+
+    def test_backup_dir_failure_is_named_not_silently_retried_via_cp(self):
+        # ensure_backup_dir возвращает bool, который прежний код выбрасывал.
+        # Отказ каталога обязан попасть в причину, если бэкап не сложился.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 1)),
+                            ('test -f /etc/nginx/nginx.conf', ('', '', 0)),
+                            ('cp ', ('cp: невозможно создать обычный файл: '
+                                     'Отказано в доступе', '', 1))])
+        info = common.create_backup_info(c, '/etc/nginx/nginx.conf')
+        assert info['state'] == 'failed'
+        assert 'Отказано в доступе' in info['note']
+
+    def test_create_backup_stays_a_path_or_none(self):
+        # Обратная совместимость — часть контракта: потребители (files.py,
+        # dns.py, panels.py) и 44 теста завязаны на path|None.
+        ok = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                             ('test -f', ('', '', 0)),
+                             ('cp ', ('', '', 0))])
+        assert common.create_backup(ok, '/etc/nginx/nginx.conf',
+                                    'configs').endswith('.bak')
+        gone = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                               ('test -f /etc/nope.conf', ('', '', 1)),
+                               ('ls -1 -p /etc', LIST_EMPTY)])
+        assert common.create_backup(gone, '/etc/nope.conf') is None
+
+    def test_unknown_backup_type_still_falls_back_to_configs(self):
+        c = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                            ('test -f', ('', '', 0)),
+                            ('cp ', ('', '', 0))])
+        info = common.create_backup_info(c, '/etc/x.conf', 'нет-такого-типа')
+        assert info['state'] == 'done'
+        assert '/configs/x.conf.' in info['path']
