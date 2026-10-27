@@ -1,25 +1,134 @@
 """Определение панели, системные метрики и базовые отчёты."""
 from common import (LOG_PATHS, DOMAIN_PATHS, get_domain_from_config, q,
-                    command_probe_info)
+                    command_probe_info,
+                     path_entry_state)
 
 
 # ==================== ОПРЕДЕЛЕНИЕ ПАНЕЛИ ====================
-def detect_panel(checker):
-    cmds = {
-        'fastpanel': 'test -f /usr/local/fastpanel/bin/fastpanel && echo "yes" || echo "no"',
-        'ispmanager': 'test -f /usr/local/mgr5/bin/mgrctl && echo "yes" || echo "no"'
-    }
-    for panel, cmd in cmds.items():
-        out, _ = checker.exec_command(cmd)
-        if out.strip() == 'yes':
-            return panel
-    out, _ = checker.exec_command('ps aux | grep -E "fastpanel|mgr5" | grep -v grep')
-    if 'fastpanel' in out.lower():
-        return 'fastpanel'
-    if 'mgr5' in out.lower():
-        return 'ispmanager'
-    return 'none'
+# Прежняя форма решала по пустоте stdout:
+#
+#     test -f /usr/local/fastpanel/bin/fastpanel && echo "yes" || echo "no"
+#
+# и печатала «панели нет» и когда бинарника нет, и когда прав не хватило
+# посмотреть. Замер живьём: test -f даёт rc=1 и ПУСТОЙ stderr в обоих отказах —
+# различить нечем ни числом, ни каналом, а ls/stat/find различают миры только
+# локализованным текстом errno (на клиентском хосте с другой локалью признак по
+# строке молча сломался бы). Поэтому панель ищут достоверными списками
+# каталогов (см. path_entry_state), а отсутствие формулируется только там, где
+# список прочитан при rc=0 и имени в нём нет.
+PANEL_BINARIES = (
+    ('fastpanel', '/usr/local/fastpanel/bin/fastpanel'),
+    ('ispmanager', '/usr/local/mgr5/bin/mgrctl'),
+)
 
+# Значение, когда спрос не состоялся. Оно НЕ равно 'none': «панелей нет» —
+# измеренный ответ, а не следствие нехватки прав. Потребители выбирают наборы
+# путей через .get(panel_type, ...), поэтому неизвестное значение деградирует в
+# «none»-наборы, а не роняет отчёт (проверено тестом).
+PANEL_UNCHECKED = 'unchecked'
+
+# Процессы спрашиваем ОДНИМ запросом без пайпа: код возврата конвейера
+# принадлежит последней команде, и «ps не запустился» неотличим от «процессов
+# нет» (замер: rc=1 и ноль байт в обоих мирах).
+PANEL_PROCESSES_CMD = 'ps aux'
+
+# Признак по процессу снимается из argv[0], а НЕ из строки вывода целиком.
+# Живой замер (верификатор 1.32.12) показал хуже прежнего диагноза: на машине
+# БЕЗ панелей «ps aux | grep -E "fastpanel|mgr5"» выдавал fastpanel — слово
+# нашлось в командной строке самого наблюдателя. Подстрока в чужом выводе
+# находит панель в «vim /root/fastpanel-notes.txt» и в grep'е, который сам её
+# ищет. Здесь сравнивается, ЧЕМ запущен процесс, а не что написано в строке.
+PANEL_PROCESS_SIGNS = (
+    ('fastpanel', ('fastpanel', '/fastpanel/')),
+    ('ispmanager', ('mgrctl', '/mgr5/')),
+)
+
+# Человекочитаемое отображение. Закон серии: «не проверено» не печатается как
+# факт и не показывается оператору машинным маркером (gui_runner пишет эту
+# строку в лог подключения).
+PANEL_STATE_TEXT = {
+    'fastpanel': 'FastPanel',
+    'ispmanager': 'ISPmanager',
+    'none': 'не найдена (проверено)',
+    PANEL_UNCHECKED: 'не проверено (не хватило прав спросить)',
+}
+
+
+def panel_label(panel_type):
+    '''То, что можно показать человеку: метка состояния или само значение.
+
+    Неизвестное значение отдаётся как есть: выдумывать вместо него «не
+    найдена» означало бы подменить ответ хоста догадкой.
+    '''
+    if not panel_type:
+        # Значения нет вовсе (соединение не установлено, выбор не сделан):
+        # «не определена» — честнее, чем печатать None или выдумывать ответ.
+        return 'не определена'
+    return PANEL_STATE_TEXT.get(panel_type, panel_type)
+
+
+def ps_row_command(line):
+    '''Поле COMMAND строки `ps aux`: всё после десятого поля.
+
+    Полей ровно одиннадцать (USER PID %CPU %MEM VSZ RSS TTY STAT START TIME
+    COMMAND), поэтому split(None, 10). Короткая строка — не строка процесса:
+    возвращаем пусто, а не угадываем.
+    '''
+    parts = (line or '').split(None, 10)
+    if len(parts) < 11:
+        return ''
+    return parts[10].strip()
+
+
+def ps_row_binary(line):
+    '''argv[0] процесса — чем он запущен (первое слово команды).'''
+    command = ps_row_command(line)
+    if not command:
+        return ''
+    return command.split(' ')[0]
+
+
+def panel_from_processes(text):
+    '''Панель по argv[0] процессов либо None — если ни один не подошёл.
+
+    Строка заголовка отбрасывается: её поле COMMAND буквально равно 'COMMAND'.
+    '''
+    for line in (text or '').splitlines():
+        binary = ps_row_binary(line)
+        if not binary or binary == 'COMMAND':
+            continue
+        base = binary.rsplit('/', 1)[-1]
+        for panel, signs in PANEL_PROCESS_SIGNS:
+            if base in signs or any(sign in binary for sign in signs):
+                return panel
+    return None
+
+
+def detect_panel(checker):
+    '''Панель хоста: имя, 'none' (доказано) или PANEL_UNCHECKED (не спросили).'''
+    cache = {}
+    unproven = []
+    for panel, path in PANEL_BINARIES:
+        state = path_entry_state(checker, path, cache)
+        if state['state'] == 'found':
+            return panel
+        if state['state'] != 'absent':
+            unproven.append(state['note'])
+    # Вторая ветка — процессы: панель может стоять в нестандартном пути
+    # (/opt/fastpanel/...), которого нет ни в одном проверенном каталоге, так
+    # что одних каталогов для «панелей нет» недостаточно.
+    ps = command_probe_info(checker, PANEL_PROCESSES_CMD)
+    if ps['state'] == 'ok':
+        hit = panel_from_processes(ps['text'])
+        if hit:
+            return hit
+    elif ps['state'] == 'absent':
+        # ps нет в PATH: процесс мы не увидели ни в каком виде.
+        unproven.append(ps['note'])
+    if unproven or ps['state'] != 'ok':
+        # Утверждать отсутствие можно, только когда каждый спрос состоялся.
+        return PANEL_UNCHECKED
+    return 'none'
 
 # ==================== СЛУЖБЫ: СТАТУСЫ ====================
 # Список проверяемых служб. php-fpm перечислен и как общий unit-шаблон,

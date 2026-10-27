@@ -25,7 +25,7 @@ from common import (  # noqa: F401
 
 # --- metrics ---
 from metrics import (  # noqa: F401
-    detect_panel, get_metrics,
+    detect_panel, get_metrics, panel_label,
     disk_memory_report, network_report,
     check_web_config,
     metrics_report, firewall_report, web_config_report,
@@ -107,7 +107,7 @@ __all__ = [
     'write_remote_file', 'find_files', 'find_files_info', 'find_file',
     'find_file_info', 'read_file_content', 'read_file_info', 'log_reader',
     'get_domain_from_config',
-    'detect_panel', 'get_metrics',
+    'detect_panel', 'get_metrics', 'panel_label',
     'disk_memory_report', 'network_report', 'check_web_config',
     'metrics_report', 'firewall_report', 'web_config_report',
     'find_logs', 'find_logs_info', 'parse_access_log_line', 'filter_by_date',

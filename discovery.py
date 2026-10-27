@@ -578,7 +578,7 @@ def discover_sites_info(checker, panel_type=None):
             for dom in parsed['domains']:
                 add(dom, docroot=parsed['docroot'], php=parsed['php'],
                     vhost=path)
-    for pattern in HTTPD_VHOST_PATTERNS.get(panel_type, []):
+    for pattern in HTTPD_VHOST_PATTERNS.get(panel_type, HTTPD_VHOST_PATTERNS['none']):
         found = find_files_info(checker, pattern, limit=50)
         notes.extend(found['notes'])
         for path in found['paths']:

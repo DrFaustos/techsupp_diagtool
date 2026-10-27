@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import messagebox
 import threading
 import time
-from diagnostic import detect_panel
+from diagnostic import detect_panel, panel_label
 from ssh_client import ServerChecker
 from ttkbootstrap.constants import *
 
@@ -56,7 +56,9 @@ class RunnerMixin:
         self.checker = checker
         self.panel_type = panel_type
         self.log(f"✅ {message}")
-        self.log(f"Панель управления: {self.panel_type}")
+        # Метка, а не машинный маркер: значение unchecked дошло бы до человека
+        # латинским словом (закон серии про «не проверено»).
+        self.log(f"Панель управления: {panel_label(self.panel_type)}")
 
         # Сохраняем в историю
         self._save_conn_history(self.ip_var.get().strip(), self.port_var.get().strip(), self.user_var.get().strip())

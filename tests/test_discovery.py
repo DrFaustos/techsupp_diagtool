@@ -364,10 +364,10 @@ class TestDiscoverSites:
         assert dc.discover_sites(c, 'none') == []
 
     def test_panel_autodetected_when_not_passed(self):
-        c = FakeSSH(routes=[('test -f /usr/local/mgr5/bin/mgrctl', 'yes')])
+        c = FakeSSH(routes=[('ls -1 -p /usr/local/mgr5/bin', 'mgrctl'+chr(10))])
         sites = dc.discover_sites(c)          # panel_type=None -> detect_panel
         assert sites == []
-        assert c.find('test -f /usr/local/mgr5/bin/mgrctl') is not None
+        assert c.find('ls -1 -p /usr/local/mgr5/bin') is not None
 
 
 # ==================== ИНВЕНТАРЬ: ПОЧТА ====================
