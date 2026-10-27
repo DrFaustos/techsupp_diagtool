@@ -622,33 +622,104 @@ class TestFastpanelRestartWebNoFpm:
 # и в pgrep, поэтому для процессов игла берётся с хвостом `>/dev/null`.
 class TestIspmanagerLogsReport:
     def test_existing_logs_get_tails(self):
+        # Файл есть по коду возврата: читать список каталога для этого нечем.
         c = FakeSSH(routes=[
-            ('test -f /usr/local/mgr5/var/ispmgr.log', 'yes'),
-            ('test -f /usr/local/mgr5/var/core.log', 'yes'),
+            ('test -f /usr/local/mgr5/var/ispmgr.log', ('yes', '', 0)),
+            ('test -f /usr/local/mgr5/var/core.log', ('yes', '', 0)),
+            ('test -f /usr/local/mgr5/var/pkg.log', ('yes', '', 0)),
             ('tail -n 40 /usr/local/mgr5/var/ispmgr.log', 'module started'),
             ('tail -n 40 /usr/local/mgr5/var/core.log', ''),
+            ('tail -n 40 /usr/local/mgr5/var/pkg.log', ''),
         ])
         out = panels_mod.ispmanager_logs_report(c)
         assert 'ispmgr.log (последние 40 строк)' in out
         assert 'module started' in out
         # пустой лог показывается как «файл пуст», а не пропадает из отчёта
         assert '(файл пуст)' in out
-        # существование проверяется по всем трём путям
-        assert c.count('test -f /usr/local/mgr5/var') == 3
+        assert c.count('ls -1 -p') == 0
 
     def test_tail_length_is_honored(self):
-        c = FakeSSH(routes=[('test -f', 'yes'), ('tail -n 7', 'x')])
+        c = FakeSSH(routes=[('test -f', ('yes', '', 0)),
+                            ('tail -n 7', 'x')])
         panels_mod.ispmanager_logs_report(c, tail=7)
         assert c.find('tail -n 7') is not None
 
-    def test_no_logs_says_where_it_looked(self):
-        c = FakeSSH(routes=[('test -f', ('', '', 1))])
+    def test_measured_absence_says_where_it_looked(self):
+        # Пустой вывод ls при rc=0 — достоверный ПУСТОЙ каталог (замер 1.32.12),
+        # значит отсутствия доказаны. Прежняя редакция этого теста клаила в
+        # список core.log, оставляя test -f с rc=1: мир противоречив, а код
+        # обязан верить списку (см. test_listing_overrides_a_silent_return_code).
+        c = FakeSSH(routes=[
+            ('test -f', ('', '', 1)),
+            ('ls -1 -p /usr/local/mgr5/var', ('', '', 0)),
+        ])
         out = panels_mod.ispmanager_logs_report(c)
         assert '⚠️ Логи панели не найдены' in out
         assert '/usr/local/mgr5/var/pkg.log' in out
         # читать то, чего нет, запрещено
         assert c.find('tail') is None
 
+    def test_listing_overrides_a_silent_return_code(self):
+        # Обратная сторона того же закона: молчанию кода возврата не верим,
+        # когда есть достоверный список, и имя в нём есть. Иначе «нет» там,
+        # где файл на месте, — ложь, которую этот слайс и лечит.
+        c = FakeSSH(routes=[
+            ('test -f /usr/local/mgr5/var/ispmgr.log', ('', '', 1)),
+            ('test -f /usr/local/mgr5/var/core.log', ('', '', 1)),
+            ('test -f /usr/local/mgr5/var/pkg.log', ('', '', 1)),
+            ('ls -1 -p /usr/local/mgr5/var',
+             ('ispmgr.log', '', 0)),
+            ('tail -n 40 /usr/local/mgr5/var/ispmgr.log', 'из списка'),
+        ])
+        out = panels_mod.ispmanager_logs_report(c)
+        assert 'из списка' in out
+        assert 'не найдены' in out  # про остальные два — честно
+
+    def test_unreadable_catalog_is_never_reported_as_absent(self):
+        # Решающий мир слайса: файлы на месте, но каталог не читается.
+        # Прежний код печатал «не найдены» и не читал ни строки лога.
+        c = FakeSSH(routes=[
+            ('test -f', ('', '', 1)),
+            ('ls -1 -p', ('', 'ls: невозможно открыть каталог', 2)),
+        ])
+        out = panels_mod.ispmanager_logs_report(c)
+        assert 'не найдены' not in out
+        assert 'не проверено' in out
+        assert 'невозможно открыть' in out
+        assert c.find('tail') is None
+
+    def test_mixed_world_shows_what_was_read_and_what_was_not(self):
+        c = FakeSSH(routes=[
+            ('test -f /usr/local/mgr5/var/ispmgr.log', ('yes', '', 0)),
+            ('tail -n 40 /usr/local/mgr5/var/ispmgr.log', 'ok line'),
+            ('test -f /usr/local/mgr5/var/core.log', ('', '', 1)),
+            ('test -f /usr/local/mgr5/var/pkg.log', ('', '', 1)),
+            ('ls -1 -p /usr/local/mgr5/var',
+             ('', 'ls: невозможно открыть каталог', 2)),
+        ])
+        out = panels_mod.ispmanager_logs_report(c)
+        assert 'ok line' in out
+        assert 'не проверено' in out
+
+    def test_questions_carry_no_marker_word(self):
+        c = FakeSSH(routes=[('test -f', ('', '', 1)),
+                            ('ls -1 -p', ('core.log', '', 0))])
+        panels_mod.ispmanager_logs_report(c)
+        for sent in c.commands:
+            if sent.startswith('test -f'):
+                assert 'echo' not in sent, sent
+
+    def test_one_listing_covers_all_paths(self):
+        # Прежняя проверка обещала «не больше четырёх спросов» — МЕРУ, снятую
+        # в мире «файлы есть», и приложенную к миру «файлов нет» (там прежний
+        # код тратил три). Это ровно та ошибка, что лечит серия: число без
+        # мира, в котором оно измерено. Честный контракт: список общего
+        # предка звучит ОДИН раз, сколько бы путей ни проверяли.
+        c = FakeSSH(routes=[('test -f', ('', '', 1)),
+                            ('ls -1 -p', ('', '', 0))])
+        panels_mod.ispmanager_logs_report(c)
+        assert c.count('ls -1 -p') == 1
+        assert len(c.commands) == 4  # 3 вопроса + 1 список на всех
 
 class TestIspmanagerPanelDiag:
     def test_healthy_panel(self):

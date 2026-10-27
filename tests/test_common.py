@@ -1498,3 +1498,89 @@ class TestProcessProbeCache:
         common.process_probe(c, self.TARGET)
         common.process_probe(c, self.TARGET)
         assert c.count("ps -eo") == 2
+
+# ========== ПРИСУТСТВИЕ ФАЙЛА: rc как ответ, список как доказательство =====
+# Замер живьём (uid=1000, настоящий bash, «файл был» доказан возвратом прав):
+#  * каталог 000 (непроходим): test -f -> out='' rc=1 err='' — ПОБАЙТОВО то же,
+#    что при «файла нет», а файл при этом ЕСТЬ (содержимое читается после
+#    возврата прав). Значит прежний признак физически не может различить миры.
+#  * каталог 111 (проход есть, список не читается): test -f -> 'yes' rc=0, а
+#    ls -1 -p -> rc=2. Замена носителя на ОДИН список превратила бы ВЕРНЫЙ
+#    ответ «файл есть» в «не проверено» — ложь в другую сторону и ложный
+#    отказ читать лог. Поэтому носитель комбинированный.
+#  * «ls: command not found» -> rc=127: списка нет, отсутствия не доказаны.
+NO_LS = ('', 'ls: command not found', 127)
+LIST_NO = ('ispmgr.log', '', 0)
+
+
+class TestFilePresence:
+    def test_state_vocabulary_is_three_not_two(self):
+        c = FakeSSH(routes=[('test -f /a/b', ('', '', 0))])
+        info = common.file_presence(c, '/a/b')
+        assert info['state'] in ('found', 'absent', 'unchecked')
+        assert info['path'] == '/a/b'
+
+    def test_code_return_is_the_answer_not_the_word(self):
+        # Прежний признак решал по СЛОВУ «yes». Здесь достаточно кода возврата:
+        # пустой stdout при rc=0 — это «файл есть», а не «мы ничего не знаем».
+        c = FakeSSH(routes=[('test -f /a/b', ('', '', 0))])
+        assert common.file_presence(c, '/a/b')['state'] == 'found'
+
+    def test_reachable_file_never_costs_a_directory_read(self):
+        # Замок против регресса мира 111: если test -f сказал rc=0, список
+        # каталога не нужен вовсе — он бы только добавил спрос и ничего не
+        # мог бы опровергнуть.
+        c = FakeSSH(routes=[('test -f /a/b', ('yes', '', 0))])
+        info = common.file_presence(c, '/a/b')
+        assert info['state'] == 'found'
+        assert c.count('ls -1 -p') == 0
+
+    def test_absence_is_proved_by_a_read_listing(self):
+        c = FakeSSH(routes=[('test -f /a/b/nope.log', ('', '', 1)),
+                            ('ls -1 -p /a/b', LIST_NO)])
+        info = common.file_presence(c, '/a/b/nope.log')
+        assert info['state'] == 'absent'
+        assert 'достоверн' in info['note']
+
+    def test_unreachable_catalog_is_unchecked_not_absent(self):
+        # Решающий отказ слайса: прежний код на этом же бое печатал «не
+        # найдено», а файл был на месте (замер с возвратом прав).
+        c = FakeSSH(routes=[('test -f /a/b/ispmgr.log', ('', '', 1)),
+                            ('ls -1 -p /a/b',
+                             ('', 'ls: невозможно открыть каталог', 2))])
+        info = common.file_presence(c, '/a/b/ispmgr.log')
+        assert info['state'] == 'unchecked'
+        assert 'невозможно открыть' in info['note']
+
+    def test_missing_listing_utility_is_unchecked(self):
+        c = FakeSSH(routes=[('test -f /a/b/ispmgr.log', ('', '', 1)),
+                            ('ls -1 -p /a/b', NO_LS)])
+        assert common.file_presence(c, '/a/b/ispmgr.log')['state'] == \
+            'unchecked'
+
+    def test_question_carries_no_marker_word(self):
+        # Слово-маркер в спросе — прежний признак; он и есть причина лжи,
+        # когда вывод пуст, а rc никто не смотрит.
+        c = FakeSSH(routes=[('test -f', ('', '', 1)),
+                            ('ls -1 -p', LIST_NO)])
+        common.file_presence(c, '/a/b/nope.log')
+        asked = [s for s in c.commands if s.startswith('test -f')]
+        assert asked
+        for sent in asked:
+            assert 'echo' not in sent, sent
+            assert '&&' not in sent, sent
+
+    def test_common_parent_is_listed_once(self):
+        c = FakeSSH(routes=[('test -f', ('', '', 1)),
+                            ('ls -1 -p', LIST_NO)])
+        cache = {}
+        common.file_presence(c, '/a/b/x.log', cache)
+        common.file_presence(c, '/a/b/y.log', cache)
+        assert c.count('ls -1 -p /a/b') == 1
+
+    def test_no_cache_asks_every_time(self):
+        c = FakeSSH(routes=[('test -f', ('', '', 1)),
+                            ('ls -1 -p', LIST_NO)])
+        common.file_presence(c, '/a/b/x.log')
+        common.file_presence(c, '/a/b/y.log')
+        assert c.count('ls -1 -p /a/b') == 2

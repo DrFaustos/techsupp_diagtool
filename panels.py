@@ -2,7 +2,7 @@
 import re
 
 from common import (q, create_backup, find_files_info,
-                     process_kill, process_probe)
+                     file_presence, process_kill, process_probe)
 
 
 # ==================== УПРАВЛЕНИЕ ISPmanager ====================
@@ -689,21 +689,52 @@ ISP_PANEL_PORT = 1500
 
 
 def ispmanager_logs_report(checker, tail=40):
-    """Хвосты логов панели (пути — константы модуля, q() для защитного цитирования)."""
-    lines = ["=== ЛОГИ ПАНЕЛИ ISPmanager ==="]
-    found = False
-    for path in ISP_LOG_PATHS:
+    """Хвосты логов панели (пути — константы модуля, q() для защитного цитирования).
+
+    Прежний вид:
+
         out, _, _ = checker.run(f'test -f {q(path)} && echo yes')
         if out.strip() != 'yes':
             continue
-        found = True
-        out, _, _ = checker.run(f'tail -n {int(tail)} {q(path)} 2>&1')
-        lines.append(f"\n--- {path} (последние {tail} строк) ---")
-        lines.append(out.strip() or "(файл пуст)")
+        ...
     if not found:
-        lines.append("⚠️ Логи панели не найдены по путям: " + ", ".join(ISP_LOG_PATHS))
-    return "\n".join(lines)
+        lines.append("⚠️ Логи панели не найдены по путям: ...")
 
+    Код возврата там ВЫБРОШЕН (out, _, _), а решало слово «yes». Замер живьём:
+    при непроходимом каталоге форма даёт ровно то же, что при «файла нет»
+    (out='' rc=1 err=''), и отчёт печатал «Логи панели не найдены» там, где
+    логи лежат на месте — оператор искал причину в панели, а не в правах.
+    Теперь три состояния: хвост читается только там, где файл найден; «не
+    найдены» говорится только по доказанному списку; нечитаемое называется
+    «не проверено» с причиной из stderr.
+    """
+    lines = ["=== ЛОГИ ПАНЕЛИ ISPmanager ==="]
+    presence_cache = {}
+    missing = []
+    unchecked = []
+    found = False
+    for path in ISP_LOG_PATHS:
+        info = file_presence(checker, path, presence_cache)
+        if info['state'] == 'found':
+            found = True
+            out, _, _ = checker.run(f'tail -n {int(tail)} {q(path)} 2>&1')
+            lines.append(f"\n--- {path} (последние {tail} строк) ---")
+            lines.append(out.strip() or "(файл пуст)")
+        elif info['state'] == 'absent':
+            missing.append(path)
+        else:
+            unchecked.append((path, info['note']))
+    if missing:
+        lines.append("⚠️ Логи панели не найдены по путям: "
+                     + ", ".join(missing))
+    for path, note in unchecked:
+        # Молчать об этом нельзя: пустое наблюдение преждний код читал как
+        # «файла нет», и ложь уезжала в отчёт.
+        lines.append(f"⚠️ {path}: " + (note or 'состояние не проверено'))
+    if not found and not missing and not unchecked:
+        lines.append("⚠️ Логи панели не найдены по путям: "
+                     + ", ".join(ISP_LOG_PATHS))
+    return "\n".join(lines)
 
 def ispmanager_panel_diag(checker):
     """Почему панель не открывается: процессы, порт, API, лицензия, лог."""
