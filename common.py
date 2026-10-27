@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.8"
+__version__ = "1.32.9"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -537,6 +537,73 @@ def unit_status_info(checker, unit):
     status, note = parse_unit_status(out, err, rc)
     return {'unit': unit, 'status': status, 'checked': status is not None,
             'note': note}
+
+
+# ==================== ПРИЗНАК НАЛИЧИЯ ЮНИТА (1.32.9) ====================
+# Тот же класс, что у is-active выше, но носитель — вопрос «установлена ли
+# служба». Прежний носитель (files.py) решал конструкцией
+#   systemctl list-unit-files | grep -q "^svc.service" && echo yes || echo no
+# Замер живьём: строка 'no' rc=0 возникает одинаково, когда (а) службы нет в
+# списке, (б) systemctl молчит (bus мёртв, каталог /run/systemd/system пуст),
+# (в) вывод пуст. Конвейер выбрасывает И код systemctl, И непустоту его stdout,
+# а '|| echo no' довершает подмену: «мы не спросили» становится «службы нет».
+# Поэтому команда перестраивается так, чтобы решение о присутствии принимал
+# shell по НЕПУСТОТЕ stdout systemctl, а сила ответа доехала различимо:
+# present/absent — ответ системы, unknown + причина в stderr — ответа не было.
+UNIT_PRESENCE_UNCHECKED_NOTE = (
+    '⚠️ Наличие службы не проверено: «{why}». Это «мы не спросили», а не '
+    '«служба не установлена»: система без systemd, недоступный bus либо обрыв')
+
+
+def unit_presence_cmd(unit):
+    """Одна POSIX-команда: present / absent / unknown для systemd-юнита.
+
+    Решение по НЕПУСТОТЕ stdout самого list-unit-files (закон 1.32.6: непустой
+    вывод — ответ системы, пустой — «не спросили»). Ни 2>/dev/null, ни 2>&1:
+    при молчании stderr обязан доехать как причина. Конвейер
+    `list-unit-files | grep -q ... && echo yes || echo no` непригоден: его
+    stdout и rc принадлежат не systemctl, и замер даёт побайтово одинаковый
+    'no' rc=0 и при genuine отсутствии, и при bus-мёртвом systemctl, и при
+    пустом выводе. echo вместо printf намеренно: у формы команды нет
+    бэкслешей вообще, и весь класс дефектов экранирования серии 1.32.8 ей не
+    страшен. Точка в [.] — grep-безопасное класс-обозначение (POSIX grep не
+    гарантирует обратный слэш перед точкой).
+    """
+    return ('list=$(systemctl list-unit-files); '
+            'if [ -n "$list" ]; then '
+            'if echo "$list" | grep -q "^{u}[.]service"; then '
+            'echo present; else echo absent; fi; '
+            'else echo unknown; fi').format(u=q(unit))
+
+
+def parse_unit_presence(out, err, rc):
+    """(present|absent|unknown, признание|None) из ответа команды присутствия.
+
+    Только 'present'/'absent' — ответ. Всё остальное (пусто, мусор от битого
+    shell, 'unknown') — «не проверено»: подставлять молчанию «absent» нельзя,
+    это и есть тот дефект, который раздел и лечит.
+    """
+    text = (out or '').strip()
+    if text == 'present':
+        return 'present', None
+    if text == 'absent':
+        return 'absent', None
+    lines = (err or '').strip().splitlines()
+    why = lines[0][:200] if lines else 'пустой вывод (rc=%d)' % rc
+    return 'unknown', UNIT_PRESENCE_UNCHECKED_NOTE.format(why=why)
+
+
+def unit_presence_info(checker, unit):
+    """Наличие юнита и СИЛА ответа: {'unit', 'presence', 'checked', 'note'}.
+
+    checked=False — система ничего не ответила: вызывающий обязан сказать «не
+    проверено», а не «не установлен» (закон серии: «не проверено» не печатается
+    как факт).
+    """
+    out, err, rc = checker.run(unit_presence_cmd(unit))
+    presence, note = parse_unit_presence(out, err, rc)
+    return {'unit': unit, 'presence': presence,
+            'checked': presence != 'unknown', 'note': note}
 
 
 # ==================== СЧЁТЧИК find (1.32.5) ====================

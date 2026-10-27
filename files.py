@@ -10,6 +10,7 @@ from common import (BACKUP_SUBDIRS, q, ensure_backup_dir, create_backup,
                     # решать по нему нельзя нигде. Здесь это дороже отчёта:
                     # по молчанию делался лишний restart и печатался
                     # красный «не запустился».)
+                    unit_presence_info,
                     unit_status_info)
 
 
@@ -297,8 +298,23 @@ def restart_services(checker):
         'apache2': 'reload'
     }
     for svc, action in services.items():
-        out, _, _ = checker.run(f'systemctl list-unit-files | grep -q "^{svc}.service" && echo "yes" || echo "no"')
-        if out.strip() != 'yes':
+        presence = unit_presence_info(checker, svc)
+        if not presence['checked']:
+            # Молчание list-unit-files — «мы не спросили», а не «службы нет».
+            # Прежний признак: list-unit-files | grep -q ... && echo yes ||
+            # echo no. Замер живьём: побайтово одинаковый 'no' rc=0 дают и
+            # genuine отсутствие, и bus-мёртвый systemctl, и пустой вывод —
+            # конвейер выбрасывает И код systemctl, И непустоту его stdout, а
+            # '|| echo no' довершает подмену: «мы не спросили» становится
+            # «службы нет». По «не проверено» действие не предпринимается: ни
+            # reload, ни вопрос is-active, ни ложного «не установлен».
+            lines.append(f"⚠️ {svc}: наличие не проверено, "
+                         f"{action} по непроверенному признаку не предпринят")
+            lines.append(presence['note'])
+            continue
+        if presence['presence'] != 'present':
+            # Здесь ответила система: genuine «юнита нет в списке». Прежний
+            # вердикт сохранён дословно — он правдив по существу.
             lines.append(f"⏭️ {svc} не установлен")
             continue
         _, _, arc = checker.run(f'systemctl {action} {svc} 2>/dev/null')

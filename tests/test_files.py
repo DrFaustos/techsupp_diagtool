@@ -341,11 +341,11 @@ class TestReplaceIpv6BackupFailure:
 
 
 class TestRestartServices:
-    # '^apache2.service' идёт раньше 'list-unit-files': игла — подстрока
-    # команды grep -q "^apache2.service", первое совпадение выигрывает.
+    # '^apache2[.]service' идёт раньше 'list-unit-files': игла — подстрока
+    # команды grep -q "^apache2[.]service", первое совпадение выигрывает.
     ROUTES = [
-        ('^apache2.service', 'no\n'),
-        ('list-unit-files', 'yes\n'),
+        ('^apache2[.]service', 'absent\n'),
+        ('list-unit-files', 'present\n'),
         # Форма команды принадлежит примитиву 1.32.6, а не тесту. Замер по
         # журналу двойника: q() — shlex.quote, для имени без пробелов кавычек
         # НЕТ, запрос звучит как is-active nginx. Кавычки возникают только на
@@ -368,7 +368,7 @@ class TestRestartServices:
         # оформлен как пробел (TestRestartServicesUnchecked), поэтому красному
         # вердикту дан честный вход — настоящий ответ inactive. Замер живьём:
         # остановленная служба отвечает rc=1, и это ОТВЕТ, а не молчание.
-        c = FakeSSH(routes=[('list-unit-files', 'yes\n'),
+        c = FakeSSH(routes=[('list-unit-files', 'present\n'),
                             ('is-active', 'inactive\n')])
         joined = '\n'.join(files_mod.restart_services(c))
         assert '❌ nginx не запустился' in joined
@@ -391,7 +391,7 @@ class TestRestartServicesUnchecked:
     (замер: inactive и offline отвечают rc=1).
     """
 
-    ROUTES = [('list-unit-files', 'yes')]
+    ROUTES = [('list-unit-files', 'present')]
 
     def _silence(self):
         # Маршрута на is-active нет вовсе: система ничего не ответила.
@@ -437,9 +437,85 @@ class TestRestartServicesUnchecked:
         # (fallback restart), и прежний красный вердикт без признаний. Игла
         # выбрана так, чтобы матроваться и до, и после смены формы команды,
         # иначе тест был бы зелёным по неверной причине (урок 1.27.0).
-        c = FakeSSH(routes=[('list-unit-files', 'yes'),
+        c = FakeSSH(routes=[('list-unit-files', 'present'),
                             ('is-active', 'inactive')])
         joined = '\n'.join(files_mod.restart_services(c))
         assert '❌ nginx не запустился' in joined, joined
         assert c.count('systemctl restart nginx') == 1, c.commands
         assert 'не проверено' not in joined, joined
+
+
+class TestRestartServicesPresence:
+    """«Не установлен» — измеренный факт, а не молчание (1.32.9).
+
+    Прежний код решал по `out.strip() != 'yes'` от конструкции
+    `systemctl list-unit-files | grep -q "^svc.service" && echo yes || echo no`.
+    Замер живьём: 'no' rc=0 дают и genuine отсутствие, и молчание systemctl
+    (bus мёртв), и пустой вывод — конвейер теряет и код systemctl, и непустоту.
+    Молчание обязано стать «не проверено», genuine отсутствие — остаться
+    «не установлен», а ответ «present» — открыть законный путь действия.
+    """
+
+    @staticmethod
+    def _uninstalled_lines(joined):
+        # Строки отчёта, УТВЕРЖДАЮЩИЕ, что службы нет. Отличаем их от
+        # строки пробела по слову-признанию: вердикт печатается как
+        # «... svc не установлен», а отказ врать — как «... наличие не
+        # проверено ... а не «служба не установлена»». Разбор по знаку
+        # (эмодзи) я в этом слайсе собирал из памяти и промахнулся
+        # (U+1F3EC вместо U+23ED): получился замок, истинный всегда,
+        # а мёртвый замок хуже его отсутствия (урок 1.32.8).
+        return [ln for ln in joined.split('\n')
+                if 'не установлен' in ln and 'проверено' not in ln]
+
+    def test_silence_is_unchecked_not_installed(self):
+        # Маршрута на list-unit-files нет вовсе: двойник молчит, как
+        # systemctl с мёртвым bus. Прежний код печатал по этому молчанию
+        # «не установлен» — ложь о состоянии сервера.
+        c = FakeSSH()
+        joined = '\n'.join(files_mod.restart_services(c))
+        assert self._uninstalled_lines(joined) == [], joined
+        assert 'не проверено' in joined, joined
+
+    def test_uninstalled_verdict_really_appears(self):
+        # Контрпример, без которого предыдущий assert ничего не стоит:
+        # обязана существовать фикстура, на которой вердикт появляется.
+        # Иначе «вердикта нет» неотличимо от «разбор битый» — тот же
+        # закон, по которому запрещающий guard обязан иметь инвертированный
+        # тест (1.32.8).
+        c = FakeSSH(routes=[('list-unit-files', 'absent')])
+        joined = '\n'.join(files_mod.restart_services(c))
+        found = self._uninstalled_lines(joined)
+        assert found, joined
+        assert any('nginx' in ln for ln in found), joined
+        assert 'не проверено' not in joined, joined
+
+    def test_absent_stays_not_installed(self):
+        # Контрпример против перелома: genuine «службы нет в списке» обязан
+        # остаться «не установлен», иначе правка проглотит настоящий ответ.
+        c = FakeSSH(routes=[('list-unit-files', 'absent')])
+        joined = '\n'.join(files_mod.restart_services(c))
+        assert '⏭️ nginx не установлен' in joined, joined
+        assert 'не проверено' not in joined, joined
+
+    def test_present_proceeds_to_action(self):
+        # Ответ present -> состояние спрашивается и служба перезагружается:
+        # прежний код на 'present' (не 'yes') вставал в «не установлен» и до
+        # is-active не доходил.
+        c = FakeSSH(routes=[('list-unit-files', 'present'),
+                            ('is-active', 'active')])
+        joined = '\n'.join(files_mod.restart_services(c))
+        assert '✅ nginx (reload) выполнен' in joined, joined
+
+
+    def test_silence_does_not_touch_the_service(self):
+        # Анти-регрессионный замок: на прежнем коде он зелёный по той же
+        # причине, по какой молчал дефект (тот вставал в «не установлен» и до
+        # reload не доходил). После перевода на «не проверено» он запирает
+        # главный риск слайса — вылечивающее действие по непроверенному
+        # признаку наличия: reload, restart или сам вопрос is-active.
+        c = FakeSSH()
+        files_mod.restart_services(c)
+        assert c.find('systemctl reload') is None, c.commands
+        assert c.find('systemctl restart') is None, c.commands
+        assert c.find('is-active') is None, c.commands
