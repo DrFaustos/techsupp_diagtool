@@ -1,7 +1,8 @@
 """Управление панелями: ISPmanager (mgrctl) и FastPanel (systemd-юниты)."""
 import re
 
-from common import q, create_backup, find_files_info
+from common import (q, create_backup, find_files_info,
+                     process_kill, process_probe)
 
 
 # ==================== УПРАВЛЕНИЕ ISPmanager ====================
@@ -18,15 +19,73 @@ def ispmanager_restart(checker):
     return "\n".join(lines)
 
 
-def ispmanager_kill_core(checker):
-    lines = ["=== ПРИНУДИТЕЛЬНОЕ ЗАВЕРШЕНИЕ CORE ==="]
-    checker.exec_command('killall core 2>&1')
-    checker.exec_command('pkill -9 core 2>&1')
-    checker.exec_command('sleep 2')
-    out, _ = checker.exec_command('ps aux | grep core | grep -v grep')
-    lines.append("✅ Процесс core завершён" if not out.strip() else "⚠️ Процесс core всё ещё работает")
-    return "\n".join(lines)
+# Пути цели убийства — константы: они же фигурируют в диагностике, и у
+# команды убийства не должно права собирать путь из кавычек на месте.
+ISP_CORE_BIN = '/usr/local/mgr5/bin/core'
+ISP_IHTTPD_BIN = '/usr/local/mgr5/bin/ihttpd'
 
+
+def process_state_label(info):
+    """Состояние процесса словами: ТРИ ответа вместо прежних двух.
+
+    Прежняя форма печатала «❌ не запущен» и когда список процессов не был
+    получен вовсе (замер: rc=127, пустой stdout — оболочка сообщает «command
+    not found», утилиту нет). Оператор читал это как «демона нет» и искал
+    причину в панели, а не в том, что мы не спросили.
+    """
+    if not info['checked']:
+        return 'не проверено: ' + (info['note'] or 'список процессов не прочитан')
+    return '✅ запущен' if info['state'] == 'running' else '❌ не запущен'
+
+
+def ispmanager_kill_core(checker):
+    """Завершает core по pid из достоверного списка процессов.
+
+    Прежний код решал по ИМЕНИ: «killall core», «pkill -9 core», а потом
+    «ps aux | grep core | grep -v grep». Живой замер на этом хосте (настоящий
+    bash, живость по State из /proc после reap):
+
+      * «pkill -9 core» убил ЧУЖОЙ coredns — pgrep и pkill матчают имя как
+        подстроку, то есть штатная кнопка была отказом обслуживания чужих
+        процессов, а не только лживым отчётом;
+      * «killall core» и «pkill -x core» чужой coredns пощадили, но «pgrep -x
+        core» находит и чужой /opt/vendor/core — то же имя файла, другая
+        установка: убивать по имени в принципе нечем;
+      * пустое наблюдение значило «завершён» даже тогда, когда ps не
+        запустилось: процесс оставался живым.
+
+    Поэтому цель берётся из argv[0], равного пути панели, а убиваются
+    названные pid. Пауза прежнего кода («sleep 2») была костылём поверх
+    ложного признака: строка зомби «[core] <defunct>» содержит слово core, и
+    «завершён» наступал лишь через пару секунд; признак по argv[0] зомби в
+    цели не считает никогда, потому что его argv0 — «[core]».
+    """
+    lines = ["=== ПРИНУДИТЕЛЬНОЕ ЗАВЕРШЕНИЕ CORE ==="]
+    probe = process_probe(checker, ISP_CORE_BIN)
+    if not probe['checked']:
+        lines.append("⚠️ " + (probe['note'] or 'список процессов не прочитан'))
+        return "\n".join(lines)
+    if probe['state'] == 'absent':
+        lines.append("Процесс core не запущен: список процессов прочитан, "
+                     "цели в нём нет")
+        if probe['note']:
+            lines.append("ℹ️ " + probe['note'])
+        return "\n".join(lines)
+    result = process_kill(checker, probe['pids'], target=ISP_CORE_BIN)
+    if result['state'] == 'gone':
+        lines.append("✅ Процесс core завершён")
+    elif result['state'] == 'alive':
+        lines.append("⚠️ Процесс core всё ещё работает")
+        if result['note']:
+            lines.append("ℹ️ " + result['note'])
+    else:
+        # Убивать пробовали, но перечитать нечем: право на «готово» даёт
+        # только перечитанный список (отказ прав и «процесса нет» дают один
+        # и тот же rc=1 — замер).
+        lines.append("⚠️ " + (result['note'] or 'состояние не проверено'))
+    if result['similar']:
+        lines.append("ℹ️ тот же файл запущен из другого пути — его не трогаем")
+    return "\n".join(lines)
 
 def ispmanager_update(checker):
     lines = ["=== ОБНОВЛЕНИЕ ISPmanager ==="]
@@ -654,13 +713,15 @@ def ispmanager_panel_diag(checker):
     version = out.strip()
     lines.append(f"Версия панели: {version or 'не определена (файл core повреждён?)'}")
 
-    out, _, _ = checker.run('pgrep -f "/usr/local/mgr5/bin/core" >/dev/null && echo yes')
-    core_up = out.strip() == 'yes'
-    out, _, _ = checker.run('pgrep -f "/usr/local/mgr5/bin/ihttpd" >/dev/null && echo yes')
-    ihttpd_up = out.strip() == 'yes'
-    lines.append(f"Процесс core: {'✅ запущен' if core_up else '❌ не запущен'}")
-    lines.append(f"Веб-сервер панели ihttpd: "
-                 f"{'✅ запущен' if ihttpd_up else '❌ не запущен'}")
+    proc_cache = {}
+    core_proc = process_probe(checker, ISP_CORE_BIN, proc_cache)
+    ihttpd_proc = process_probe(checker, ISP_IHTTPD_BIN,
+                                proc_cache)
+    lines.append(f"Процесс core: {process_state_label(core_proc)}")
+    lines.append(f"Веб-сервер панели ihttpd: {process_state_label(ihttpd_proc)}")
+    for proc in (core_proc, ihttpd_proc):
+        if proc['state'] == 'absent' and proc['note']:
+            lines.append("ℹ️ " + proc['note'])
 
     out, _, _ = checker.run(
         "curl -sk -m 5 -o /dev/null -w '%{http_code}' "

@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.12"
+__version__ = "1.32.13"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -908,6 +908,139 @@ def path_entry_state(checker, path, cache=None):
     return {'path': path, 'state': 'unchecked',
             'note': PATH_ENTRY_UNCHECKED_NOTE.format(
                 why=reason or 'ни один каталог не прочитан')}
+
+# ============ ПРОЦЕССЫ: носитель, цель, убийство (1.32.13) =================
+# Прежние формы решали по ИМЕНИ процесса и по пустоте конвейера. Замер живьём
+# (настоящий bash, живость по State из /proc после reap): «pkill core» без -x
+# убил ЧУЖОЙ coredns (pgrep и pkill матчают имя как подстроку); «pgrep -x core»
+# нашёл и чужой /opt/vendor/core (то же имя файла, другая установка);
+# «pgrep -f <путь>» нашёл чужой «tail -f <тот же путь>» и пропустил запуски
+# «exec -a core» и «cd && exec ./core»; «ps aux | grep core | grep -v grep» на
+# «ps: command not found» дал пустоту, которую отчёт прочитал как «завершён»
+# при живом процессе.
+#
+# Носитель — один «ps -eo pid=,args=» без пайпа: у конвейера код возврата
+# принадлежит последней команде, и «утилита не запустилась» неотличимо от
+# «процессов нет». Пустой вывод при rc=0 здесь достоверен (пустой список — это
+# измеренное отсутствие), при rc=127 — «не проверено» (замер: rc=127 выдаёт
+# оболочка, stdout пуст, доказательство живёт в stderr).
+#
+# Целью считается процесс, у которого argv[0] РАВЕН пути: путь в чужих
+# аргументах панелью не является. Для убийства имя не переиспользуется —
+# убивают названные pid, а право на «готово» даёт только перечитанный список.
+PROCESS_LIST_CMD = 'ps -eo pid=,args='
+PROCESS_KILL_CMD = 'kill -9'
+
+PROCESS_UNCHECKED_NOTE = (
+    'Состояние не проверено: «{why}». Это «мы не спросили», а не ответ хоста: '
+    'список процессов не получен, значит нельзя утверждать ни «работает», '
+    'ни «остановлен»')
+
+
+def parse_process_table(text):
+    """Строки «ps -eo pid=,args=» -> список (pid, argv0).
+
+    Замер: без второго «=» ps печатает заголовок, первым полем у него стоит
+    COMMAND (не число), поэтому заголовок отсекается самим признаком числа.
+    Короткая строка — не процесс: её не угадываем, а отбрасываем.
+    """
+    rows = []
+    for line in (text or '').splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        rows.append((parts[0], parts[1].split(' ')[0]))
+    return rows
+
+
+def process_probe(checker, path, cache=None):
+    """Работает ли процесс, запущенный именно этим путём.
+
+    {path, state, checked, pids, similar, note}, state:
+    running   — argv[0] какого-то процесса равен path;
+    absent    — список прочитан (rc=0) и такого процесса в нём нет: отсутствие
+                ДОКАЗАНО списком, а не выведено из пустоты;
+    unchecked — списка нет (утилиты нет, отказ, непустой отказ) — ответа мы не
+                знаем и права на диагноз не имеем.
+
+    similar — pid процессов с тем же именем файла, но запущенных из другого
+    пути. Это НЕ цель (замер: pgrep -x убивает их вместе с ней), и промолчать
+    о них нельзя: оператор иначе решит, что панель не запущена.
+
+    cache — словарь для нескольких целей в ОДНОМ снимке: список
+    процессов один и тот же, и платить сетевым round-trip за каждую
+    цель нечем. Кеш обязан жить ровно в рамках одного снимка:
+    процесс_kill его не получает (см. ниже).
+    """
+    if cache is not None and PROCESS_LIST_CMD in cache:
+        out, err, rc = cache[PROCESS_LIST_CMD]
+    else:
+        out, err, rc = checker.run(PROCESS_LIST_CMD)
+        if cache is not None:
+            cache[PROCESS_LIST_CMD] = (out, err, rc)
+    target = (path or '').strip()
+    name = target.rsplit('/', 1)[-1]
+    info = {'path': target, 'state': 'unchecked', 'checked': False,
+            'pids': [], 'similar': [], 'note': ''}
+    if rc != 0:
+        why = _first_line(err) or _first_line(out)
+        info['note'] = PROCESS_UNCHECKED_NOTE.format(
+            why=why or ('список процессов не получен (rc=%s)' % rc))
+        return info
+    for pid, argv0 in parse_process_table(out):
+        if argv0 == target:
+            info['pids'].append(pid)
+        elif name and argv0.rsplit('/', 1)[-1] == name:
+            info['similar'].append(pid)
+    info['checked'] = True
+    info['state'] = 'running' if info['pids'] else 'absent'
+    if info['similar']:
+        info['note'] = ('тот же файл запущен из другого пути: pid '
+                        + ', '.join(info['similar'])
+                        + ' — это не цель, её не трогаем')
+    return info
+
+
+def process_kill(checker, pids, target=None):
+    """Убивает названные pid и перечитывает список, если названа цель.
+
+    Решать по ответу убивающей команды нельзя: отказ прав и «процесса нет»
+    дают один и тот же rc=1 (замер: у kill без аргументов rc=2, у
+    несуществующего pid rc=1, у отказа прав rc=1). Единственное право на
+    «готово» — повторный достоверный список, где цели больше нет.
+    """
+    wanted = [str(p) for p in (pids or []) if str(p).isdigit()]
+    if not wanted:
+        return {'state': 'nothing-to-kill', 'checked': True, 'pids': [],
+                'similar': [], 'note': 'убивать нечего: pid не названы'}
+    out, err, rc = checker.run(PROCESS_KILL_CMD + ' ' + ' '.join(wanted))
+    why = _first_line(err) or _first_line(out)
+    result = {'state': 'unchecked', 'checked': False, 'pids': wanted,
+              'similar': [], 'note': ''}
+    if not target:
+        # Перечитать нечем: цель не названа, значит и права на «готово» нет.
+        result['note'] = PROCESS_UNCHECKED_NOTE.format(
+            why=why or 'путь цели не назван, перечитать нечего')
+        return result
+    # Кеш сюда не передаётся НАМЕРЕННО: снимок ДО убийства не имеет
+    # права решать, убит ли процесс ПОСЛЕ него. Ответ самой убивающей
+    # команды различить отказ прав и «процесса нет» не может (замер:
+    # rc=1 в обоих мирах), поэтому перечитка обязана быть свежей.
+    probe = process_probe(checker, target)
+    result['pids'] = probe['pids']
+    result['similar'] = probe['similar']
+    if not probe['checked']:
+        result['note'] = ('отказ убийства: «%s»; %s' % (why, probe['note'])
+                          if why and rc != 0 else probe['note'])
+        return result
+    result['checked'] = True
+    if probe['pids']:
+        result['state'] = 'alive'
+        result['note'] = ('процесс жив' + ('; отказ убийства: «%s»' % why
+                                           if rc != 0 and why else ''))
+        return result
+    result['state'] = 'gone'
+    return result
 
 # ==================== СЧЁТЧИК find (1.32.5) ====================
 # `find … 2>/dev/null | wc -l` непригоден как ответ «нарушений нет»: код возврата

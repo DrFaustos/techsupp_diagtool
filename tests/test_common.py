@@ -1311,3 +1311,190 @@ class TestRemoveRemotePath:
 
         ok, why = common.remove_remote_path(Dead(), '/tmp/d')
         assert ok is False and 'connection reset' in why
+
+# ============ ПРОЦЕССЫ: носитель, цель, убийство (1.32.13) =================
+# Приговор прежним формам вынесен ЖИВЫМ замером на этом хосте (настоящий
+# bash, живость — по /proc State после reap):
+#  * pkill core (без -x, ровно как в panels.ispmanager_kill_core) УБИЛ ЧУЖОЙ
+#    coredns: pgrep/pkill матчают имя как подстроку;
+#  * pgrep -x core нашёл и чужой /opt/vendor/core (тот же basename, другая
+#    установка) — то есть убил бы не ту панель;
+#  * pgrep -f "<путь core>" нашёл чужой «tail -f <тот же путь>» и ПРОПУСТИЛ
+#    запуски «exec -a core» и «cd && exec ./core»;
+#  * пайп ps aux | grep core | grep -v grep потерял код возврата (rc
+#    принадлежит последней команде) и на «ps: command not found» дал пустоту,
+#    которую отчёт прочитал как «✅ Процесс core завершён» при живом процессе.
+# Носитель — один ps -eo pid=,args= без пайпа; цель — argv[0], равный пути.
+
+
+class TestProcessProbe:
+    TARGET = "/usr/local/mgr5/bin/core"
+    CORE = "      1 /usr/local/mgr5/bin/core -D"
+    TAIL = "    424 /usr/bin/tail -f /usr/local/mgr5/bin/core"
+    VENDOR = "    500 /opt/vendor/core -d"
+    NOISE = "     42 /usr/bin/tail -f /var/log/notes.txt"
+    # Замер: ps -eo pid=,args (без второго =) печатает COMMAND первой строкой.
+    HEADER = "        COMMAND"
+
+    def table(self, *rows):
+        return chr(10).join(rows) + chr(10)
+
+    def probe(self, routes=None, default=("", "", 0)):
+        c = FakeSSH(routes=routes or [], default=default)
+        return c, common.process_probe(c, self.TARGET)
+
+    def test_carrier_is_one_command_without_pipe(self):
+        c = FakeSSH(routes=[("ps -eo", self.table(self.CORE))])
+        common.process_probe(c, self.TARGET)
+        assert c.commands == [common.PROCESS_LIST_CMD]
+        cmd = c.commands[0]
+        for forbidden in ("|", "&&", "||", ">", "grep", "pgrep", "pkill"):
+            assert forbidden not in cmd, cmd
+
+    def test_exact_path_is_running(self):
+        c, info = self.probe([("ps -eo", self.table(self.CORE, self.TAIL))])
+        assert info["state"] == "running"
+        assert info["checked"] is True
+        assert info["pids"] == ["1"]
+
+    def test_path_in_foreign_arguments_is_not_the_daemon(self):
+        # Ровно тот процесс, который находил pgrep -f по пути панели.
+        c, info = self.probe([("ps -eo", self.table(self.TAIL))])
+        assert info["state"] == "absent"
+        assert info["pids"] == []
+
+    def test_same_name_in_another_path_is_not_the_daemon(self):
+        c, info = self.probe([("ps -eo", self.table(self.VENDOR))])
+        assert info["state"] == "absent"
+        # О похожем имени обязаны сказать словами: это кандидат «запущено не
+        # по нашему пути», а не молчаливое «процесса нет».
+        assert info["similar"] == ["500"]
+        assert info["note"]
+
+    def test_absence_is_measured_not_assumed(self):
+        c, info = self.probe([("ps -eo", self.table(self.TAIL, self.VENDOR,
+                                                    self.NOISE))])
+        assert info["state"] == "absent"
+        assert info["checked"] is True
+        assert info["pids"] == [] and info["similar"] == ["500"]
+
+    def test_header_row_is_not_a_process(self):
+        c, info = self.probe([("ps -eo", self.table(self.HEADER, self.CORE))])
+        assert info["state"] == "running" and info["pids"] == ["1"]
+
+    def test_short_rubbish_row_is_not_guessed(self):
+        c, info = self.probe([("ps -eo", self.table("x", self.CORE))])
+        assert info["pids"] == ["1"]
+
+    def test_missing_utility_is_unchecked_not_absent(self):
+        # Замер: rc=127 выдаёт оболочка, stdout пуст. Прежний пайп на этом же
+        # ответе печатал «завершён» — ровно тот отказ, что лечит слайс.
+        c, info = self.probe(default=("", "ps: command not found", 127))
+        assert info["state"] == "unchecked"
+        assert info["checked"] is False
+        assert info["pids"] == []
+        assert info["note"]
+
+    def test_unreadable_table_is_unchecked(self):
+        c, info = self.probe(default=("", "cannot open /proc", 1))
+        assert info["state"] == "unchecked"
+        assert info["checked"] is False
+
+
+class TestProcessKill:
+    TARGET = "/usr/local/mgr5/bin/core"
+    CORE = "      1 /usr/local/mgr5/bin/core -D"
+    OTHER = "     42 /usr/bin/tail -f /var/log/notes.txt"
+
+    def kill(self, routes, pids=("1",)):
+        c = FakeSSH(routes=routes)
+        return c, common.process_kill(c, list(pids), target=self.TARGET)
+
+    def test_kill_asks_only_named_pids(self):
+        c = FakeSSH()
+        common.process_kill(c, ["12", "34"], target=self.TARGET)
+        cmd = c.find("kill")
+        assert cmd is not None and "12" in cmd and "34" in cmd
+        # Имя процесса в команду убийства не едет: по имени убивали чужое.
+        for sent in c.commands:
+            assert "core" not in sent, sent
+
+    def test_gone_is_proved_by_reading_the_list_again(self):
+        c, result = self.kill([("kill", ""), ("ps -eo", self.OTHER + chr(10))])
+        assert result["state"] == "gone"
+        assert result["checked"] is True
+        assert c.count("ps -eo") == 1
+
+    def test_alive_target_stays_alive(self):
+        c, result = self.kill([("kill", ""),
+                               ("ps -eo", self.CORE + chr(10))])
+        assert result["state"] == "alive"
+        assert result["checked"] is True
+
+    def test_confirmation_that_never_arrived_is_unchecked(self):
+        # Убил — но перечитать нечем: «готово» здесь не право на отчёт.
+        c, result = self.kill([("kill", ""),
+                               ("ps -eo", ("", "ps: command not found", 127))])
+        assert result["state"] == "unchecked"
+        assert result["checked"] is False
+
+    def test_refused_kill_keeps_its_reason(self):
+        c, result = self.kill([("kill", ("", "kill: (1) - Operation not "
+                                          "permitted", 1)),
+                               ("ps -eo", self.CORE + chr(10))])
+        assert result["state"] == "alive"
+        assert "permitted" in result["note"]
+
+    def test_kill_without_pids_does_not_ask_anything(self):
+        c, result = self.kill([], pids=())
+        assert c.find("kill") is None
+        assert result["state"] == "nothing-to-kill"
+
+class TestProcessProbeCache:
+    """Один спрос на несколько целей; кеш НЕ переживает убийство."""
+
+    TARGET = "/usr/local/mgr5/bin/core"
+    OTHER = "/usr/local/mgr5/bin/ihttpd"
+    CORE = "      1 /usr/local/mgr5/bin/core -D"
+    IHTTPD = "      7 /usr/local/mgr5/bin/ihttpd -c conf"
+    SLEEP = "     42 /usr/bin/sleep 300"
+
+    def test_two_targets_cost_one_question(self):
+        c = FakeSSH(routes=[("ps -eo", self.CORE + chr(10) + self.IHTTPD
+                             + chr(10))])
+        cache = {}
+        first = common.process_probe(c, self.TARGET, cache)
+        second = common.process_probe(c, self.OTHER, cache)
+        assert c.count("ps -eo") == 1
+        assert first["pids"] == ["1"] and second["pids"] == ["7"]
+
+    def test_refused_table_is_not_asked_twice(self):
+        # Причина отказа — та же команда, значит ответ тот же: повторный спрос
+        # ничего бы не добавил и только замедлил бы отчёт.
+        c = FakeSSH(default=("", "ps: command not found", 127))
+        cache = {}
+        a = common.process_probe(c, self.TARGET, cache)
+        b = common.process_probe(c, self.OTHER, cache)
+        assert c.count("ps -eo") == 1
+        assert a["state"] == "unchecked" and b["state"] == "unchecked"
+
+    def test_kill_rereads_without_any_cache(self):
+        # Решающий контрпример: первый список и второй (после убийства) —
+        # РАЗНЫЕ миры. Передай process_kill кеш — и «✅ завершён» печатался
+        # бы по снимку ДО убийства, то есть ровно та ложь, что лечит серия.
+        c = FakeSSH(routes=[
+            ("kill", ""),
+            ("ps -eo", [self.CORE + chr(10), self.SLEEP + chr(10)]),
+        ])
+        probe = common.process_probe(c, self.TARGET)
+        assert probe["pids"] == ["1"]
+        result = common.process_kill(c, probe["pids"], target=self.TARGET)
+        assert result["state"] == "gone"
+        assert c.count("ps -eo") == 2
+
+    def test_probe_without_cache_always_asks(self):
+        # Отсутствие кеша — прежнее поведение: каждый спрос настоящий.
+        c = FakeSSH(routes=[("ps -eo", self.CORE + chr(10))])
+        common.process_probe(c, self.TARGET)
+        common.process_probe(c, self.TARGET)
+        assert c.count("ps -eo") == 2

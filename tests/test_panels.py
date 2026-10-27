@@ -497,20 +497,85 @@ class TestIspmanagerRestart:
         assert '⚠️ Панель возможно не запустилась' in out
 
 
+# ========== ЗАВЕРШЕНИЕ CORE: цель по пути, а не по имени (1.32.13) =========
+# Живой замер (настоящий bash, живость по State из /proc после reap):
+#  * «pkill -9 core» (боевая форма) УБИЛ ЧУЖОЙ coredns: pgrep/pkill матчают
+#    имя как подстроку;
+#  * «pkill -x core» и «killall core» чужой coredns пощадили;
+#  * «ps aux | grep core | grep -v grep» на «ps: command not found» дал rc=1 и
+#    пустоту, а «✅ Процесс core завершён» печатался при ЖИВОМ процессе
+#    (exec_command выбрасывает код возврата);
+#  * «pgrep -f "<путь core>"» в диагностике нашёл чужой «tail -f <тот же
+#    путь>» и пропустил запуски «exec -a core» и «cd && exec ./core».
+CORE_ROW = "      1 /usr/local/mgr5/bin/core -D"
+IHTTPD_ROW = "      7 /usr/local/mgr5/bin/ihttpd -c conf"
+FOREIGN_ROW = "     42 /usr/bin/coredns -dns.port=1053"
+TAIL_ROW = "    424 /usr/bin/tail -f /usr/local/mgr5/bin/core"
+VENDOR_ROW = "    500 /opt/vendor/core -d"
+NOISE_ROW = "     42 /usr/bin/tail -f /var/log/notes.txt"
+NO_PS = ("", "ps: command not found", 127)
+
+
+def rows(*items):
+    return chr(10).join(items) + chr(10)
+
+
 class TestIspmanagerKillCore:
     def test_core_gone_after_kill(self):
-        c = FakeSSH(routes=[('ps aux | grep core', '')])
+        # Цель убивают по pid из достоверного списка. Имя процесса в спросе
+        # убийства — запрещённая форма: по нему убивали чужой coredns.
+        c = FakeSSH(routes=[
+            ('kill', ''),
+            ('ps -eo', [rows(CORE_ROW), rows(FOREIGN_ROW)]),
+        ])
         out = panels_mod.ispmanager_kill_core(c)
         assert '✅ Процесс core завершён' in out
-        assert c.find('killall core') is not None
-        assert c.find('pkill -9 core') is not None
-        assert c.find('sleep 2') is not None
+        assert c.find('kill -9 1') is not None
+        assert c.count('ps -eo') == 2
 
     def test_core_still_running_is_warned(self):
-        c = FakeSSH(routes=[('ps aux | grep core',
-                             'root 1 0.0 /usr/local/mgr5/bin/core\n')])
+        c = FakeSSH(routes=[('kill', ''), ('ps -eo', rows(CORE_ROW))])
         out = panels_mod.ispmanager_kill_core(c)
         assert '⚠️ Процесс core всё ещё работает' in out
+
+    def test_nothing_to_kill_says_absence_was_checked(self):
+        # Список получен, цели в нём нет: это измеренное отсутствие, а не
+        # «мы не спросили». Убивающий команда при этом не звучит вовсе.
+        c = FakeSSH(routes=[('ps -eo', rows(NOISE_ROW, FOREIGN_ROW))])
+        out = panels_mod.ispmanager_kill_core(c)
+        assert c.find('kill') is None
+        assert 'не запущен' in out and 'не проверено' not in out
+
+    def test_unasked_question_is_never_reported_as_success(self):
+        # Решающий отказ слайса: прежний код на этом же бое печатал
+        # «✅ Процесс core завершён», а процесс оставался жив.
+        c = FakeSSH(default=NO_PS)
+        out = panels_mod.ispmanager_kill_core(c)
+        assert '✅' not in out
+        assert 'не проверено' in out
+
+    def test_never_asks_the_process_name(self):
+        # Ни в одном спросе не должно быть имени процесса: оно и есть причина
+        # убийства чужого (pkill/coredns). Путь цели в команде убийства не
+        # появляется — убивают pid.
+        c = FakeSSH(routes=[('kill', ''), ('ps -eo', rows(CORE_ROW))])
+        panels_mod.ispmanager_kill_core(c)
+        assert c.commands
+        for sent in c.commands:
+            assert 'killall' not in sent, sent
+            assert 'pkill' not in sent, sent
+            assert 'pgrep' not in sent, sent
+            assert '|' not in sent, sent
+        killed = [s for s in c.commands if 'kill' in s]
+        assert killed and all('core' not in s for s in killed), killed
+
+    def test_same_name_from_another_path_is_named_in_words(self):
+        # Цели нет, но тот же файл запущен из другого пути: оператор обязан
+        # увидеть это словами, а не молчаливое «не запущен».
+        c = FakeSSH(routes=[('ps -eo', rows(VENDOR_ROW))])
+        out = panels_mod.ispmanager_kill_core(c)
+        assert 'тот же файл запущен из другого пути' in out
+        assert c.find('kill') is None
 
 
 class TestIspmanagerDisable:
@@ -520,9 +585,10 @@ class TestIspmanagerDisable:
         assert '✅ Панель отключена' in out
         assert '⚠️ Для включения выполните: chmod +x' in out
         assert c.find('chmod -x /usr/local/mgr5/bin/core') is not None
+        # disable остаётся за границей слайса: здесь имя точное (killall core
+        # чужой coredns не бьёт — замер), поэтому форма сохранена намеренно.
         assert c.find('killall core') is not None
         assert c.find('killall ihttpd') is not None
-
 
 class TestIspmanagerCronFixBackupFailure:
     def test_missing_backup_warns_but_fix_still_runs(self):
@@ -588,8 +654,7 @@ class TestIspmanagerPanelDiag:
     def test_healthy_panel(self):
         c = FakeSSH(routes=[
             ('core ispmgr -V', '6.4.2'),
-            ('bin/core" >/dev/null', 'yes'),
-            ('ihttpd', 'yes'),
+            ('ps -eo', rows(CORE_ROW, IHTTPD_ROW)),
             ('127.0.0.1:1500', '302'),
             ('sysinfo', 'elid=1'),
             ('licctl info', 'license: ok, expires 2027'),
@@ -1747,3 +1812,76 @@ class TestFastpanelLogsExplainsGaps:
                     + NOTHING)
         assert panels_mod.find_fastpanel_logs(c) == \
             ['/var/log/fastpanel2/engine.log']
+
+# ====== ДИАГНОСТИКА ПАНЕЛИ: три состояния процесса вместо двух (1.32.13) =====
+# Прежняя форма «pgrep -f "/usr/local/mgr5/bin/core" >/dev/null && echo yes»
+# решала по пустоте: rc=127 (утилиты нет) и доказанное отсутствие давали
+# побайтово один ответ «❌ не запущен». Замер: pgrep -f по пути панели находит
+# чужой «tail -f <тот же путь>» и самого наблюдателя, а запуск «./core» или
+# «exec -a core» ПРОПУСКАЕТ — то есть тот же отчёт бывал и ложноположительным.
+DIAG_BASE = [
+    ('core ispmgr -V', '6.4.2'),
+    ('127.0.0.1:1500', '302'),
+    ('sysinfo', 'elid=1'),
+    ('licctl info', 'license: ok, expires 2027'),
+    ('tail -n 15', ''),
+]
+
+
+class TestIspmanagerPanelDiagProcessStates:
+    def test_alive_processes_are_proved_by_the_list(self):
+        c = FakeSSH(routes=DIAG_BASE + [
+            ('ps -eo', rows(CORE_ROW, IHTTPD_ROW)),
+        ])
+        out = panels_mod.ispmanager_panel_diag(c)
+        assert 'Процесс core: ✅ запущен' in out
+        assert 'ihttpd: ✅ запущен' in out
+        assert 'не проверено' not in out
+
+    def test_measured_absence_still_says_not_running(self):
+        # Замок против «теперь всегда не проверено»: список получен, имени
+        # нет — отсутствие доказано и печатается как раньше.
+        c = FakeSSH(routes=DIAG_BASE + [('ps -eo', rows(NOISE_ROW))])
+        out = panels_mod.ispmanager_panel_diag(c)
+        assert out.count('❌ не запущен') == 2
+        assert 'не проверено' not in out
+
+    def test_missing_utility_is_not_reported_as_not_running(self):
+        c = FakeSSH(routes=DIAG_BASE + [('ps -eo', NO_PS)])
+        out = panels_mod.ispmanager_panel_diag(c)
+        assert 'не проверено' in out
+        assert '❌ не запущен' not in out
+
+    def test_daemon_started_by_relative_path_is_found(self):
+        # Замер: pgrep -f по полному пути этот запуск ПРОПУСТИЛ (argv0=./core),
+        # а argv[0] здесь равен пути, потому что ps показывает реальный argv0.
+        c = FakeSSH(routes=DIAG_BASE + [
+            ('ps -eo', rows(CORE_ROW, NOISE_ROW)),
+        ])
+        out = panels_mod.ispmanager_panel_diag(c)
+        assert 'Процесс core: ✅ запущен' in out
+
+    def test_foreign_process_holding_the_path_is_not_the_daemon(self):
+        c = FakeSSH(routes=DIAG_BASE + [('ps -eo', rows(TAIL_ROW))])
+        out = panels_mod.ispmanager_panel_diag(c)
+        assert 'Процесс core: ❌ не запущен' in out
+
+    def test_two_targets_cost_one_question(self):
+        # Список процессов один и тот же: вторая цель обязана читать его из
+        # кеша, иначе диагностика платит сетевым round-trip за каждую строку
+        # отчёта. Прежний код спрашивал дважды.
+        c = FakeSSH(routes=DIAG_BASE + [
+            ('ps -eo', rows(CORE_ROW, IHTTPD_ROW)),
+        ])
+        out = panels_mod.ispmanager_panel_diag(c)
+        assert c.count('ps -eo') == 1
+        assert 'Процесс core: ✅ запущен' in out
+        assert 'ihttpd: ✅ запущен' in out
+
+    def test_diag_never_asks_a_pipe_or_a_name(self):
+        c = FakeSSH(routes=DIAG_BASE + [('ps -eo', rows(NOISE_ROW))])
+        panels_mod.ispmanager_panel_diag(c)
+        for sent in c.commands:
+            assert 'pgrep' not in sent, sent
+            assert 'pkill' not in sent, sent
+            assert 'killall' not in sent, sent
