@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.9"
+__version__ = "1.32.10"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -604,6 +604,89 @@ def unit_presence_info(checker, unit):
     presence, note = parse_unit_presence(out, err, rc)
     return {'unit': unit, 'presence': presence,
             'checked': presence != 'unknown', 'note': note}
+
+
+# ==================== ЗОНД ДОСТУПНОСТИ РЕЗОЛВЕРА (1.32.10) ====================
+# Тот же корень, что у is-active (1.32.6) и у list-unit-files (1.32.9), но
+# носитель — доступность DNS-сервера, и ложь здесь дороже: по слову
+# «недоступен» оператор жмёт «сменить резолверы», а set_dns_resolvers
+# перезаписывает /etc/resolv.conf.
+#
+# Прежний носитель (dns.py) решал конструкцией
+#   dig +timeout=2 +tries=1 @NS google.com A 2>/dev/null \
+#       | grep -q 'NOERROR' && echo доступен || echo недоступен
+# Замер живьём (этот хост, dig 9.18): побайтово одинаковое «недоступен» дают
+# (а) сервер, ответивший NXDOMAIN — то есть ЖИВОЙ сервер, чья запись просто
+# отсутствует; (б) бинарника dig нет вовсе (rc=127 — мы не спрашивали);
+# (в) пустой вывод. Пайп выбрасывает И код dig, И stderr, где живёт причина
+# («communications error ... connection refused»), а '|| echo' довершает
+# подмену. Отдельно python-дополнение `out.strip() else "недоступен"` —
+# четвёртый вход в ту же ложь, а exec_command() отдаёт только каналы, значит
+# rc=127 неразличим с тишиной в принципе.
+#
+# Поэтому зона — ОДНА команда без пайпа и без заглушек: код возврата
+# принадлежит dig, stderr целый, состояние решает парсер по фактам. Никаких
+# бэкслешей в форме нет вовсе (урок 1.32.9: нечего экранировать — нечего
+# ломать).
+RESOLVER_UNCHECKED_NOTE = (
+    '⚠️ Доступность резолвера не проверена: «{why}». Это «мы не спросили», '
+    'а не состояние сервера: возможно, на хосте нет dig либо оборвался канал')
+
+
+def resolver_probe_cmd(resolver, probe='google.com'):
+    """Одна POSIX-команда, спрашивающая доступность резолвера.
+
+    Без `2>/dev/null`, без `2>&1` и без конвейера: rc обязан принадлежать
+    dig, а stderr — доехать как причина. Ни `&&`/`||`: решение принимает
+    парсер по фактам, а не оболочка по умолчанию. Адрес резолвера и имя
+    проверки экранируются через q(): это имена, а не glob.
+    """
+    return ('dig +timeout=2 +tries=1 @' + q(resolver) + ' ' + q(probe) +
+            ' A')
+
+
+def parse_resolver_probe(out, err, rc):
+    """('ok'|'down'|'unchecked', признание|None) из ответа dig.
+
+    Признак — ОТВЕТ сервера, а не наличие записи. Замер: NXDOMAIN приходит
+    при rc=0 и с полным выводом, то есть сервер работает, а отсутствующая
+    запись — не его неисправность. Поэтому любой статус-заголовок ответа
+    ('status: ...') означает «сервер ответил». Молчание при rc=127 — этого
+    бинарника нет: спрашивать не чем, ответ unknown.
+    """
+    def first(text):
+        lines = (text or '').strip().splitlines()
+        return lines[0][:200] if lines else ''
+
+    text = (out or '') + (err or '')
+    if rc == 127:
+        why = first(err) or 'команда не найдена (rc=127)'
+        return 'unchecked', RESOLVER_UNCHECKED_NOTE.format(why=why)
+    if 'status:' in text:
+        # Сервер ответил. Любой статус (NOERROR, NXDOMAIN, SERVFAIL) — это
+        # ответ, а не отказ: резолвер доступен.
+        return 'ok', None
+    if not text.strip():
+        why = 'пустой вывод (rc=%s)' % rc
+        return 'unchecked', RESOLVER_UNCHECKED_NOTE.format(why=why)
+    # Ответа нет, но каналы не пусты: dig сам сказал, почему (замер:
+    # 'communications error to 127.0.0.1#53: connection refused',
+    # 'timed out' при rc=9). Это отказ сервера, а не наше молчание.
+    why = first(err) or first(out)
+    return 'down', why
+
+
+def resolver_probe_info(checker, resolver, probe='google.com'):
+    """Доступность резолвера и СИЛА ответа: {resolver, state, checked, note}.
+
+    checked=False — система ничего не ответила: вызывающий обязан сказать
+    «не проверено», а не «недоступен» (закон серии: «не проверено» не
+    печатается как факт, и по нему не совершается вылечивающее действие).
+    """
+    out, err, rc = checker.run(resolver_probe_cmd(resolver, probe))
+    state, note = parse_resolver_probe(out, err, rc)
+    return {'resolver': resolver, 'state': state,
+            'checked': state != 'unchecked', 'note': note}
 
 
 # ==================== СЧЁТЧИК find (1.32.5) ====================

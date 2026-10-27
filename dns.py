@@ -8,7 +8,8 @@ from common import (q, create_backup, write_remote_file,
                     # «система не ответила», а не «не активно», и
                     # решать по нему нельзя нигде и ни в какой
                     # форме, здесь особенно: ветка пишет файл.
-                    unit_status_info)
+                    unit_status_info,
+                    resolver_probe_info)
 
 
 # ==================== DNS ФУНКЦИИ ====================
@@ -127,11 +128,24 @@ def dns_resolvers_report(checker):
     lines.append("Проверка доступности:")
 
     for ns in nameservers:
-        # dig: rc!=0 при NXDOMAIN — судим по выводу grep, а не по rc.
-        cmd = f"dig +timeout=2 +tries=1 @{q(ns)} google.com A 2>/dev/null | grep -q 'NOERROR' && echo 'доступен' || echo 'недоступен'"
-        out, _ = checker.exec_command(cmd)
-        status = out.strip() if out.strip() else "недоступен"
-        lines.append(f"  {ns}: {status}")
+        # Доступность меряет общий зонд (1.32.10): решение по ОТВЕТУ сервера,
+        # а не по наличию слова NOERROR. Замер живьём: побайтово одинаковое
+        # «недоступен» давали (а) живой сервер, ответивший NXDOMAIN, (б)
+        # бинарника dig нет (rc=127 — спрашивать было не чем), (в) пустой
+        # вывод. Пайп с `grep -q NOERROR && echo ... || echo ...` выбрасывал
+        # и код dig, и stderr с причиной, а python-дополнение
+        # `else "недоступен"` добавляло четвёртый вход в ту же ложь. По
+        # «не проверено» диагноз не печатается: по слову «недоступен»
+        # оператор жмёт «сменить резолверы», а set_dns_resolvers
+        # перезаписывает /etc/resolv.conf.
+        probe = resolver_probe_info(checker, ns)
+        if not probe['checked']:
+            lines.append(f"  {ns}: не проверено")
+            lines.append("  " + probe['note'])
+        elif probe['state'] == 'ok':
+            lines.append(f"  {ns}: доступен")
+        else:
+            lines.append(f"  {ns}: недоступен ({probe['note']})")
 
     out, _ = checker.exec_command('systemd-resolve --status 2>/dev/null | grep "DNS Servers"')
     if out.strip():

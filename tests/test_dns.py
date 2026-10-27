@@ -23,6 +23,15 @@ DIG_FULL = [
 ]
 
 
+# Сырой ответ ЖИВОГО dig, снятый замером на этом хосте (dig 9.18):
+# сервер ответил — значит доступен. Прежняя фикстура кормила продукт
+# готовым словом «доступен», минуя форму dig, и потому не ловила
+# дефект (урок 1.27.0: подмена измерения намерением).
+DIG_NOERROR = (';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1'
+               + ';; ANSWER SECTION:' + chr(10)
+               + 'google.com.  300 IN A 142.250.74.14' + chr(10))
+
+
 class TestDnsReport:
     def test_a_ns_ptr_collected(self):
         out = dns_mod.dns_report(FakeSSH(routes=DIG_FULL), 'example.com')
@@ -126,7 +135,7 @@ class TestResolversReport:
     def test_lists_and_probes_each_ns(self):
         c = FakeSSH(routes=[
             ('/etc/resolv.conf', 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n'),
-            ('google.com A', 'доступен\n'),
+            ('google.com A', DIG_NOERROR),
         ])
         out = dns_mod.dns_resolvers_report(c)
         assert 'Найдено DNS-серверов: 2' in out
@@ -349,7 +358,7 @@ class TestDnsReportPtrMissing:
 # ==================== отчёт по резолверам: systemd-раздел ================
 class TestResolversReportSystemd:
     BASE = [('/etc/resolv.conf', 'nameserver 1.1.1.1\n'),
-            ('google.com A', 'доступен\n')]
+            ('google.com A', DIG_NOERROR)]
 
     def test_systemd_resolve_status_shown(self):
         c = FakeSSH(routes=self.BASE + [
@@ -442,3 +451,101 @@ class TestSetResolversResolvedFailures:
         out = dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
         assert '❌ Ошибка для eth0 (rc=1): Interactive authentication required' in out
         assert '✅ DNS для eth0' not in out
+
+
+class TestResolversAvailability:
+    """«Недоступен» — ответ сервера, а не наше молчание (1.32.10).
+
+    Прежний код решал по `out.strip() != 'доступен'` от конструкции
+    `dig ... 2>/dev/null | grep -q 'NOERROR' && echo доступен || echo
+    недоступен`. Замер живьём: «недоступен» печатается и когда сервер
+    ответил NXDOMAIN (он жив), и когда бинарника dig нет (rc=127), и когда
+    вывод пуст. По этому слову оператор идёт менять резолверы, а
+    set_dns_resolvers перезаписывает /etc/resolv.conf.
+
+    Маршруты описывают ФОРМУ, снятую замером (у dig в выводе есть строка
+    «status: ...»), а не ожидание: подмена измерения намерением — урок
+    1.27.0/1.32.8 про зелёный по неверной причине.
+    """
+
+    RESOLV = ('nameserver 1.1.1.1' + chr(10))
+
+    @staticmethod
+    def _unavailable_lines(joined):
+        # Строки, УТВЕРЖДАЮЩИЕ, что резолвер недоступен. Разбор по слову, а
+        # не по знаку (эмодзи), и с исключением строки-признания: закон
+        # серии (1.28.0, 1.32.8, 1.32.9) — проверка по подстроке краснеет на
+        # тексте, который объясняет, почему прежний знак был бы ложью.
+        return [ln for ln in joined.splitlines()
+                if 'недоступен' in ln and 'проверен' not in ln]
+
+    @staticmethod
+    def _pipe_answer(dig):
+        # Ответ СТАРОГО пайпа, вычисленный ЗАМЕРОМ: `... 2>/dev/null |
+        # grep -q NOERROR && echo доступен || echo недоступен` печатал
+        # «доступен» ровно когда в stdout dig был NOERROR (stderr там
+        # заглушён). Возвращать же сырое тело dig, как делала прежняя
+        # фикстура, значило скормить старой пайп-команде ответ нового
+        # кода: nxdomain-проверка зазеленела на дефектном продукте.
+        out = dig[0] if isinstance(dig, tuple) else dig
+        return ('доступен' if 'NOERROR' in out else 'недоступен') + chr(10)
+
+    def _shell(self, dig):
+        # Две иглы — две формы носителя, порядок КРИТИЧЕН: прежняя команда
+        # продукта содержит и 'dig +timeout=2', и 'grep -q', поэтому игла
+        # пайпа обязана стоять первой, иначе старая команда получила бы
+        # сырой ответ dig как stdout пайпа (урок 1.27.0).
+        return FakeSSH(routes=[('cat /etc/resolv.conf', self.RESOLV),
+                               ('grep -q', self._pipe_answer(dig)),
+                               ('dig +timeout=2', dig)])
+
+    def test_live_server_answered_nxdomain_is_not_unavailable(self):
+        # Замер: NXDOMAIN приходит при rc=0 с полным выводом. Сервер жив.
+        # Прежний код по отсутствию слова NOERROR печатал «недоступен».
+        body = (';; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 26701'
+                + chr(10) + ';; QUERY: 1, ANSWER: 0, AUTHORITY: 1')
+        c = self._shell((body, '', 0))
+        joined = dns_mod.dns_resolvers_report(c)
+        assert self._unavailable_lines(joined) == [], joined
+        assert '1.1.1.1' in joined, joined
+
+    def test_missing_dig_is_unchecked_not_unavailable(self):
+        # rc=127: спрашивать было не чем. Прежний код печатал «недоступен»,
+        # и оператор ехал менять резолверы на хосте без bind-utils.
+        c = self._shell(('', 'bash: line 1: dig: command not found', 127))
+        joined = dns_mod.dns_resolvers_report(c)
+        assert self._unavailable_lines(joined) == [], joined
+        assert 'не проверено' in joined or 'не проверена' in joined, joined
+
+    def test_connection_refused_stays_unavailable(self):
+        # Контрпример против перелома: отказ сервера обязан остаться
+        # отказом. Замер: 'communications error to 127.0.0.1#53: connection
+        # refused' при rc=9 — это ОТВЕТ стека, а не наше молчание.
+        c = self._shell(('', ';; communications error to 127.0.0.1#53: '
+                             'connection refused', 9))
+        joined = dns_mod.dns_resolvers_report(c)
+        assert self._unavailable_lines(joined), joined
+
+    def test_noerror_stays_available(self):
+        # Замок от перелома: живой резолвер обязан остаться «доступен».
+        body = (';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1'
+                + chr(10) + ';; ANSWER SECTION:' + chr(10)
+                + 'google.com.  300 IN A 142.250.74.14')
+        c = self._shell((body, '', 0))
+        joined = dns_mod.dns_resolvers_report(c)
+        assert '1.1.1.1: доступен' in joined, joined
+
+    def test_no_probe_is_asked_with_blinded_channels(self):
+        # Поведенческий замок (урок 1.32.9): смотрим команды, реально
+        # ОТПРАВЛЕННЫЕ продуктом, а не текст исходника — докстринг
+        # покраснеть не может.
+        c = self._shell(('', '', 0))
+        dns_mod.dns_resolvers_report(c)
+        probes = [cmd for cmd in c.commands if 'dig ' in cmd and ' A' in cmd]
+        assert probes, c.commands
+        for cmd in probes:
+            assert '2>/dev/null' not in cmd, cmd
+            assert '||' not in cmd and '&&' not in cmd, cmd
+            assert '|' not in cmd, cmd
+
+
