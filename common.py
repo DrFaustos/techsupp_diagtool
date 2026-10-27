@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.16"
+__version__ = "1.32.17"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -148,17 +148,35 @@ def ensure_backup_dir(checker):
 
 
 def _backup_dir_note(backup_path, dinfo):
-    """Что сказать о каталоге бэкапов, если он не принимает запись.
+    """Что сказать о каталогах бэкапов, если прайс вернул ok=False.
 
-    Называется именно тот подкаталог, куда должен был лечь бэкап: лечение
-    «каталог не пишет» (права, занятое имя) другое, чем «файл не читается».
+    Лечение «каталог не пишет» (права, занятое имя) другое, чем «файл не
+    читается», поэтому отказ обязан называть НЕПИСАЮЩИЙ каталог полным путём.
+    Прежняя версия брала причину у пути, КУДА собирался лечь бэкап, и в мире
+    «crontab пишет, а configs — нет» печатала «каталог .../crontab недоступен
+    для записи» вообще без причины. Это нашла не фикстура, а живой прогон
+    1.32.17 (настоящий bash, temp-песочница, uid=1000): ok=False наступает,
+    когда отказал ЛЮБОЙ из пяти каталогов, а сообщение врало про пишущий путь
+    и уводило chmod не туда. Тот же корень серии: признак не различает миры.
+
+    Три мира, три разных сообщения:
+      отказал целевой  — прежний замок 1.32.16: назвать его и причину;
+      отказал другой   — назвать ОТКАЗАВШИЕ пути, целевой не поминать;
+      причин нет вовсе — сказать, что причина не названа (молчание — пробел).
     """
     if dinfo.get('ok'):
         return None
     subdir = os.path.dirname(backup_path)
-    why = dinfo.get('dirs', {}).get(subdir)
-    return ('каталог %s недоступен для записи%s'
-            % (subdir, ': ' + why if why else ''))
+    bad = dict((p, w) for p, w in (dinfo.get('dirs') or {}).items() if w)
+    if not bad:
+        return ('каталог %s недоступен для записи: причина не названа'
+                % subdir)
+    if subdir in bad:
+        why = bad[subdir]
+        return ('каталог %s недоступен для записи%s'
+                % (subdir, ': ' + why if why else ''))
+    return ('резерв не записан: %s'
+            % '; '.join('%s — %s' % (p, w) for p, w in bad.items()))
 
 def create_backup_info(checker, filepath, backup_type='configs'):
     """Резервная копия файла с временной меткой: {path, state, note}.
@@ -247,15 +265,133 @@ def create_backup(checker, filepath, backup_type='configs'):
     info = create_backup_info(checker, filepath, backup_type)
     return info['path'] if info['state'] == 'done' else None
 
-def save_crontab_backup(checker):
-    """Сохраняет текущий crontab в файл бэкапа. Возвращает путь или None."""
-    ensure_backup_dir(checker)
+
+CRONTAB_ABSENT_MARK = 'no crontab for'
+
+
+def crontab_read_info(checker):
+    """Текущий crontab: {state, text, note} — «ок» / «достоверно пусто» / «не прочитали».
+
+    Прежний читатель выбрасывал и код возврата, и канал:
+
+        out, _, _ = checker.run('crontab -l 2>/dev/null')
+
+    а пустой stdout даёт и «заданий нет», и «не удалось прочитать» (замер
+    живьём, подставной crontab с хранилищем заданий: rc=1 у обоих миров, а
+    текст причины — только в stderr, который как раз и уходил в /dev/null).
+    Следствие не косметика, а потеря данных: правка вида
+    `{ crontab -l 2>/dev/null; echo NEW; } | crontab -` при нечитаемом crontab
+    отправляет в crontab ОДНУ строку NEW, существующие задания стираются все
+    (замер: 3 из 3), а оператор читает rc=0 и «✅ Задание в crontab».
+
+    Поэтому признак живёт здесь, в ОДНОМ месте: закон серии — признак спрашивает
+    одна функция на весь проект (как unit_status_info в 1.32.6), иначе bitrix.py
+    начал бы различать «no crontab for» по-своему, а panels.py по-своему, и
+    коды разъехались бы релизами. Решает ПАРА (rc, текст канала), а не пустота
+    stdout: 'none' — достоверная пустота (rc=0 без содержательных символов либо
+    штатный ответ «no crontab for <user>»), 'failed' — «мы не спросили» (rc=127,
+    I/O, права) и обязан называться, а не становиться пустотой (1.32.13).
+    """
+    out, err, rc = checker.run('crontab -l')
+    text = out or ''
+    if rc == 0:
+        return {'state': 'ok' if text.strip() else 'none',
+                'text': text if text.strip() else '', 'note': ''}
+    low = ((err or '') + chr(10) + (out or '')).lower()
+    if CRONTAB_ABSENT_MARK in low:
+        # Хозяйка машины ещё не заводила crontab: это пустота, а не отказ.
+        # Ложная тревога здесь сломала бы штатную установку cron-агентов.
+        return {'state': 'none', 'text': '', 'note': ''}
+    why = _first_line(err) or _first_line(out) or 'нет вывода'
+    return {'state': 'failed', 'text': '',
+            'note': 'crontab -l вернул rc=%s: %s' % (rc, why)}
+
+
+def _crontab_backup_question(path):
+    """Один вопрос о crontab: прочитать в файл, убрать мусор, перечитать.
+
+    Прежняя форма решала по слову-маркеру и молча портила диск:
+
+        out, _, rc = checker.run(f'crontab -l > {path} 2>/dev/null && echo "ok"')
+        return backup_path if rc == 0 and out.strip() == 'ok' else None
+
+    Замер живьём (uid=1000, настоящий bash, подставной crontab с режимами):
+
+        ok      rc=0, stdout непустой ......... путь (норма)
+        empty   rc=0, stdout пуст ............. ПУТЬ К ПУСТОМУ ФАЙЛУ: откат из
+                                                него затирает рабочий crontab
+        nojob   rc=1 «no crontab for root» .... None + ПУСТОЙ .bak на диске
+        broken  rc=2 «bad thing happened» ..... None + ПУСТОЙ .bak
+        нет crontab в PATH (rc=127) ........... None + ПУСТОЙ .bak, причина
+                                                в 2>/dev/null
+
+    Редирект `> файл` создаёт файл ДО запуска crontab, поэтому отказ оставляет
+    файл, маскирующийся под бэкап, — уборка обязана ехать тем же спросом.
+    Пустой stdout при rc=1 неотличим от «заданий нет» по одному каналу, а
+    файл из одних переводов строки — не задания: разделителем служит
+    `grep -q '[^[:space:]]'` и ЕГО код (0 — есть содержательный символ,
+    1 — достоверно пусто, >1 — grep не смог: это «мы не спросили», а не
+    «заданий нет»). Завершающее `cat` отдаёт содержимое обратно: право на
+    «готово» даёт перечитанный непустой файл, а не обещание редиректа
+    (закон серии 1.32.6 — 1.32.16). Слова-маркера, `&&` и `2>/dev/null` в
+    спросе нет; цена прежняя — один вопрос на бэкап.
+    """
+    f = q(path)
+    return ('crontab -l > ' + f + '; r=$?'
+            '; if [ $r -ne 0 ]; then rm -f ' + f + '; exit $r; fi'
+            '; grep -q \'[^[:space:]]\' ' + f + ' 2>&1; g=$?'
+            '; if [ $g -gt 1 ]; then rm -f ' + f + '; exit $g; fi'
+            '; if [ $g -eq 1 ]; then rm -f ' + f + '; exit 0; fi'
+            '; cat -- ' + f + ' 2>&1')
+
+
+def save_crontab_backup_info(checker):
+    """Резервная копия текущего crontab: {state, path, note}.
+
+    state — 'done' (файл перечитан непустым), 'empty' (crontab достоверно не
+    содержит заданий) или 'failed' (причина названа в note). 'empty' и 'failed'
+    давали прежний `None` неотличимо друг от друга и от успеха-с-путём-к-пустому
+    файлу; потребителю нужно третье: правка crontab без прочитанного оригинала
+    перезаписывает весь файл одной новой строкой (замер живьём: потеряны все
+    существующие задания, а оператор прочитал rc=0 и «✅»).
+    """
+    dinfo = ensure_backup_dir_info(checker)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_path = f"{BACKUP_SUBDIRS['crontab']}/crontab.{timestamp}.bak"
-    out, _, rc = checker.run(f'crontab -l > {q(backup_path)} 2>/dev/null && echo "ok"')
-    if rc == 0 and out.strip() == 'ok':
-        return backup_path
-    return None
+    backup_path = "%s/crontab.%s.bak" % (BACKUP_SUBDIRS['crontab'], timestamp)
+    if not dinfo['ok']:
+        # Каталог не принимает запись — нечего и соваться: прежний код писал
+        # crontab в read-only каталог и печатал путь как успех.
+        return {'state': 'failed', 'path': None,
+                'note': _backup_dir_note(backup_path, dinfo) or ''}
+    out, err, rc = checker.run(_crontab_backup_question(backup_path))
+    if rc != 0:
+        # rc=1 со словами «no crontab for <user>» — штатный ответ cronie на
+        # машине, где crontab ещё не заводили. Это ДОСТОВЕРНАЯ пустота, а не
+        # отказ: живой прогон 1.32.17 показал ложную тревогу в первом GREEN —
+        # bitrix_cron_install отменял штатную установку cron-агентов. Признак
+        # берётся тот же, что у crontab_read_info (один носитель на проект).
+        low = ((err or '') + chr(10) + (out or '')).lower()
+        if CRONTAB_ABSENT_MARK in low:
+            return {'state': 'empty', 'path': None, 'note': ''}
+        why = _first_line(err) or _first_line(out) or 'нет вывода'
+        return {'state': 'failed', 'path': None,
+                'note': 'crontab -l вернул rc=%s: %s' % (rc, why)}
+    if not (out or '').strip():
+        # rc=0 и перечитывание пустое: заданий нет. Файл убран тем же спросом,
+        # поэтому «бэкап создан» тут сказать нечем.
+        return {'state': 'empty', 'path': None, 'note': ''}
+    return {'state': 'done', 'path': backup_path, 'note': ''}
+
+
+def save_crontab_backup(checker):
+    """Сохраняет текущий crontab в файл бэкапа. Возвращает путь или None.
+
+    Тонкая обёртка над save_crontab_backup_info: потребители (bitrix.py,
+    diagnostic) завязаны на path|None. Кто обязан различать «заданий нет»,
+    «не прочитали» и «не куда писать» — берёт save_crontab_backup_info.
+    """
+    info = save_crontab_backup_info(checker)
+    return info['path'] if info['state'] == 'done' else None
 
 
 def write_remote_file(checker, filepath, content):

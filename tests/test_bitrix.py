@@ -828,15 +828,21 @@ class TestMailSend:
 
 
 # ==================== установка cron-агентов ====================
-# Порядок маршрутов: игла '| crontab -' — подстрока КОМАНДЫ УСТАНОВКИ
-# ({ crontab -l 2>/dev/null; echo ...; } | crontab -), поэтому она обязана
-# стоять раньше 'crontab -l 2>/dev/null', иначе установка получила бы ответ
-# от маршрута чтения текущего crontab.
-def _install_routes(grep_out='', cur='', setup=('', '', 0)):
+# Иглы описывают ФОРМУ команд, а не контракт, и с 1.32.17 форма сменилась:
+# 2>/dev/null из спросов ушёл (он прятал ровно ту строку, что отличает
+# «не прочитали» от «заданий нет»), поэтому игла чтения — просто 'crontab -l'.
+# Порядок маршрутов решает (первое совпадение выигрывает): '| crontab -' —
+# подстрока команды установки, она раньше всех; 'crontab -l >' — команда
+# бэкапа, она обязана стоять раньше широкой 'crontab -l', иначе бэкап получил
+# бы ответ чтения текущего crontab и тест «бэкап до правки» краснел бы по
+# неверной причине (тот же закон, что записан в tests/support.py про иглы).
+def _install_routes(grep_out='', cur='', setup=('', '', 0),
+                    backup=('0 3 * * * /usr/sbin/logrotate\n', '', 0)):
     return [
         ('| crontab -', setup),
-        ('crontab -l 2>/dev/null | grep', grep_out),
-        ('crontab -l 2>/dev/null', cur),
+        ('| grep -F cron.sh', grep_out),
+        ('crontab -l >', backup),
+        ('crontab -l', cur),
         ('test -f', 'ok'),
     ]
 
@@ -1470,3 +1476,62 @@ class TestMailLogDebianPath:
         assert 'лог может писаться' not in out
         assert 'ls -l /var/log/mail*' in out         # ручная проверка осталась
         assert 'повторите через минуту' in out       # асинхронность postfix
+
+# ============ 1.32.17: «не прочитали crontab» не равно «crontab пуст» ============
+# Замер живьём (подставной crontab с хранилищем заданий + настоящий bash):
+#   здоровый мир .......... { crontab -l 2>/dev/null; echo NEW; } | crontab -
+#                           -> 4 строки, существующие задания целы
+#   чтение не удалось (rc=1, stdout пуст) -> в crontab ушла ОДНА строка NEW,
+#                           ВСЕ существующие задания ПОТЕРЯНЫ, а оператор
+#                           прочитал rc=0 и «✅ Задание в crontab».
+# Причина: боевой код выбрасывает rc чтения, а «не удалось прочитать» и
+# «заданий нет» дают одинаковый пустой stdout (2>/dev/null ещё и прячет
+# причину). Тот же корень серии, но носитель дороже остальных: data loss.
+CR_READ_FAIL = ('', 'crontab: cannot open: Input/output error\n', 1)
+CR_BACKUP_FAIL = ('', 'crontab: cannot create: Read only file system\n', 1)
+CR_TWO = ('0 3 * * * /usr/sbin/logrotate\n'
+          '*/10 * * * * /opt/monitor/check.sh\n')
+
+
+class TestCronInstallReadsBeforeWriting:
+    # Иглы: «| crontab -» — подстрока команды установки, поэтому она раньше
+    # всех. «| grep -F cron.sh» берётся ХВОСТОМ команды, а не участком с
+    # 2>/dev/null: форма перечитки меняется этим же слайсом, и игла обязана
+    # пережить смену формы (иначе тест покраснеет по неверной причине).
+    @staticmethod
+    def _routes(read, backup=('', '', 0), setup=('', '', 0), grep=''):
+        return [('| crontab -', setup),
+                ('| grep -F cron.sh', grep),
+                ('crontab -l >', backup),
+                ('crontab -l', read),
+                ('test -f', 'ok')]
+
+    def test_unreadable_crontab_aborts_without_writing(self):
+        c = FakeSSH(routes=self._routes(CR_READ_FAIL))
+        out = bx.bitrix_cron_install(c)
+        assert '❌' in out
+        assert 'Input/output error' in out
+        assert c.find('| crontab -') is None
+        assert c.find('crontab -l >') is None   # и бэкап не пишем наугад
+
+    def test_failed_backup_blocks_the_edit(self):
+        # Задания есть, а резерв не записался: правка без отката опаснее
+        # отказа. Прежний код печатал «⚠️ бэкап не требуется» и правил.
+        c = FakeSSH(routes=self._routes(CR_TWO, backup=CR_BACKUP_FAIL))
+        out = bx.bitrix_cron_install(c)
+        assert '❌' in out
+        assert 'Read only file system' in out
+        assert c.find('| crontab -') is None
+
+    def test_healthy_install_keeps_reading_reason_channel(self):
+        # Норма обязана остаться нормой: установка идёт, бэкап назван, а
+        # перечитывание внутри команды установки не прячет причину в
+        # /dev/null (иначе «не прочитали» снова станет «заданий нет»).
+        c = FakeSSH(routes=self._routes(CR_TWO, backup=(CR_TWO, '', 0),
+                                        grep=bx.CRON_LINE))
+        out = bx.bitrix_cron_install(c)
+        assert '✅ Задание в crontab:' in out
+        assert 'Резервная копия crontab:' in out
+        setup = c.find('| crontab -')
+        assert setup is not None
+        assert 'crontab -l 2>/dev/null' not in setup

@@ -9,7 +9,8 @@ Access denied для пользователя БД из dbconn.php, молчащ
 import re
 from datetime import datetime, timezone
 
-from common import (q, save_crontab_backup, write_remote_file,
+from common import (q, save_crontab_backup_info, crontab_read_info,
+                    write_remote_file,
                     prepare_secret_file, remove_remote_path,
                     count_find_info,
                     # Признак юнита спрашивает ОДНА функция на весь проект
@@ -1062,25 +1063,47 @@ def bitrix_cron_install(checker):
         lines.append(f'❌ {CRON_SH} не найден — добавлять в cron нечего')
         return '\n'.join(lines)
 
-    out, _, _ = checker.run('crontab -l 2>/dev/null')
-    existing = [ln for ln in out.splitlines() if CRON_SH in ln]
+    read = crontab_read_info(checker)
+    if read['state'] == 'failed':
+        # «Не прочитали» и «заданий нет» дают одинаково пустой stdout, а
+        # правка ниже перезаписывает ВЕСЬ crontab одной строкой: замер
+        # живьём — существующие задания стёрты все, оператор видел rc=0 и
+        # «✅». Поэтому непрочитанный оригинал отменяет правку.
+        lines.append(f'❌ Текущий crontab не прочитан ({read["note"]}) — '
+                     f'правку отменяю: иначе существующие задания будут стёрты')
+        return '\n'.join(lines)
+
+    existing = [ln for ln in read['text'].splitlines() if CRON_SH in ln]
     if existing:
         lines.append('⚠️ Задание cron.sh уже есть в crontab, дублировать не буду:')
         lines.extend('   ' + ln for ln in existing)
         return '\n'.join(lines)
 
-    backup = save_crontab_backup(checker)
-    lines.append(f'✅ Резервная копия crontab: {backup}' if backup
-                 else '⚠️ Текущий crontab пуст — бэкап не требуется')
+    binfo = save_crontab_backup_info(checker)
+    if binfo['state'] == 'failed':
+        # Задания прочитаны, а резерв не записался: правка без возможности
+        # откатить опаснее отказа. Прежний код печатал «бэкап не требуется»
+        # (False неотличимо от «пусто») и правил.
+        lines.append(f'❌ Резервная копия crontab не записана: {binfo["note"]} — '
+                     f'правку отменяю')
+        return '\n'.join(lines)
+    if binfo['state'] == 'done':
+        lines.append(f'✅ Резервная копия crontab: {binfo["path"]}')
+    else:
+        lines.append('ℹ️ Текущий crontab пуст — бэкап не требуется')
 
+    # Чтение внутри конструкции обязано не прятать причину: 2>/dev/null
+    # превращал «не прочитали» в «заданий нет» ровно здесь (1.32.17).
     out, err, rc = checker.run(
-        f'{{ crontab -l 2>/dev/null; echo {q(CRON_LINE)}; }} | crontab - 2>&1')
+        f'{{ crontab -l; echo {q(CRON_LINE)}; }} | crontab - 2>&1')
     if rc != 0:
         lines.append(f'❌ crontab не принял строку (rc={rc}): '
                      f'{(out or err).strip() or "нет вывода"}')
         return '\n'.join(lines)
 
-    out, _, _ = checker.run('crontab -l 2>/dev/null | grep -F cron.sh')
+    # Перечитывание: код возврата конвейера принадлежит grep, поэтому решение
+    # — непустота ответа, а не rc (урок 1.32.3 про rc конвейера).
+    out, _, _ = checker.run('crontab -l | grep -F cron.sh')
     if out.strip():
         lines.append('✅ Задание в crontab:')
         lines.append(out.strip())

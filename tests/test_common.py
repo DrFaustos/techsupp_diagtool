@@ -1831,3 +1831,309 @@ class TestEnsureBackupDirInfo:
         assert 'cp вернул rc=1' in info['note']
         assert 'недоступен для записи' in info['note']
         assert '/root/tech_support/configs' in info['note']
+
+# ===== CRONTAB-БЭКАП: «пусто» и «не смогли спросить» — не одно и то же =====
+# Замер живьём (настоящий /bin/bash, подставной crontab с режимами, uid=1000).
+# Боевая строка
+#
+#     out, _, rc = checker.run(f'crontab -l > {q(backup_path)} 2>/dev/null && echo "ok"')
+#     if rc == 0 and out.strip() == 'ok':
+#         return backup_path
+#     return None
+#
+# решала по слову «ok», которое печатает сама оболочка, и по редиректу,
+# который создаёт файл ДО запуска crontab. Замеренные миры:
+#   ok      rc=0, stdout непустой ........ путь к файлу (норма)
+#   empty   rc=0, stdout пуст ............ ПУТЬ К ПУСТОМУ ФАЙЛУ: «бэкап готов»,
+#                                         восстановление из него затирает crontab
+#   nojob   rc=1 (stderr «no crontab») ... None + ПУСТОЙ .bak на диске
+#   broken  rc=2 (stderr «bad thing») .... None + ПУСТОЙ .bak
+#   нет crontab в PATH rc=127 ............ None + ПУСТОЙ .bak, причина в /dev/null
+# То есть «заданий нет» и «мы не смогли прочитать» дают одно и то же решение,
+# а отказ оставляет файл, маскирующийся под бэкап. Тот же корень серии
+# 1.32.6 - 1.32.16: признак, который не различает миры.
+CR_DONE = ('0 * * * * /usr/bin/backup.sh\n', '', 0)
+CR_EMPTY = ('', '', 0)
+CR_NOJOB = ('', 'no crontab for root\n', 1)
+CR_GONE = ('', 'bash: line 1: crontab: command not found\n', 127)
+WPROBE_DENIED = ('/root/tech_support/configs/.wprobe: Отказано в доступе',
+                 '', 1)
+
+
+class TestSaveCrontabBackupInfo:
+    def test_nonempty_crontab_is_done_with_path(self):
+        # Норма обязана остаться нормой: ложная тревога дороже ложного успеха.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_DONE)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'done'
+        assert info['path'] and info['path'].endswith('.bak')
+        assert info['note'] == ''
+
+    def test_empty_crontab_is_empty_not_a_finished_backup(self):
+        # ГЛАВНЫЙ RED: прежний код возвращал путь к пустому файлу. Пустой
+        # бэкап — не бэкап: откат из него затирает рабочий crontab.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_EMPTY)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'empty'
+        assert info['path'] is None
+
+    def test_genuine_failure_is_named_with_rc_and_text(self):
+        # ПЕРЕСМОТРЕНО живым прогоном 1.32.17. Прежняя версия этого теста
+        # требовала failed от rc=1 «no crontab for root» — то есть закрепляла
+        # ложную тревогу: на машине без заведённого crontab это штатная
+        # пустота, и она же ловится отдельным тестом ниже. Настоящий отказ —
+        # другой носитель: rc=2 и ни слова про отсутствие crontab.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >',
+                             ('', 'crontab: bad thing happened\n', 2))])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'failed'
+        assert info['path'] is None
+        assert 'rc=2' in info['note']
+        assert 'bad thing happened' in info['note']
+
+    def test_missing_utility_is_not_reported_as_empty(self):
+        # «Утилиты нет» — это «мы не спросили», а не «задач нет» (закон
+        # 1.32.13). Пустой stdout при rc=127 неотличим от empty по одному
+        # каналу, поэтому решает код возврата, а не непустота вывода.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_GONE)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'failed'
+        assert '127' in info['note']
+
+    def test_refusal_uses_one_question_and_removes_the_trash(self):
+        # Редирект создаёт файл до crontab, поэтому уборка обязана ехать тем
+        # же спросом: цена не растёт, мусор не остаётся.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_NOJOB)])
+        common.save_crontab_backup_info(c)
+        sent = [s for s in c.commands if 'crontab -l >' in s]
+        assert len(sent) == 1, c.commands
+        assert 'rm -f' in sent[0], sent[0]
+
+    def test_marker_word_and_devnull_are_gone(self):
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_DONE)])
+        common.save_crontab_backup_info(c)
+        for s in c.commands:
+            assert '&&' not in s, s
+            assert '2>/dev/null' not in s, 'причина снова в /dev/null'
+            assert 'echo "ok"' not in s and "echo 'ok'" not in s, s
+
+    def test_backup_path_needle_is_preserved(self):
+        # Потребители и прежние тесты ищут «crontab -l > <путь>»; форма
+        # меняется, игла остаётся.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_DONE)])
+        info = common.save_crontab_backup_info(c)
+        assert c.find('crontab -l > ' + info['path']) is not None
+
+    def test_unwritable_catalog_is_failed_and_is_not_written_to(self):
+        # Прайс 1.32.16: каталог обязан выдержать пробную запись. Здесь она
+        # отклонена, а mkdir молчит, поэтому прежний код ушёл бы писать
+        # crontab в каталог, который не принимает.
+        c = FakeSSH(routes=[('.wprobe', WPROBE_DENIED),
+                            ('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_DONE)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'failed'
+        assert info['path'] is None
+        assert 'недоступен для записи' in info['note']
+        assert c.find('crontab -l >') is None
+
+    def test_wrapper_stays_path_or_none(self):
+        # Обратная совместимость: bitrix.py и прежние тесты завязаны на
+        # path|None.
+        ok = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                             ('crontab -l >', CR_DONE)])
+        assert common.save_crontab_backup(ok).endswith('.bak')
+        empty = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                                ('crontab -l >', CR_EMPTY)])
+        assert common.save_crontab_backup(empty) is None
+        dead = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                               ('crontab -l >', CR_NOJOB)])
+        assert common.save_crontab_backup(dead) is None
+
+    def test_done_is_paid_by_reread_not_by_rc_alone(self):
+        # Право на «готово» даёт перечитанный непустой файл: rc=0 с пустым
+        # перечитыванием — это empty, а не done (закон 1.32.15).
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', ('', '', 0))])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'empty'
+
+# ===== 1.32.17: «crontab прочитан», «заданий нет» и «не прочитали» — три мира =====
+# Носитель обязан жить в ОДНОМ месте (закон серии: признак спрашивает одна
+# функция на весь проект — как unit_status_info в 1.32.6). Иначе bitrix.py
+# начнёт различать «no crontab for root» по-своему, panels.py — по-своему, и
+# коды разъедутся релизами.
+#
+# Замер живьём (настоящий /bin/bash, uid=1000). ЧЕСТНО О ДАННЫХ: на машине
+# замера утилиты crontab НЕТ (замер: rc=127, stderr
+# «bash: строка 9: crontab: command not found»), поэтому миры «заданий нет» и
+# «I/O ошибка» сняты подставным crontab из localize13217*.py, а текст
+# «no crontab for <user>» — штатный ответ cronie/vixie-реализации. Измеренное
+# здесь не оспаривается и без утилиты:
+#   заданий нет достоверно ... rc=1, stderr «no crontab for <user>»
+#   I/O ошибка ............... rc=1, stderr «crontab: cannot open: ...»
+#   утилиты нет в PATH ....... rc=127, stderr «command not found» (замер живьём)
+# У «задач нет» и «не прочитали» ОДИНАКОВЫЙ rc=1 и одинаково пустой stdout:
+# решает пара (rc, текст канала), а не пустота stdout. Отмерен и разделитель
+# пустоты (настоящий grep): тело -> rc=0, пустой файл и файл из пробелов ->
+# rc=1, отсутствующий файл -> rc=2, то есть «мы не спросили» отличается от
+# «там пусто». Прежний боевой код бросал и rc, и канал (crontab -l
+# 2>/dev/null), поэтому мир «не прочитали» печатал оператору «Текущий crontab
+# пуст», а правка { crontab -l 2>/dev/null; echo NEW; } | crontab - стирала
+# все задания (замер с хранилищем: потеряны 3 из 3, оператор видел rc=0 и ✅).
+CR_TEXT = '0 3 * * * /usr/sbin/logrotate\n*/10 * * * * /opt/monitor/check.sh\n'
+CR_NONE = ('', 'no crontab for root\n', 1)
+CR_IO_FAIL = ('', 'crontab: cannot open: Input/output error\n', 1)
+CR_NO_UTILITY = ('', 'bash: line 1: crontab: command not found\n', 127)
+
+
+class TestCrontabReadInfo:
+    def test_read_crontab_is_ok_with_its_text(self):
+        c = FakeSSH(routes=[('crontab -l', (CR_TEXT, '', 0))])
+        info = common.crontab_read_info(c)
+        assert info['state'] == 'ok'
+        assert info['text'] == CR_TEXT
+        assert info['note'] == ''
+
+    def test_no_crontab_yet_is_none_not_failed(self):
+        # Самым частый мир на чистых машинах: rc=1 со словами «no crontab
+        # for». Это ДОСТОВЕРНАЯ пустота, а не сбой: ложная тревога здесь
+        # сломала бы штатную установку cron-агентов.
+        c = FakeSSH(routes=[('crontab -l', CR_NONE)])
+        info = common.crontab_read_info(c)
+        assert info['state'] == 'none'
+        assert info['text'] == ''
+        assert info['note'] == ''
+
+    def test_read_error_is_failed_and_names_rc_and_reason(self):
+        # Тот же rc=1, что у «задач нет», но другой канал: признак обязан
+        # различать миры, иначе «не проверено» станет «проверено и пусто».
+        c = FakeSSH(routes=[('crontab -l', CR_IO_FAIL)])
+        info = common.crontab_read_info(c)
+        assert info['state'] == 'failed'
+        assert 'rc=1' in info['note']
+        assert 'Input/output error' in info['note']
+
+    def test_missing_utility_is_failed_not_none(self):
+        # «Утилиты нет» — это «мы не спросили» (закон 1.32.13).
+        c = FakeSSH(routes=[('crontab -l', CR_NO_UTILITY)])
+        info = common.crontab_read_info(c)
+        assert info['state'] == 'failed'
+        assert '127' in info['note']
+
+    def test_silence_with_zero_rc_is_none(self):
+        # rc=0 и пустой вывод: утилита ответила и ничего не вернула —
+        # достоверная пустота. Молчание БЕЗ ответа (rc неизвестен) в этом
+        # мире задаётся маршрутом, поэтому default здесь не при чём.
+        c = FakeSSH(routes=[('crontab -l', ('', '', 0))])
+        assert common.crontab_read_info(c)['state'] == 'none'
+
+    def test_question_has_no_devnull_and_no_marker(self):
+        # Причина обязана доезжать до python: 2>/dev/null прятал ровно ту
+        # строку, которая отличает «не прочитали» от «заданий нет».
+        c = FakeSSH(routes=[('crontab -l', (CR_TEXT, '', 0))])
+        common.crontab_read_info(c)
+        sent = c.find_all('crontab')
+        assert len(sent) == 1, c.commands
+        assert '2>/dev/null' not in sent[0], sent[0]
+        assert '&&' not in sent[0] and '||' not in sent[0], sent[0]
+
+# ===== 1.32.17-D: отказ обязан называть НЕПИСАЮЩИЙ каталог, а не нужный =====
+# Найдено ЖИВЫМ верификатором (настоящий bash, temp-песочница, uid=1000), а не
+# фикстурой: прайс 1.32.16 честно спрашивает пять каталогов и говорит ok=False,
+# когда отказал ЛЮБОЙ из них. Прежний _backup_dir_note брал причину у пути,
+# КУДА собирался лечь бэкап, и в мире «crontab пишет, а configs — нет» печатал
+# «каталог /…/crontab недоступен для записи» вообще без причины. Сообщение,
+# которое врало про пишущий путь и уводило лечение (chmod) не туда — тот же
+# корень серии: признак не различает миры.
+WPROBE_OK = ('', '', 0)
+CR_BROKEN = ('', 'crontab: bad thing happened\n', 2)
+
+
+class TestBackupNoteNamesTheRefusingCatalog:
+    def test_writable_target_is_not_blamed_for_another_catalog(self):
+        # configs не принимает запись, crontab — принимает. Прежний note
+        # утверждал, что crontab недоступен: ложь про пишущий путь.
+        c = FakeSSH(routes=[('configs/.wprobe', WPROBE_DENIED),
+                            ('.wprobe', WPROBE_OK),
+                            ('crontab -l >', CR_DONE)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'failed'
+        assert '/root/tech_support/configs' in info['note'], info['note']
+        assert 'Отказано в доступе' in info['note'], info['note']
+        target = common.BACKUP_SUBDIRS['crontab']
+        assert ('каталог %s недоступен' % target) not in info['note'], \
+            info['note']
+
+    def test_when_target_itself_refuses_it_is_named_with_reason(self):
+        # Прежний замок 1.32.16 сохранён: если не пишет именно целевой
+        # каталог, он и обязан быть назван полным путём с причиной.
+        c = FakeSSH(routes=[('crontab/.wprobe', WPROBE_DENIED),
+                            ('.wprobe', WPROBE_OK),
+                            ('crontab -l >', CR_DONE)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'failed'
+        assert common.BACKUP_SUBDIRS['crontab'] in info['note']
+        assert 'недоступен для записи' in info['note'], info['note']
+
+    def test_every_refusing_catalog_is_listed(self):
+        # Отказали два каталога — отказ обязан назвать оба: оператор лечит
+        # конкретные пути, а не один «наугад».
+        c = FakeSSH(routes=[('configs/.wprobe', WPROBE_DENIED),
+                            ('swap/.wprobe', WPROBE_DENIED),
+                            ('.wprobe', WPROBE_OK),
+                            ('crontab -l >', CR_DONE)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'failed'
+        assert '/root/tech_support/configs' in info['note'], info['note']
+        assert '/root/tech_support/swap' in info['note'], info['note']
+
+    def test_wrapper_returns_none_when_another_catalog_refuses(self):
+        # path|None: «не куда писать» обязан быть None, даже если целевой
+        # каталог как раз пишет (решает прайс, а не догадка о целевом).
+        c = FakeSSH(routes=[('configs/.wprobe', WPROBE_DENIED),
+                            ('.wprobe', WPROBE_OK),
+                            ('crontab -l >', CR_DONE)])
+        assert common.save_crontab_backup(c) is None
+
+
+# ===== 1.32.17-D2: «no crontab for root» — достоверная пустота, а не отказ ====
+# Живой прогон показал ложную тревогу в моём же первом GREEN: rc=1 со словами
+# «no crontab for <user>» — штатный ответ cronie/vixie на машине, где crontab
+# ещё не заводили. Прежний разбор относил его к failed, и bitrix_cron_install
+# отменял ШТАТНУЮ установку cron-агентов. Различать обязан носитель
+# (rc, текст канала), а не один rc — тот же закон, что у crontab_read_info.
+class TestNoCrontabYetIsNotAFailure:
+    def test_absent_crontab_is_empty_and_leaves_no_file(self):
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_NOJOB)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'empty', info
+        assert info['path'] is None
+        assert info['note'] == ''
+        sent = [s for s in c.commands if 'crontab -l >' in s]
+        assert len(sent) == 1 and 'rm -f' in sent[0], c.commands
+
+    def test_genuine_failure_stays_failed_with_rc_and_text(self):
+        # Настоящий отказ (rc=2, ни слова про отсутствие crontab) обязан
+        # остаться failed: пустота «заданий нет» не имеет права гасить
+        # реальный сбой.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_BROKEN)])
+        info = common.save_crontab_backup_info(c)
+        assert info['state'] == 'failed', info
+        assert 'rc=2' in info['note']
+        assert 'bad thing happened' in info['note']
+
+    def test_wrapper_returns_none_for_absent_crontab(self):
+        # path|None сохранён: «заданий нет» — это не путь к пустому файлу.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_NOJOB)])
+        assert common.save_crontab_backup(c) is None

@@ -18,6 +18,7 @@
 from common import (  # noqa: F401
     BACKUP_DIR, BACKUP_SUBDIRS, LOG_PATHS, DOMAIN_PATHS,
     q, ensure_backup_dir, create_backup, save_crontab_backup,
+    save_crontab_backup_info, crontab_read_info,
     write_remote_file, find_files, find_files_info, find_file,
     find_file_info, read_file_content, read_file_info, log_reader,
     get_domain_from_config,
@@ -104,6 +105,7 @@ from fmanager import (  # noqa: F401
 __all__ = [
     'BACKUP_DIR', 'BACKUP_SUBDIRS', 'LOG_PATHS', 'DOMAIN_PATHS',
     'q', 'ensure_backup_dir', 'create_backup', 'save_crontab_backup',
+    'save_crontab_backup_info', 'crontab_read_info',
     'write_remote_file', 'find_files', 'find_files_info', 'find_file',
     'find_file_info', 'read_file_content', 'read_file_info', 'log_reader',
     'get_domain_from_config',
