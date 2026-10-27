@@ -346,6 +346,12 @@ class TestRestartServices:
     ROUTES = [
         ('^apache2.service', 'no\n'),
         ('list-unit-files', 'yes\n'),
+        # Форма команды принадлежит примитиву 1.32.6, а не тесту. Замер по
+        # журналу двойника: q() — shlex.quote, для имени без пробелов кавычек
+        # НЕТ, запрос звучит как is-active nginx. Кавычки возникают только на
+        # именах с пробелом (php 8.2-fpm — тест 1.32.6), поэтому игла обязана
+        # описывать снятую форму, а не ожидание: иначе тест краснеет по
+        # несущественной причине (урок 1.27.0 про зелёный по неверной причине).
         ('is-active nginx', 'active\n'),
         ('is-active mysql', ['inactive\n', 'active\n']),
     ]
@@ -357,9 +363,83 @@ class TestRestartServices:
         assert '⏭️ apache2 не установлен' in joined
 
     def test_restart_failure_reported(self):
-        # unit есть, но is-active всегда пусто -> fallback не спасает
-        c = FakeSSH(routes=[('list-unit-files', 'yes\n')])
+        # Прежняя фикстура НЕ имела маршрута на is-active, то есть кодировала
+        # ровно дефектное поведение: молчание = красный диагноз. Молчание теперь
+        # оформлен как пробел (TestRestartServicesUnchecked), поэтому красному
+        # вердикту дан честный вход — настоящий ответ inactive. Замер живьём:
+        # остановленная служба отвечает rc=1, и это ОТВЕТ, а не молчание.
+        c = FakeSSH(routes=[('list-unit-files', 'yes\n'),
+                            ('is-active', 'inactive\n')])
         joined = '\n'.join(files_mod.restart_services(c))
         assert '❌ nginx не запустился' in joined
         # для nginx: reload + is-active + restart(fallback) + is-active
         assert c.count('is-active nginx') == 2
+
+
+class TestRestartServicesUnchecked:
+    """Молчание systemctl не даёт права ни на красный диагноз, ни на restart.
+
+    Прежний код решал по пустой строке: `systemctl is-active UNIT 2>/dev/null`
+    на хосте без systemd отвечает пустым stdout при rc=1 (замер живьём: причина
+    «System has not been booted with systemd as init system (PID 1). Can't
+    operate.» живёт в stderr, который как раз и глушил 2>/dev/null). Пустота
+    означала «не активно», и по ней инструмент делал ЛИШНИЙ `systemctl restart`
+    (fallback) по непроверенному состоянию и печатал «не запустился».
+
+    Двойник тут честен как бой: без маршрута он отвечает пустой stdout при
+    rc=0, значит признак обязан держаться непустоты stdout, а не кода возврата
+    (замер: inactive и offline отвечают rc=1).
+    """
+
+    ROUTES = [('list-unit-files', 'yes')]
+
+    def _silence(self):
+        # Маршрута на is-active нет вовсе: система ничего не ответила.
+        return FakeSSH(routes=list(self.ROUTES))
+
+    def test_silence_does_not_trigger_extra_restart(self):
+        # nginx перезагружается (reload), значит любое systemctl restart для
+        # него — это fallback, то есть действие по непроверенному признаку.
+        c = self._silence()
+        files_mod.restart_services(c)
+        assert c.find('systemctl restart nginx') is None, c.commands
+        # Спросить ещё раз после вылечивающего действия, которое не
+        # предпринималось, нечего: по nginx вопрос обязан остаться одним.
+        # Счёт по всем службам был бы незадовлетворяемым замком: служб в цикле
+        # три (nginx/mysql/apache2), у каждой свой вопрос, и после честного
+        # GREEN общее число равно 3 — тест краснел бы и на правильном коде.
+        assert c.count('is-active nginx') == 1, c.commands
+
+    def test_silence_is_named_as_unchecked_with_the_reason(self):
+        c = self._silence()
+        joined = '\n'.join(files_mod.restart_services(c))
+        assert 'не проверено' in joined, joined
+        assert 'systemd' in joined, 'причина обязана доехать до оператора'
+
+    def test_silence_is_not_a_red_verdict(self):
+        # Смотрим на знак диагноза, а не на отдельное слово: заметка о пробеле
+        # сама содержит отрицание прежнего вердикта.
+        c = self._silence()
+        joined = '\n'.join(files_mod.restart_services(c))
+        assert '❌' not in joined, joined
+
+    def test_channels_are_not_blinded(self):
+        # Замок на форму команды: 2>/dev/null прячет причину отказа, а признак
+        # обязан различать «ответили inactive» и «не ответили».
+        c = self._silence()
+        files_mod.restart_services(c)
+        cmd = c.find('is-active')
+        assert cmd is not None
+        assert '2>/dev/null' not in cmd and '2>&1' not in cmd, cmd
+
+    def test_real_inactive_still_gets_the_fallback_and_the_red(self):
+        # Контрпример: настоящий ответ системы обязан сохранить и прежний путь
+        # (fallback restart), и прежний красный вердикт без признаний. Игла
+        # выбрана так, чтобы матроваться и до, и после смены формы команды,
+        # иначе тест был бы зелёным по неверной причине (урок 1.27.0).
+        c = FakeSSH(routes=[('list-unit-files', 'yes'),
+                            ('is-active', 'inactive')])
+        joined = '\n'.join(files_mod.restart_services(c))
+        assert '❌ nginx не запустился' in joined, joined
+        assert c.count('systemctl restart nginx') == 1, c.commands
+        assert 'не проверено' not in joined, joined

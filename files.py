@@ -4,7 +4,13 @@ from datetime import datetime
 
 from common import (BACKUP_SUBDIRS, q, ensure_backup_dir, create_backup,
                     write_remote_file, RF_TEXT, read_file_info,
-                    find_files_info, FF_DIR_TEXT)
+                    find_files_info, FF_DIR_TEXT,
+                    # Состояние юнита спрашивает ОДНА функция (1.32.6):
+                    # пустой stdout systemctl — «система не ответила», и
+                    # решать по нему нельзя нигде. Здесь это дороже отчёта:
+                    # по молчанию делался лишний restart и печатался
+                    # красный «не запустился».)
+                    unit_status_info)
 
 
 # ==================== РАБОТА С ФАЙЛАМИ (С БЭКАПАМИ) ====================
@@ -292,18 +298,37 @@ def restart_services(checker):
     }
     for svc, action in services.items():
         out, _, _ = checker.run(f'systemctl list-unit-files | grep -q "^{svc}.service" && echo "yes" || echo "no"')
-        if out.strip() == 'yes':
-            _, _, arc = checker.run(f'systemctl {action} {svc} 2>/dev/null')
-            status, _, _ = checker.run(f'systemctl is-active {svc} 2>/dev/null')
-            if status.strip() == 'active':
-                lines.append(f"✅ {svc} ({action}) выполнен")
-            else:
-                _, _, rrc = checker.run(f'systemctl restart {svc} 2>/dev/null')
-                status2, _, _ = checker.run(f'systemctl is-active {svc} 2>/dev/null')
-                if status2.strip() == 'active':
-                    lines.append(f"✅ {svc} перезапущен (fallback)")
-                else:
-                    lines.append(f"❌ {svc} не запустился (rc={rrc}, reload rc={arc})")
-        else:
+        if out.strip() != 'yes':
             lines.append(f"⏭️ {svc} не установлен")
+            continue
+        _, _, arc = checker.run(f'systemctl {action} {svc} 2>/dev/null')
+        status = unit_status_info(checker, svc)
+        if not status['checked']:
+            # Молчание systemctl — «мы не спросили», а не «не активно». Прежний
+            # код решал по пустой строке и по ней же делал лишний `systemctl
+            # restart` (fallback): действие по непроверенному признаку. Ни
+            # fallback, ни красного диагноза, ни второго вопроса — только
+            # причина, снятая с незаглушённого stderr.
+            lines.append(f"⚠️ {svc}: состояние после {action} не проверено, "
+                         f"перезапуск по непроверенному признаку не предпринят")
+            lines.append(status['note'])
+            continue
+        if status['status'] == 'active':
+            lines.append(f"✅ {svc} ({action}) выполнен")
+            continue
+        # Здесь ответила система, а не мы промолчали: прежний путь (fallback
+        # restart) и прежние вердикты сохраняются дословно.
+        _, _, rrc = checker.run(f'systemctl restart {svc} 2>/dev/null')
+        after = unit_status_info(checker, svc)
+        if not after['checked']:
+            # Перезапуск сделан по настоящему ответу, но подтвердить его чем?
+            # Молчание не подтверждает и не опровергает: утверждать «запущен»
+            # или «не запустился» по нему нельзя.
+            lines.append(f"⚠️ {svc} перезапуск отправлен (rc={rrc}), но "
+                         f"состояние после него не проверено")
+            lines.append(after['note'])
+        elif after['status'] == 'active':
+            lines.append(f"✅ {svc} перезапущен (fallback)")
+        else:
+            lines.append(f"❌ {svc} не запустился (rc={rrc}, reload rc={arc})")
     return lines
