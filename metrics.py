@@ -1,4 +1,6 @@
 """Определение панели, системные метрики и базовые отчёты."""
+import ipaddress
+
 from common import (LOG_PATHS, DOMAIN_PATHS, get_domain_from_config, q,
                     command_probe_info,
                      path_entry_state)
@@ -247,8 +249,8 @@ def network_report(checker):
     out_get, _ = checker.exec_command('ip route get 1.1.1.1 2>/dev/null | grep -oP "src \\S+" | cut -d" " -f2')
     src_ip = out_get.strip()
 
-    out_ext, _ = checker.exec_command('curl -s ifconfig.me 2>/dev/null || wget -qO- ifconfig.me 2>/dev/null || dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null')
-    external_ip = out_ext.strip()
+    ext = probe_external_ip(checker)
+    external_ip = ext['address']
 
     lines = []
     lines.append("=== СЕТЕВЫЕ ИНТЕРФЕЙСЫ (ip a) ===")
@@ -265,9 +267,143 @@ def network_report(checker):
         if src_ip:
             lines.append(f"  (трафик идёт через NAT: приватный IP {src_ip} на интерфейсе {default_iface} -> плавающий IP {external_ip})")
     else:
-        lines.append("\nВнешний IP не удалось определить (проверьте доступность ifconfig.me или установите curl/wget/dig)")
+        lines.append("\n" + external_ip_note(ext))
 
     return "\n".join(lines)
+
+
+# ==================== ВНЕШНИЙ IP ====================
+# Прежняя решалка спрашивала три утилиты ОДНОЙ ||-цепочкой через exec_command
+# (код возврата выбрасывается в ssh_client.exec_command) и решала по непустоте
+# stdout:
+#
+#     out_ext, _ = checker.exec_command('curl -s ifconfig.me 2>/dev/null || '
+#                                       'wget -qO- ifconfig.me 2>/dev/null || '
+#                                       'dig +short ... 2>/dev/null')
+#     external_ip = out_ext.strip()
+#
+# Замер живьём на этой машине (curl, wget и dig УСТАНОВЛЕНЫ) дал три мира, в
+# которых отчёт печатал мусор как находку:
+#
+#   PATH без curl      -> цепочка уходит в wget: rc=0, stdout='<<!DOCTYPE html>…'
+#       => «Внешний (плавающий) IP: <!DOCTYPE html>» — страница выдана за адрес;
+#   PATH без curl/wget -> dig при недоступном резолвере пишет диагностику в
+#       STDOUT с rc=9 => «Внешний (плавающий) IP: ;; communications error…»;
+#   всё установлено, сети нет: curl rc=6, а -s глушит причину ЦЕЛИКОМ (оба
+#       канала пусты) => строка советует «установите curl/wget/dig» там, где
+#       всё уже установлено, и оператор едет ставить пакеты.
+#
+# Конвейер || делал хуже: на rc=0 он останавливается, поэтому при curl, ушедшем
+# rc=0 с пустым выводом (замер заглушкой) wget и dig не спрашивались вовсе —
+# «не спросили» выглядело как «спросили и не получили ответа».
+#
+# Форма -sS вместо -s: замер — `curl -sS` даёт 'curl: (6) Could not resolve
+# host: …' в stderr при том же rc=6, тогда как `curl -s` оставляет оба канала
+# пустыми. Причина обязана доезжать: отрицание без причины в этой серии не
+# печатается.
+#
+# command_probe_info (1.32.11) и web_config_probe (1.32.25) здесь НЕ
+# переиспользуются: тем же байтом задают ДРУГОЙ вопрос. Веб-конфигу достаточно
+# ПЕРВОГО ответа (текст ошибки сервера и есть находка), внешнему IP нужен
+# именно валидный адрес, поэтому обход идёт до первой строки, которой хватит
+# быть адресом, а причины остальных отказов сохраняются для строки отрицания.
+EXTERNAL_IP_SOURCES = (
+    ('curl', 'curl -sS ifconfig.me'),
+    ('wget', 'wget -qO- ifconfig.me'),
+    ('dig', 'dig +short myip.opendns.com @resolver1.opendns.com'),
+)
+
+
+def as_ip_address(text):
+    '''Первая непустая строка ответа как IP-адрес, если он им является.
+
+    Решать непустотой нельзя (замеры выше): вывод утилиты — это HTML, диагностика
+    резолвера или адрес, и все три варианта непустые. Признак — сам адрес,
+    проверка стандартной библиотекой, без разбора форматов чужих утилит.
+    '''
+    lines = [l.strip() for l in (text or '').strip().splitlines() if l.strip()]
+    if not lines:
+        return ''
+    try:
+        return str(ipaddress.ip_address(lines[0]))
+    except ValueError:
+        return ''
+
+
+def parse_external_ip_probe(out, err, rc):
+    '''('address'|'not_address'|'failed'|'absent'|'unchecked', адрес, причина).
+
+    Пять состояний, а не два. Причина берётся ТОЛЬКО из stderr: stdout — тело
+    ответа утилиты, и печатать его в строке отрицания нельзя, иначе диагностика
+    («;; communications error…», HTML) уедет в отчёт второй раз — уже в другом
+    качестве. Отсутствие доказывает код возврата оболочки (rc=127/126), а не
+    пустой вывод.
+    '''
+    def first_line(text):
+        lines = (text or '').strip().splitlines()
+        return lines[0][:160] if lines else ''
+
+    out_t = (out or '').strip()
+    err_t = (err or '').strip()
+    if rc == 127 or rc == 126:
+        return 'absent', '', first_line(err_t or out_t) or ('rc=%s' % rc)
+    if rc == 0:
+        if not out_t:
+            return 'unchecked', '', 'пустой ответ (rc=0)'
+        address = as_ip_address(out_t)
+        if address:
+            return 'address', address, None
+        return 'not_address', '', 'ответ не является адресом'
+    return 'failed', '', first_line(err_t) or ('rc=%s' % rc)
+
+
+def probe_external_ip(checker):
+    '''Внешний IP: {'address', 'notes', 'absent', 'asked', 'all_absent'}.
+
+    Утилиты спрашиваются раздельно и обход продолжается, пока не найден адрес:
+    отказ одной — не повод утверждать, что адреса нет, и не повод молчать о
+    причине остальных.
+    '''
+    address = ''
+    notes = []
+    absent = []
+    asked = 0
+    for name, cmd in EXTERNAL_IP_SOURCES:
+        out, err, rc = checker.run(cmd)
+        asked += 1
+        state, addr, why = parse_external_ip_probe(out, err, rc)
+        if state == 'address':
+            address = addr
+            break
+        if state == 'absent':
+            absent.append(name)
+            notes.append('%s не найдена' % name)
+        elif why and why.startswith(name):
+            notes.append(why)
+        else:
+            notes.append('%s: %s' % (name, why or state))
+    return {'address': address, 'notes': notes, 'absent': absent,
+            'asked': asked,
+            'all_absent': bool(absent) and len(absent) == asked}
+
+
+def external_ip_note(probe):
+    '''Отрицание с причиной; «установите» — только когда ставить нечего.
+
+    Прежняя строка содержала совет установить на всех мирах сразу, поэтому в
+    мире «всё установлено, сети нет» она отправляла оператора ставить пакеты.
+    '''
+    if probe['all_absent']:
+        return ('Внешний IP не удалось определить: ни одна утилита не найдена ('
+                + ', '.join(name for name, _cmd in EXTERNAL_IP_SOURCES)
+                + ') — установите любую из них')
+    reasons = probe['notes']
+    if not reasons:
+        # Пустой список причин — это тоже отрицание, и оно обязано
+        # читаться: без ветки функция печатала «...: » с пустым
+        # перечислением (замер живьём 1.32.26).
+        reasons = ['утилиты не дали ответа']
+    return ('Внешний IP не удалось определить: ' + '; '.join(reasons))
 
 
 # ==================== ВЕБ-КОНФИГУРАЦИЯ ====================

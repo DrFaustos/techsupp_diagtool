@@ -196,6 +196,225 @@ class TestWebConfig:
         assert 'не обнаружен' not in out
 
 
+class TestExternalIpIsAnAddressNotAChainOutput:
+    """Внешний IP обязан быть адресом, а не выводом ||-цепочки (1.32.26).
+
+    Прежний код спрашивал ОДНОЙ командой
+
+        curl -s ifconfig.me 2>/dev/null || wget -qO- ifconfig.me 2>/dev/null
+            || dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null
+
+    и решал по непустоте stdout: exec_command контрактом отдаёт только пару
+    каналов, код возврата выбрасывается в ssh_client.exec_command. Замер
+    живьём на этой машине (все три утилиты установлены) дал три мира, в них
+    прежний отчёт лжёт байтами, а не словами:
+
+      curl нет, wget есть       цепочка даёт rc=0 и <!DOCTYPE html>...: отчёт
+        печатает «Внешний (плавающий) IP: <!DOCTYPE html>» — HTML выдан за
+        адрес;
+      curl и wget нет, dig есть dig пишет диагностику отказа в STDOUT с rc=9,
+        и она доезжает как «плавающий IP»;
+      всё установлено, сети нет curl даёт rc=6, а -s глушит причину ЦЕЛИКОМ
+        (stdout и stderr пусты), и строка отчёта советует «установите
+        curl/wget/dig» там, где всё уже установлено.
+
+    Порядок роутов в фикстурах значит: FakeSSH матчает ПОДСТРОКОЙ и берёт
+    ПЕРВЫЙ подходящий, а прежний код делает ОДИН спрос на всю цепочку. Роут,
+    который обязан достаться прежней коду, стоит в списке раньше остальных;
+    новый код спрашивает бинарники раздельно и получает каждый свой ответ.
+    """
+    IP_A = '2: eth0: <BROADCAST>\n    inet 10.0.0.5/24 scope global eth0\n'
+    IP_R = 'default via 10.0.0.1 dev eth0 proto dhcp metric 100\n'
+    HTML = '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+    DIG_FAIL = (';; communications error to 192.0.2.1#53: timed out\n'
+                ';; no servers could be reached\n')
+    ABSENT = 'command not found'
+
+    def base(self):
+        # 'route get' обязан стоять перед 'ip r': игла 'ip r' иначе проглотила
+        # бы и её — контракт, уже закреплённый TestNetworkReport.
+        return [('route get', '10.0.0.5\n'), ('ip r', self.IP_R),
+                ('ip a', self.IP_A)]
+
+    def test_html_from_wget_is_not_reported_as_an_address(self):
+        # Мир замера 1c: PATH без curl -> боевая цепочка уходит в wget и
+        # возвращается rc=0 с HTML-ом страницы.
+        c = FakeSSH(routes=self.base() + [
+            ('-qO- ifconfig.me', (self.HTML, '', 0)),
+            ('-sS ifconfig.me', ('', '/bin/bash: line 1: curl: ' + self.ABSENT,
+                                 127)),
+            ('myip.opendns.com', ('', '/bin/bash: line 1: dig: ' + self.ABSENT,
+                                  127)),
+        ])
+        out = metrics_mod.network_report(c)
+        assert '<!DOCTYPE' not in out, out[-260:]
+        assert self.ABSENT not in out, out[-260:]
+
+    def test_dig_diagnostic_is_not_reported_as_an_address(self):
+        # dig пишет диагностику отказа в STDOUT (rc=9): для решалки по
+        # непустоте это «ответ есть», а по существу — отказ резолвера.
+        c = FakeSSH(routes=self.base() + [
+            ('myip.opendns.com', (self.DIG_FAIL, '', 9)),
+            ('-qO- ifconfig.me', ('', '/bin/bash: line 1: wget: ' + self.ABSENT,
+                                  127)),
+            ('-sS ifconfig.me', ('', '/bin/bash: line 1: curl: ' + self.ABSENT,
+                                 127)),
+        ])
+        out = metrics_mod.network_report(c)
+        assert ';; communications error' not in out, out[-260:]
+        assert 'no servers could be reached' not in out, out[-260:]
+
+    def test_install_advice_is_not_shown_when_tools_are_installed(self):
+        # Утилиты на месте, сети нет: curl rc=6 (-s глушит причину), wget
+        # rc=4, dig rc=9. Прежняя строка советует УСТАНОВИТЬ уже
+        # установленное, и оператор едет ставить пакеты вместо диагностики.
+        c = FakeSSH(routes=self.base() + [
+            ('-qO- ifconfig.me', ('', 'wget: unable to resolve host address',
+                                  4)),
+            ('-sS ifconfig.me', ('', 'curl: (6) Could not resolve host: '
+                                 'ifconfig.me', 6)),
+            ('myip.opendns.com', (self.DIG_FAIL, '', 9)),
+        ])
+        out = metrics_mod.network_report(c)
+        assert 'установите' not in out, out[-260:]
+
+
+class TestAsIpAddress:
+    """Признак «адрес» — сам адрес, а не непустота вывода утилиты.
+
+    Замеры живьём (1.32.26): curl даёт '135.181.169.106', wget в ЧЕСТНОМ мире
+    даёт HTML-страницу страницы ifconfig.me, dig при недоступном резолвере
+    пишет ';; communications error to 192.0.2.1#53: timed out' в STDOUT. Все
+    три варианта непустые, поэтому решение по непустоте и выдавало HTML и
+    диагностику резолвера как «плавающий IP».
+    """
+
+    def test_plain_v4_and_v6_are_addresses(self):
+        assert metrics_mod.as_ip_address('135.181.169.106') == '135.181.169.106'
+        assert metrics_mod.as_ip_address('2001:db8::1') == '2001:db8::1'
+
+    def test_surrounding_blanks_and_trailing_lines_are_tolerated(self):
+        # Боевые утилиты печатают адрес со переводом строки (замер: curl).
+        assert metrics_mod.as_ip_address(' 203.0.113.9\n') == '203.0.113.9'
+        assert (metrics_mod.as_ip_address('203.0.113.9\nлишний хвост\n')
+                == '203.0.113.9')
+
+    def test_html_and_resolver_diagnostic_are_not_addresses(self):
+        # Дословные байты из замеров 1c и 1b.
+        assert metrics_mod.as_ip_address('<!DOCTYPE html>\n<html lang="en">') == ''
+        assert metrics_mod.as_ip_address(';; communications error to '
+                                         '192.0.2.1#53: timed out') == ''
+
+    def test_empty_is_not_an_address(self):
+        for body in ('', '   ', '\n\n'):
+            assert metrics_mod.as_ip_address(body) == '', repr(body)
+
+
+class TestParseExternalIpProbe:
+    """Пять состояний вместо «пусто / непусто»; причина — только из stderr."""
+
+    def test_address_state_carries_the_address(self):
+        state, addr, why = metrics_mod.parse_external_ip_probe(
+            '203.0.113.9\n', '', 0)
+        assert state == 'address'
+        assert addr == '203.0.113.9'
+        assert why is None
+
+    def test_success_with_html_is_not_address_not_a_finding(self):
+        state, addr, why = metrics_mod.parse_external_ip_probe(
+            '<!DOCTYPE html>\n<html>', '', 0)
+        assert state == 'not_address'
+        assert addr == ''
+        assert why and 'адресом' in why
+
+    def test_absent_is_proved_by_rc_not_by_empty_output(self):
+        for rc in (127, 126):
+            state, addr, why = metrics_mod.parse_external_ip_probe(
+                '', '/bin/bash: line 1: curl: command not found', rc)
+            assert state == 'absent', rc
+            assert addr == '', rc
+            assert 'command not found' in why, rc
+
+    def test_failure_keeps_the_stderr_reason(self):
+        # Живой байт замера: curl -sS при rc=6 даёт причину в stderr.
+        state, addr, why = metrics_mod.parse_external_ip_probe(
+            '', 'curl: (6) Could not resolve host: ifconfig.me', 6)
+        assert state == 'failed'
+        assert why.startswith('curl: (6)')
+
+    def test_silence_at_rc_zero_is_unchecked(self):
+        # Мир заглушки: утилита ушла rc=0, ничего не напечатав (замер 1c).
+        state, addr, why = metrics_mod.parse_external_ip_probe('', '', 0)
+        assert state == 'unchecked'
+        assert addr == ''
+        assert why
+
+    def test_stdout_never_leaks_into_the_reason(self):
+        # Диагностика dig живёт в STDOUT (rc=9): в причину она не попадает,
+        # иначе отрицание второй раз напечатает то, что уже отказ.
+        state, addr, why = metrics_mod.parse_external_ip_probe(
+            ';; no servers could be reached', '', 9)
+        assert state == 'failed'
+        assert why == 'rc=9'
+
+
+class TestExternalIpNoteAndOrder:
+    """Отрицание с причиной; «установите» — только когда ставить нечего."""
+
+    def test_install_advice_only_when_nothing_is_installed(self):
+        probe = {'address': '', 'notes': ['curl не найдена'],
+                 'absent': ['curl', 'wget', 'dig'], 'asked': 3,
+                 'all_absent': True}
+        note = metrics_mod.external_ip_note(probe)
+        assert 'установите' in note
+        assert 'не удалось определить' in note
+
+    def test_reasons_are_kept_and_no_install_advice(self):
+        probe = {'address': '', 'notes': ['curl: (6) Could not resolve host'],
+                 'absent': [], 'asked': 3, 'all_absent': False}
+        note = metrics_mod.external_ip_note(probe)
+        assert 'установите' not in note
+        assert 'Could not resolve host' in note
+
+    def test_probe_stops_at_the_first_valid_address(self):
+        c = FakeSSH(routes=[
+            ('curl -sS ifconfig.me', ('203.0.113.9\n', '', 0)),
+            ('wget -qO- ifconfig.me', ('<html>', '', 0)),
+            ('dig +short', ('', '', 0)),
+        ])
+        probe = metrics_mod.probe_external_ip(c)
+        assert probe['address'] == '203.0.113.9'
+        asked = [x for x in c.commands if 'ifconfig' in x or 'dig' in x]
+        assert asked == ['curl -sS ifconfig.me'], asked
+
+    def test_probe_keps_asking_after_a_non_address(self):
+        # Мир 1c: curl нет, wget отдаёт HTML. Обход обязан дойти до dig, а
+        # находкой HTML не стать.
+        c = FakeSSH(routes=[
+            ('curl -sS ifconfig.me', ('', '/bin/bash: line 1: curl: command '
+                                      'not found', 127)),
+            ('wget -qO- ifconfig.me', ('<!DOCTYPE html>\n<html>', '', 0)),
+            ('dig +short', (';; communications error\n', '', 9)),
+        ])
+        probe = metrics_mod.probe_external_ip(c)
+        assert probe['address'] == ''
+        assert probe['all_absent'] is False
+        asked = [x for x in c.commands if 'ifconfig' in x or 'dig' in x]
+        assert len(asked) == 3, asked
+        assert '<!DOCTYPE' not in metrics_mod.external_ip_note(probe)
+
+    def test_probe_reports_all_absent_without_inventing_an_answer(self):
+        c = FakeSSH(routes=[
+            ('curl -sS ifconfig.me', ('', 'bash: curl: command not found', 127)),
+            ('wget -qO- ifconfig.me', ('', 'bash: wget: command not found', 127)),
+            ('dig +short', ('', 'bash: dig: command not found', 127)),
+        ])
+        probe = metrics_mod.probe_external_ip(c)
+        assert probe['address'] == ''
+        assert probe['all_absent'] is True
+        assert 'установите' in metrics_mod.external_ip_note(probe)
+
+
 # ==== веб-конфиг: веб-сервер регистрируется кодом возврата, а не словом ====
 # RED этого слайса (1.32.25) красен ПО СУЩЕСТВУ, а не по отсутствию имени: все
 # три теста гонят существующую check_web_config на ЖИВЫХ байтах этой машины
@@ -204,6 +423,29 @@ class TestWebConfig:
 # Прежняя решалка (`if 'nginx' in out` на выводе `nginx -t 2>&1`, там же)
 # вывернута: регистрирует сервер по имени ОТСУТСТВУЮЩЕЙ команды и НЕ
 # регистрирует apache при честном отказе конфига.
+
+    def test_note_never_prints_an_empty_reason_list(self):
+        # Замер живьём (1.32.26): external_ip_note для уже найденного адреса
+        # возвращал 'Внешний IP не удалось определить: ' — отрицание со ссылкой
+        # на причины, которых нет. network_report в такую ветку не заходит, но
+        # носитель, умеющий напечатать ложь, рано или поздно её напечатает:
+        # закон серии «отрицание обязано быть с причиной» проверяющий не
+        # допрошен.
+        cases = (
+            {'address': '203.0.113.9', 'notes': [], 'absent': [], 'asked': 1,
+             'all_absent': False},
+            {'address': '', 'notes': [], 'absent': [], 'asked': 3,
+             'all_absent': False},
+        )
+        for probe in cases:
+            note = metrics_mod.external_ip_note(probe)
+            assert 'не удалось определить' in note, repr(note)
+            assert not note.rstrip().endswith(':'), repr(note)
+            reason = note.split(':', 1)[1].strip()
+            assert reason, repr(note)
+            assert '<!DOCTYPE' not in note, repr(note)
+
+
 class TestWebConfigAbsentVsBroken:
     """Веб-сервер регистрируется кодом возврата, а не словом в выводе (1.32.25).
 
