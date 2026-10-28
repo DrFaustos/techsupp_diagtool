@@ -48,6 +48,125 @@ def _nameservers_from_text(text):
     return found
 
 
+# ==================== ОДИН ВОПРОС dig (1.32.24) ====================
+# Прежний вид спрашивал dig через exec_command: по контракту он отдаёт только
+# stdout и stderr (exit_status выбрасывается внутри SSH-клиента, ssh_client.py
+# строка 127), и решал по пустоте stdout — if out.strip(). Замер живьём (этот
+# хост, dig 9.18) дал пять миров, ДВА из которых прежний отчёт печатал как
+# НАЙДЕННЫЕ ЗАПИСИ:
+#
+#   резолвер не отвечает    rc=9   stdout НЕПУСТОЙ: ';; communications error to
+#                             127.0.0.1#53: connection refused' — боевой отчёт
+#                             выдавал «A-записи: ;; communications error ...»,
+#                             то есть строку ошибки резолвера за адрес хоста
+#                             (решающий мир слайса)
+#   ответ непригоден        rc=0   stdout ';; Warning: Message parser reports
+#                             malformed message packet.' — та же подмена;
+#                             «не найдены» по такому выводу было бы второй
+#                             ложью: сервер не говорил, что записей нет. Снято
+#                             собственным DNS-сервером на rcode=3 и rcode=2
+#   бинарника dig нет       rc=127 stdout пуст, stderr 'command not found' —
+#                             прежний код подписывал это «не найдены»: диагноз
+#                             домену там, где спрашивать было не чем
+#   живой сервер, записей нет rc=0 stdout пуст — единственное честное
+#                             «не найдены» (замер: NXDOMAIN приходит при rc=0)
+#   живой сервер с записью  rc=0   stdout '93.184.216.34' — записи
+#
+# Отдельно: '2>/dev/null' глушил единственный канал с причиной, а конвейер
+# отдал бы код возврата последней команде (урок серии про пайпы). Поэтому
+# вопрос задаёт ОДНА функция без пайпа и без заглушек, а решение принимает
+# парсер по (out, err, rc).
+DIG_UNCHECKED_NOTE = ('⚠️ {label}: не проверено — {why}. Это «мы не спросили», '
+                      'а не «записей нет»: проверьте, что dig установлен '
+                      'на хосте')
+
+
+def dig_records_cmd(rtype, target):
+    """Одна POSIX-команда: записи типа rtype для target в форме +short.
+
+    Без `2>/dev/null`, без `2>&1` и без конвейера: код возврата обязан
+    принадлежать dig, а stderr — доехать до парсера причиной отказа. Ни `&&`,
+    ни `||`: решение принимает парсер по фактам, а не оболочка по умолчанию.
+
+    Тип записи (A, NS, -x) идёт без кавычек: это литерал программы, а не ввод
+    оператора, и кавычка сломала бы саму форму «+short A». Домен и адрес
+    экранируются q(): без этого домен вида «example.com; rm -rf /» стал бы
+    второй командой (замок test_domain_is_shell_quoted).
+    """
+    return 'dig +short ' + rtype + ' ' + q(target)
+
+
+def parse_dig_records(out, err, rc):
+    """('records'|'none'|'fail'|'unchecked', записи, признание или None).
+
+    Различает четыре состояния, а не «пусто / непусто»:
+
+      records   — rc=0 и в stdout есть содержательные строки;
+      none      — rc=0, содержательных строк нет и оба канала чисты: сервер
+                  ответил, записей нет (замер: NXDOMAIN приходит при rc=0);
+      fail      — отказ ОТВЕТИВШЕЙ стороны: rc != 0 с текстом причины либо
+                  rc=0 с непригодным выводом (служебные строки «;; Warning»);
+      unchecked — rc=127: спрашивать было не чем. По этому состоянию диагноз
+                  не печатается (закон 1.32.10) и лечивающее действие по нему
+                  не совершается.
+
+    Отсечение префикса «;;» обязательно: это служебные строки dig, а не
+    записи. Замер показал, что при битом пакете warning едет именно в stdout
+    при rc=0, поэтому «rc=0 и stdout непустой» НЕ означает «есть запись».
+    """
+    def first(text):
+        lines = [ln.strip() for ln in (text or '').splitlines() if ln.strip()]
+        return lines[0][:200] if lines else ''
+
+    if rc == 127:
+        return 'unchecked', [], (first(err) or 'dig не найден (rc=127)')
+    if rc != 0:
+        return ('fail', [],
+                first(err) or first(out) or ('dig не выполнен (rc=%s)' % rc))
+    body, junk = [], []
+    for line in (out or '').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        (junk if line.startswith(';;') else body).append(line)
+    if body:
+        return 'records', body, None
+    why = first(err) or (junk[0] if junk else '')
+    if why:
+        return ('fail', [],
+                (why[:200] + ': сервер не дал внятного ответа (rc=0)'))
+    return 'none', [], None
+
+
+def dig_records_info(checker, rtype, target):
+    """Записи dig с СИЛОЙ ответа: {rtype, target, state, records, why, checked}.
+
+    checked=False — система ничего не ответила: вызывающий обязан сказать
+    «не проверено», а не «не найдено».
+    """
+    out, err, rc = checker.run(dig_records_cmd(rtype, target))
+    state, records, why = parse_dig_records(out, err, rc)
+    return {'rtype': rtype, 'target': target, 'state': state,
+            'records': records, 'why': why, 'checked': state != 'unchecked'}
+
+
+def _dig_lines(info, label, none_line):
+    """Строки отчёта по состоянию ОДНОГО вопроса dig.
+
+    Отрицательные состояния называются РАЗНЫМИ словами, потому что лечатся
+    по-разному: «не найдены» — проверять домен, «не получены» — разбираться с
+    резолвером, «не проверено» — ничего не утверждать. Прежний код схлопывал
+    все три в «не найдены» либо в напечатанную строку ошибки.
+    """
+    if info['state'] == 'records':
+        return [f"{label}: {', '.join(info['records'])}"]
+    if info['state'] == 'none':
+        return [none_line]
+    if info['state'] == 'fail':
+        return [f"❌ {label} — не получены: {info['why']}"]
+    return [DIG_UNCHECKED_NOTE.format(label=label, why=info['why'])]
+
+
 # ==================== DNS ФУНКЦИИ ====================
 def dns_report_local(domain):
     lines = []
@@ -90,54 +209,52 @@ def dns_report_local(domain):
 
 
 def dns_report(checker, domain, ip=None):
+    """Записи домена глазами САМОГО сервера — с силой ответа dig.
+
+    Прежний вид читал dig через exec_command (тот по контракту отдаёт только
+    stdout и stderr: exit_status выбрасывается внутри SSH-клиента) и решал по
+    пустоте stdout. Замер живьём (этот хост, dig 9.18): «резолвер не отвечает»
+    даёт rc=9 и НЕПУСТОЙ stdout ';; communications error to 127.0.0.1#53:
+    connection refused' — прежний отчёт печатал «A-записи: ;; communications
+    error ...», то есть строку ошибки резолвера выдавал за адрес хоста.
+    «Бинарника dig нет» (rc=127, спрашивать было не чем) подписывался
+    «не найдены» — диагноз домену там, где проверки не было.
+
+    Вопрос и разбор теперь у носителя dig_records_info (одна команда без
+    пайпов и заглушек канала), здесь остаются только формулировки для
+    оператора; три отрицания называются тремя разными словами, потому что
+    лечатся по-разному.
+    """
     lines = []
     lines.append(f"=== DNS-ПРОВЕРКА НА СЕРВЕРЕ ДЛЯ {domain} ===")
 
     ip_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
     is_ip = bool(ip_pattern.match(domain))
 
-    # Внимание: dig возвращает rc!=0 при отсутствии записи (NXDOMAIN),
-    # поэтому здесь по-прежнему используем exec_command и судим по выводу.
     if is_ip:
-        cmd = f"dig +short -x {q(domain)} 2>/dev/null"
-        out, _ = checker.exec_command(cmd)
-        if out.strip():
-            lines.append(f"PTR (обратный DNS): {out.strip()}")
-        else:
-            lines.append("PTR-запись не найдена.")
+        info = dig_records_info(checker, '-x', domain)
+        lines.extend(_dig_lines(info, 'PTR (обратный DNS)',
+                                'PTR-запись не найдена.'))
         return "\n".join(lines)
 
     target_ip = ip
     if not target_ip:
-        cmd = f"dig +short A {q(domain)} 2>/dev/null"
-        out, _ = checker.exec_command(cmd)
-        if out.strip():
-            a_records = out.splitlines()
-            lines.append(f"A-записи: {', '.join(a_records)}")
-            target_ip = a_records[0].strip()
-        else:
-            lines.append("A-записи не найдены.")
+        info_a = dig_records_info(checker, 'A', domain)
+        if info_a['state'] == 'records':
+            target_ip = info_a['records'][0]
+        lines.extend(_dig_lines(info_a, 'A-записи', 'A-записи не найдены.'))
 
-    cmd = f"dig +short NS {q(domain)} 2>/dev/null"
-    out, _ = checker.exec_command(cmd)
-    if out.strip():
-        lines.append(f"NS-записи: {', '.join(out.splitlines())}")
-    else:
-        lines.append("NS-записи не найдены.")
+    info_ns = dig_records_info(checker, 'NS', domain)
+    lines.extend(_dig_lines(info_ns, 'NS-записи', 'NS-записи не найдены.'))
 
     if target_ip:
-        cmd = f"dig +short -x {q(target_ip)} 2>/dev/null"
-        out, _ = checker.exec_command(cmd)
-        if out.strip():
-            lines.append(f"PTR для {target_ip}: {out.strip()}")
-        else:
-            lines.append(f"PTR-запись для {target_ip} не найдена.")
+        info_ptr = dig_records_info(checker, '-x', target_ip)
+        lines.extend(_dig_lines(info_ptr, 'PTR для ' + target_ip,
+                                'PTR-запись для %s не найдена.' % target_ip))
     else:
         lines.append("Не удалось получить IP для PTR-запроса.")
 
     return "\n".join(lines)
-
-
 def dns_resolvers_report(checker):
     lines = []
     lines.append("=== DNS-РЕЗОЛВЕРЫ НА СЕРВЕРЕ ===")

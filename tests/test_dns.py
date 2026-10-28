@@ -80,6 +80,166 @@ class TestDnsReport:
         assert "'example.com; rm -rf /'" in cmd
 
 
+# ==================== dns_report: «не спросили» не есть «не найдено» =========
+class TestDnsReportUnverified:
+    """dns_report обязан различать «записей нет» и «мы не спросили» (1.32.24).
+
+    Прежний код читал dig через exec_command, который контрактом отдаёт только
+    два канала (ssh_client.py:127 выбрасывает rc внутри себя), и решал по
+    пустоте if out.strip(). Замер живьём (этот хост, dig 9.18): мир «резолвер
+    не отвечает» даёт rc=9 и НЕПУСТОЙ stdout «;; communications error to
+    127.0.0.1#53: connection refused», а мир «бинарника dig нет» даёт rc=127 с
+    пустым stdout. Первый боевой отчёт выдаёт за адрес хоста, второй подписывает
+    «не найдено» там, где спрашивать было не чем.
+
+    Маршруты описывают ФОРМУ ответа dig, снятую замером (сырой stdout с
+    «communications error», пустой NXDOMAIN при rc=0), а не ожидание: подмена
+    измерения намерением — урок 1.27.0 про зелёный по неверной причине.
+    """
+
+    COMM_ERR = ';; communications error to 127.0.0.1#53: connection refused'
+
+    def test_resolver_error_is_not_reported_as_a_record(self):
+        # РЕШАЮЩИЙ МИР: rc=9 и непустой stdout. if out.strip() тут ИСТИНА, и
+        # прежний код печатал «A-записи: ;; communications error ...».
+        c = FakeSSH(routes=[('+short A', (self.COMM_ERR, '', 9)),
+                            ('+short NS', (self.COMM_ERR, '', 9))])
+        out = dns_mod.dns_report(c, 'example.com')
+        # Строка ошибки резолвера не имеет права стоять НА МЕСТЕ ЗАПИСИ:
+        # прежний код печатал «A-записи: ;; communications error ...».
+        assert 'A-записи: ' not in out, out
+        assert 'NS-записи: ' not in out, out
+        assert 'PTR для ' not in out, out
+        # Сам текст «;; communications ...» в отчёте ДОПУСТИМ как ПРИЧИНА
+        # отказа (закон серии: отказ обязан быть назван причиной от носителя).
+        # Прежнее требование «не проверено» было бы моей собственной подменой
+        # миров: rc=9 — это ОТКАЗ (сервер/канал ответил отказом), а
+        # «не проверено» — про «спрашивать было не чем» (rc=127). Различие
+        # двух состояний и есть цель слайса, поэтому отказ требует
+        # «не получены» плюс причину, а не чужое признание.
+        assert 'не получены' in out, out
+        assert 'не найдены' not in out, out
+        assert 'communications error' in out, out
+
+    def test_missing_dig_is_unverified_not_not_found(self):
+        # rc=127: спрашивать было не чем. Прежний код по пустому stdout печатал
+        # «A-записи не найдены.» — диагноз, по которому оператор винит домен.
+        c = FakeSSH(routes=[('+short A', ('', 'bash: dig: command not found', 127)),
+                            ('+short NS', ('', 'bash: dig: command not found', 127))])
+        out = dns_mod.dns_report(c, 'example.com')
+        assert 'A-записи не найдены.' not in out, out
+        assert 'не проверено' in out or 'не проверена' in out, out
+
+    def test_nxdomain_stays_not_found_not_unverified(self):
+        # Контрпример от перелома: живой сервер без записи — это «не найдено»,
+        # а не «не проверено». Замер: NXDOMAIN приходит при rc=0 с пустым
+        # +short выводом.
+        c = FakeSSH(routes=[('+short A', ('', '', 0)),
+                            ('+short NS', ('', '', 0))])
+        out = dns_mod.dns_report(c, 'example.com')
+        assert 'A-записи не найдены.' in out, out
+        assert 'не проверено' not in out, out
+
+    def test_malformed_answer_is_not_reported_as_not_found(self):
+        # Замер (собственный DNS-сервер, rcode=3 и rcode=2, битый пакет):
+        # dig отвечает rc=0 и кладёт в STDOUT служебное предупреждение.
+        # if out.strip() здесь ИСТИНА, и прежний код выдал бы warning как
+        # запись; «не найдены» по такому ответу — вторая ложь: сервер не
+        # говорил, что записей нет, он выдал непригодный ответ.
+        warn = (';; Warning: Message parser reports malformed message packet.')
+        c = FakeSSH(routes=[('+short A', (warn, '', 0)),
+                            ('+short NS', (warn, '', 0))])
+        out = dns_mod.dns_report(c, 'example.com')
+        assert 'A-записи: ' not in out, out
+        assert 'A-записи не найдены.' not in out, out
+        assert 'не получены' in out, out
+
+    def test_dig_is_asked_without_blinded_channel(self):
+        # Поведенческий замок (урок 1.32.9): смотрим реально ОТПРАВЛЕННЫЕ
+        # команды. dig обязан идти так, чтобы rc принадлежал dig, а stderr
+        # доехал причиной: без 2>/dev/null и без конвейера с || / &&.
+        c = FakeSSH(routes=DIG_FULL)
+        dns_mod.dns_report(c, 'example.com')
+        digs = [cmd for cmd in c.commands if 'dig ' in cmd]
+        assert digs, c.commands
+        for cmd in digs:
+            assert '2>/dev/null' not in cmd, cmd
+            assert '||' not in cmd and '&&' not in cmd, cmd
+
+
+# ==================== Парсер ответа dig (1.32.24) ====================
+class TestParseDigRecords:
+    """Четыре состояния носителя — ПРЯМЫМИ тестами, а не через текст отчёта.
+
+    parse_dig_records — чистая функция, и серия держит правило: у чистого
+    парсера обязана быть ветка на каждое состояние (ср. parse_resolver_probe,
+    1.32.10). Через dns_report состояние «none» от «fail» по формулировке
+    отчёта не различить: правка одного слова в строке утопила бы дефект, а не
+    поймала бы его.
+
+    Ответы кормятся КАК СНЯТЫЕ ЗАМЕРОМ, включая деталь, на которой стоит весь
+    слайс: у отказа («резолвер не отвечает») причина лежит в STDOUT, а не в
+    stderr, поэтому боевое `if out.strip()` читал её как найденную запись.
+    """
+
+    def test_records_at_rc0(self):
+        state, recs, why = dns_mod.parse_dig_records(
+            '1.1.1.1' + chr(10) + '2.2.2.2' + chr(10), '', 0)
+        assert state == 'records'
+        assert recs == ['1.1.1.1', '2.2.2.2']
+        assert why is None
+
+    def test_none_is_answered_empty_at_rc0(self):
+        # Замер: NXDOMAIN приходит при rc=0 с пустым +short — сервер ОТВЕТИЛ,
+        # записей нет. Только это состояние имеет право называться «не найдены».
+        assert dns_mod.parse_dig_records('', '', 0) == ('none', [], None)
+
+    def test_refusal_is_fail_and_reason_comes_from_stdout(self):
+        # Замер живьём: rc=9, причина в STDOUT (первый канал пуст). Прежний код
+        # всё равно печатал бы текст ошибки как запись.
+        err = ';; communications error to 127.0.0.1#53: connection refused'
+        state, recs, why = dns_mod.parse_dig_records(err, '', 9)
+        assert state == 'fail'
+        assert recs == []
+        assert why == err
+
+    def test_unfit_answer_at_rc0_is_fail_not_none(self):
+        # Замер (собственный DNS-сервер, rcode=3 и rcode=2): битый пакет даёт
+        # rc=0 и служебное предупреждение в stdout. «Не найдены» по такому
+        # выводу — вторая ложь: сервер не говорил, что записей нет.
+        warn = ';; Warning: Message parser reports malformed message packet.'
+        state, recs, why = dns_mod.parse_dig_records(warn, '', 0)
+        assert state == 'fail'
+        assert recs == []
+        assert 'rc=0' in why
+
+    def test_missing_binary_is_unchecked(self):
+        # rc=127: спрашивать было не чем. Состояние не даёт диагноза (закон
+        # 1.32.10) и не запускает лечивающее действие.
+        state, recs, why = dns_mod.parse_dig_records(
+            '', 'bash: dig: command not found', 127)
+        assert state == 'unchecked'
+        assert recs == []
+        assert why == 'bash: dig: command not found'
+
+    def test_service_lines_never_become_records(self):
+        # Замок на отсечение «;;»: смешанный вывод обязан отдать записи без
+        # мусора, иначе предупреждение уедет в отчёт на месте адреса.
+        out = (';; Warning: something odd' + chr(10)
+               + '93.184.216.34' + chr(10))
+        state, recs, why = dns_mod.parse_dig_records(out, '', 0)
+        assert state == 'records'
+        assert recs == ['93.184.216.34']
+
+    def test_command_form_has_no_blinded_channel_and_is_quoted(self):
+        # Форма вопроса — часть контракта: без заглушек канала, без конвейера
+        # (код пайпа принадлежит последней команде) и с экранированным доменом.
+        cmd = dns_mod.dig_records_cmd('A', 'example.com; rm -rf /')
+        assert cmd == "dig +short A 'example.com; rm -rf /'"
+        for blind in ('2>/dev/null', '2>&1', '|', '&&', '||'):
+            assert blind not in cmd, cmd
+
+
 # ==================== dns_report_local (socket) ====================
 class TestDnsReportLocal:
     # Реальный getaddrinfo отдаёт 5-элементные кортежи, IP в addr[4][0].

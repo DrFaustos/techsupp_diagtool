@@ -882,7 +882,7 @@ Diagn/
 | common.py | Конфигурации (BACKUP_DIR, LOG_PATHS, DOMAIN_PATHS), q(), бэкапы, SFTP-запись, безопасное создание и уборка файлов с секретами; `domains_from_config_text` — парсер `server_name` (комментарии и похожие директивы доменами не становятся), `domains_from_configs_info` — домены по списку конфигов с ОДНОЙ сводкой на причину пустоты |
 | metrics.py | detect_panel, get_metrics, disk_memory_report, network_report, web_config_report |
 | logs.py | find_logs, analyze_access_log, get_domains(_info — с причинами пустоты, в т. ч. «нет прав на конфиг» ≠ «доменов нет»), check_site_logs, search_oom_logs |
-| dns.py | dns_report, dns_report_local, dns_resolvers_report, set_dns_resolvers |
+| dns.py | dns_report, dns_report_local, dns_resolvers_report, set_dns_resolvers; `dig_records_cmd`/`parse_dig_records`/`dig_records_info` — записи dig по коду возврата: «не найдены» / «не получены» / «не проверено» вместо одного «не найдено» |
 | files.py | read_file, write_file, get_config_files(_info — с причинами пустоты), replace_ipv4/ipv6, restart_services |
 | panels.py | Управление ISPmanager и FastPanel (restart, status, logs, ssl) + диагностика «панель не открывается»: процессы, порт, лицензия (проверка, обновление под IP, активация по ключу), разблокировка, пакет fastpanel2, сброс пароля fastuser; `systemd_unit_state` разводит «юнит есть / юнита нет / не проверено», логи панели — через `find_fastpanel_logs_info` (с причинами пустоты) |
 | discovery.py | Инвентарь хостинга: сайты/почта/DNS-зоны из панели (mgrctl, mogwai) и конфигов, проверка доступности, досье домена, операции с ящиками (резолв родителя `plid`, пароль мимо argv), проверка писем в спам — SPF/DKIM/DMARC/PTR через `dig` без синтаксиса панелей |
