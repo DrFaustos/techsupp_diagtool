@@ -11,6 +11,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          # fetch-depth: 1 (дефолт checkout@v7) присылает shallow-клон:
+          # 1 коммит и 1 тег. Сторож tests/test_git_history.py требует
+          # >= 8 релизных тегов и падает на урезанном списке, т.к. без
+          # истории он был бы тривиально зелёным. Ослаблять сторож -
+          # значит потерять его; CI обязан видеть полную историю.
+          fetch-depth: 0
 
       - name: Install Tkinter, venv and Xvfb
         run: |
