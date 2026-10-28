@@ -10,6 +10,12 @@ import re
 from datetime import datetime, timezone
 
 from common import (
+                    # Признак «есть ли строка в конфиге» и признак «есть ли
+                    # группа» спрашивают ОДНА функция каждый (1.32.21):
+                    # раньше обе кнопки решали по готовому слову ok, а код
+                    # возврата — единственный, кто различает «прочитано и
+                    # нет» и «мы не спросили».
+                    file_pattern_info, group_presence_info,
                     # Признак «доступен ли путь» спрашивает ОДНА функция
                     # (1.32.20): раньше каждая кнопка решала по готовому
                     # слову, и они разъехались бы релизами.
@@ -594,8 +600,25 @@ def bitrix_mysql_tune(checker):
 
     conf = mysql_tune_config(mem)
     pattern = '^!includedir\\s+' + re.escape(MYSQL_CNF_DIR)
-    out, _, _ = checker.run(f'grep -Eq {q(pattern)} {q(MYSQL_CNF)} 2>/dev/null && echo ok')
-    if out.strip() != 'ok':
+    # Прежняя форма решала по СЛОВУ и глушила причину (2>/dev/null). Замер
+    # живьём: «файл не читается (000)», «файла нет» и «каталог вместо файла»
+    # дают rc=2 с побайтово одинаковым stdout, а прежнее поколение печатало им
+    # всем «❌ my.cnf не подключает /etc/my.cnf.d» — утверждение о содержимом
+    # файла, которого мы не видели. Носитель — file_pattern_info (1.32.21),
+    # список каталога читает общий dir_listing_info.
+    pat = file_pattern_info(checker, MYSQL_CNF, pattern)
+    if pat['state'] in ('unreadable', 'unchecked'):
+        lines.append(f'❌ {MYSQL_CNF}: {pat["note"]} — тюнинг не записываем: '
+                     'сначала нужны права на чтение конфига')
+        return '\n'.join(lines)
+    if pat['state'] == 'absent':
+        lines.append(f'❌ {MYSQL_CNF} не найден — {pat["note"]}. Правка '
+                     'выполняется по месту появления конфига; значения для '
+                     'ручной правки:')
+        lines.extend((conf or '').splitlines())
+        return '\n'.join(lines)
+    if pat['state'] != 'found':
+        # rc=1: файл ПРОЧИТАН и совпадений нет — здесь прежний диагноз честен.
         lines.append(f'❌ {MYSQL_CNF} не подключает {MYSQL_CNF_DIR} — правку '
                      'пришлось бы делать в сам my.cnf. Значения для ручной правки:')
         lines.extend((conf or '').splitlines())
@@ -1008,10 +1031,20 @@ def bitrix_perms_report(checker):
 
 def bitrix_perms_fix(checker):
     lines = ['=== ВОССТАНОВЛЕНИЕ ПРАВ САЙТА ===']
-    out, _, _ = checker.run(f'getent group {q(SITE_GROUP)} >/dev/null && echo ok')
-    if out.strip() != 'ok':
+    # Прежняя форма сливала «группы нет» (rc=2) и «getent нечем спросить»
+    # (rc=127): живой прогон прежнего кода при отсутствующем в PATH getent
+    # напечатал «❌ Группы bitrix нет в системе — прервано» и отменил chown —
+    # лечение, которое оператор обязан сделать руками, было отменено нашей же
+    # слепотой. Носитель — group_presence_info (1.32.21).
+    grp = group_presence_info(checker, SITE_GROUP)
+    if grp['state'] == 'absent':
+        # rc=2 — измеренное отсутствие: прежний отказ здесь правильный.
         lines.append(f'❌ Группы {SITE_GROUP} нет в системе — прервано, '
                      'chown на несуществующую группу ничего не починит')
+        return '\n'.join(lines)
+    if grp['state'] != 'present':
+        lines.append(f'❌ {grp["note"]} — chown не отправлен: отсутствие '
+                     f'группы {SITE_GROUP} этим спросом не измерено')
         return '\n'.join(lines)
 
     lines.append('⚠️ Идём по всему документ-корню: на больших сайтах 1-5 минут.')

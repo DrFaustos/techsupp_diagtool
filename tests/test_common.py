@@ -2372,3 +2372,206 @@ class TestPathAccessDistinguishesWorlds:
         assert c.count('test -w') == 3, c.commands
         assert c.count('ls -1 -p') == 1, c.commands
 
+
+# ===== 1.32.21: содержимое файла решает КОД grep, а не слово ok ==============
+# Замер живьём (настоящий bash 5.3, uid=1000, настоящие chmod; инструмент
+# .ai-free/localize13221.py) по форме «grep -Eq ПАТ ФАЙЛ 2>/dev/null && echo ok»:
+#   паттерн есть            out='ok' rc=0    верный «подключает»
+#   паттерна нет            out=''   rc=1    файл ПРОЧИТАН — честное «нет»
+#   файл есть, chmod 000    out=''   rc=2
+#   файла нет               out=''   rc=2    ТРИ мира одним числом
+#   каталог вместо файла    out=''   rc=2
+# У grep rc=2 значит «файл не открылся»; ПОЧЕМУ — знает только stderr, он
+# заглушён 2>/dev/null, а его текст локализован (замер: «Отказано в доступе»
+# против «Permission denied»), поэтому по строке различать нельзя (закон
+# 1.32.12). Право на слово «файла нет» имеет только достоверный список
+# каталога — ОДНА функция dir_listing_info (1.32.14), а не второй читатель ls.
+FP_FOUND = ('', '', 0)
+FP_NOT_FOUND = ('', '', 1)
+FP_NOT_READABLE = ('', '', 2)
+FP_LISTING = ('my.cnf' + chr(10) + 'my.cnf.rpmsave/', '', 0)
+FP_LISTING_NO_CNF = ('my.cnf.rpmsave/' + chr(10), '', 0)
+FP_BLOCKED = ('ls: cannot open directory: Permission denied' + chr(10), '', 2)
+FP_NO_GREP = ('', 'bash: grep: command not found' + chr(10), 127)
+
+
+class TestFilePatternDistinguishesWorlds:
+    """Спрос «есть ли паттерн в файле» обязан называть мир, а не слово."""
+
+    def test_found_is_answered_by_return_code(self):
+        # Норма: rc=0 от grep — это измерение. Список каталога к нему НЕ
+        # спрашивается: платить вторым вопросом за уже известное — ровно то,
+        # за что серия ругает «умные» проверки (1.32.14, 1.32.20).
+        c = FakeSSH(routes=[('grep -Eq', FP_FOUND)])
+        info = common.file_pattern_info(c, '/etc/my.cnf', '^!includedir')
+        assert info['state'] == 'found', info
+        assert info['checked'] is True, info
+        assert c.count('grep -Eq') == 1, c.commands
+        assert c.count('ls -1 -p') == 0, c.commands
+
+    def test_not_found_is_proven_absence_of_the_pattern(self):
+        # rc=1 у grep — особое число: файл ОТКРЫТ и ПРОЧИТАН, совпадений нет.
+        # Это единственный мир, где прежний диагноз «не подключает — правка
+        # вручную» честен, и он обязан выжить без правок.
+        c = FakeSSH(routes=[('grep -Eq', FP_NOT_FOUND)])
+        info = common.file_pattern_info(c, '/etc/my.cnf', '^!includedir')
+        assert info['state'] == 'not_found', info
+        assert info['checked'] is True, info
+        assert c.count('ls -1 -p') == 0, c.commands
+
+    def test_unreadable_file_is_not_reported_as_no_pattern(self):
+        # Ровно тот мир, где прежний код соврал: файл ЕСТЬ, но не читается.
+        # «Паттерна нет» там — утверждение о содержимом, которого мы не видели.
+        c = FakeSSH(routes=[('grep -Eq', FP_NOT_READABLE),
+                            ('ls -1 -p', FP_LISTING)])
+        info = common.file_pattern_info(c, '/etc/my.cnf', '^!includedir')
+        assert info['state'] == 'unreadable', info
+        assert info['checked'] is False, info
+        assert 'не проверено' in info['note'].lower(), info
+
+    def test_absent_file_needs_the_proven_listing(self):
+        # Обратная ветка: отсутствия ДОКАЗАНО достоверным списком родителя, где
+        # имени нет. Прежний контракт обязан выжить — иначе «не проверено»
+        # вытеснит честное «конфига нет» и оператор перестанет видеть проблему.
+        c = FakeSSH(routes=[('grep -Eq', FP_NOT_READABLE),
+                            ('ls -1 -p', FP_LISTING_NO_CNF)])
+        info = common.file_pattern_info(c, '/etc/my.cnf', '^!includedir')
+        assert info['state'] == 'absent', info
+        assert info['checked'] is True, info
+
+    def test_unreadable_directory_is_unchecked_not_absent(self):
+        # Список не читается: «файла нет» и «файл не виден» побайтово равны
+        # (замер: grep в обоих мирах даёт rc=2), значит здесь рождается
+        # «не проверено», а не догадка.
+        c = FakeSSH(routes=[('grep -Eq', FP_NOT_READABLE),
+                            ('ls -1 -p', FP_BLOCKED)])
+        info = common.file_pattern_info(c, '/etc/my.cnf', '^!includedir')
+        assert info['state'] == 'unchecked', info
+        assert info['checked'] is False, info
+        assert 'не проверено' in info['note'].lower(), info
+
+    def test_missing_grep_is_unchecked_without_paying_extra(self):
+        # rc=127 — доказательство живёт в stderr у оболочки. Ответ про
+        # содержимое при этом неизвестен, а список каталога его не даст:
+        # спрашивать его значило бы платить за то, что состояния не меняет.
+        c = FakeSSH(routes=[('grep -Eq', FP_NO_GREP)])
+        info = common.file_pattern_info(c, '/etc/my.cnf', '^!includedir')
+        assert info['state'] == 'unchecked', info
+        assert info['checked'] is False, info
+        assert c.count('ls -1 -p') == 0, c.commands
+
+    def test_question_carries_no_mute_and_no_ready_word(self):
+        # Статический замок на ФОРМЕ спроса: «2>/dev/null» глушит единственную
+        # подсказку (почему файл не открылся), а «&& echo ok» — готовое слово,
+        # которое и было носителем лжи.
+        c = FakeSSH(routes=[('grep -Eq', FP_FOUND)])
+        common.file_pattern_info(c, '/etc/my.cnf', '^!includedir')
+        assert c.commands, 'носитель ничего не спросил'
+        for s in c.commands:
+            assert '2>/dev/null' not in s, c.commands
+            assert '&&' not in s, c.commands
+            assert 'echo' not in s, c.commands
+        assert any('grep -Eq' in s for s in c.commands), c.commands
+
+    def test_empty_path_is_unchecked_without_asking(self):
+        c = FakeSSH()
+        info = common.file_pattern_info(c, '', '^!includedir')
+        assert info['state'] == 'unchecked' and info['checked'] is False, info
+        assert c.commands == [], c.commands
+
+    def test_empty_pattern_is_rejected_not_guessed(self):
+        # Пустой регуляр матчит ЛЮБУЮ строку: молча приняв его, носитель
+        # заявил бы «паттерн есть» в любом файле. Это не «не проверено», а
+        # активная ложь, поэтому — ValueError, а не догадка.
+        c = FakeSSH()
+        try:
+            common.file_pattern_info(c, '/etc/my.cnf', '')
+        except ValueError as exc:
+            assert 'паттерн' in str(exc).lower() or 'pattern' in str(exc), exc
+        else:
+            raise AssertionError('пустой паттерн принят молча: %s' % c.commands)
+
+    def test_cache_pays_the_parent_once(self):
+        # Отчёт может спрашивать несколько конфигов ОБЩЕГО предка: цена
+        # различения не имеет права расти линейно. Фикстура именно про общего
+        # предок (замер 1.32.20: с вложенными путями проверка краснела по
+        # неверной причине).
+        cache = {}
+        c = FakeSSH(routes=[('grep -Eq', FP_NOT_READABLE),
+                            ('ls -1 -p', FP_LISTING)])
+        for name in ('my.cnf', 'my.cnf.d', 'mysql.cnf'):
+            common.file_pattern_info(c, '/etc/' + name, '^!includedir',
+                                     cache=cache)
+        assert c.count('grep -Eq') == 3, c.commands
+        assert c.count('ls -1 -p') == 1, c.commands
+
+
+# ===== 1.32.21: «нет записи» и «нет утилиты» — разные миры (getent) ==========
+# Замер живьём (.ai-free/localize13221.py) по форме
+# «getent group ГРУППА >/dev/null && echo ok» (PATH подменён в env ребёнка):
+#   группа есть        out='ok' rc=0
+#   группы нет         out=''   rc=2     ДОКАЗАННОЕ отсутствие
+#   getent нет в PATH  out=''   rc=127   мы НЕ СПРОСИЛИ
+# Прежний код смотрел на слово и в мире 127 печатал «Группы bitrix нет в
+# системе — прервано»: отказ лечить права на машине, где признак было нечем
+# измерить. parse_command_probe (1.32.11) здесь НЕ годится: он любой rc!=0 при
+# пустом stdout зовёт unchecked, а rc=2 у getent — ровно измеренное «нет».
+GP_PRESENT = ('', '', 0)
+GP_ABSENT = ('', '', 2)
+GP_NO_TOOL = ('', 'bash: getent: command not found' + chr(10), 127)
+GP_OTHER_FAIL = ('', '', 1)
+
+
+class TestGroupPresenceDistinguishesWorlds:
+    """Существует ли группа: ответ в коде, а «не спросили» — не «нет»."""
+
+    def test_present_is_answered_by_return_code(self):
+        c = FakeSSH(routes=[('getent group', GP_PRESENT)])
+        info = common.group_presence_info(c, 'bitrix')
+        assert info['state'] == 'present', info
+        assert info['checked'] is True, info
+
+    def test_absent_group_is_a_measurement_not_a_guess(self):
+        # rc=2 обязан остаться честным «нет»: прежний отказ лечить права здесь
+        # правильный, и терять его нельзя.
+        c = FakeSSH(routes=[('getent group', GP_ABSENT)])
+        info = common.group_presence_info(c, 'bitrix')
+        assert info['state'] == 'absent', info
+        assert info['checked'] is True, info
+
+    def test_unavailable_tool_is_unchecked_not_absent(self):
+        # Ядро слайса: rc=127 — «нечем спросить». По этому состоянию нельзя ни
+        # утверждать «группы нет», ни отменять лечение (закон серии).
+        c = FakeSSH(routes=[('getent group', GP_NO_TOOL)])
+        info = common.group_presence_info(c, 'bitrix')
+        assert info['state'] == 'unchecked', info
+        assert info['checked'] is False, info
+        assert 'не проверено' in info['note'].lower(), info
+
+    def test_other_failure_is_unchecked(self):
+        # rc=1 у getent — не «нет записи» (для этого есть rc=2). Молчаливый
+        # допуск «любой ненулевой код = нет» вернул бы тот же жест.
+        c = FakeSSH(routes=[('getent group', GP_OTHER_FAIL)])
+        info = common.group_presence_info(c, 'bitrix')
+        assert info['state'] == 'unchecked', info
+        assert info['checked'] is False, info
+
+    def test_question_carries_no_redirect_and_no_word(self):
+        # «>/dev/null» — та самая заглушка: у getent она не мешала ответу, но
+        # ровно она и прятала причину отказа (замер: rc=127 с текстом в stderr).
+        c = FakeSSH(routes=[('getent group', GP_PRESENT)])
+        common.group_presence_info(c, 'bitrix')
+        assert c.commands, 'носитель ничего не спросил'
+        for s in c.commands:
+            assert '>/dev/null' not in s, c.commands
+            assert '&&' not in s, c.commands
+            assert 'echo' not in s, c.commands
+
+    def test_empty_name_is_unchecked_without_asking(self):
+        # Пустое имя — не «группы нет»: «getent group ""» отвечает rc=2, и
+        # молчаливый такой спрос выдал бы отказ лечить по нашей опечатке.
+        c = FakeSSH()
+        info = common.group_presence_info(c, '')
+        assert info['state'] == 'unchecked' and info['checked'] is False, info
+        assert c.commands == [], c.commands
+

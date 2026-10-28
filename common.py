@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.20"
+__version__ = "1.32.21"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -1394,6 +1394,167 @@ def path_access_info(checker, path, mode='w', cache=None):
         why='; '.join(x for x in (('test -%s вернул rc=%s%s'
                                    % (mode, rc, ': ' + why if why else '')),
                                   listing['note']) if x))
+    return info
+
+
+# ======== СОДЕРЖИМОЕ ФАЙЛА: ответ в коде возврата grep (1.32.21) =============
+# Прежняя форма решала по СЛОВУ: «grep -Eq ПАТ ФАЙЛ 2>/dev/null && echo ok».
+# Замер живьём (настоящий bash 5.3, uid=1000, настоящие chmod на реальных
+# файлах; инструмент .ai-free/localize13221.py):
+#   паттерн есть            out='ok' rc=0    верный «подключает»
+#   паттерна нет            out=''   rc=1    файл ПРОЧИТАН — честное «нет»
+#   файл есть, chmod 000    out=''   rc=2
+#   файла нет               out=''   rc=2    ТРИ мира одним числом
+#   каталог вместо файла    out=''   rc=2
+# У grep rc=2 значит «файл не открылся»; ПОЧЕМУ — знает только stderr, а он был
+# заглушён 2>/dev/null, и его текст локализован (замер: «Отказано в доступе»
+# против «Permission denied»), поэтому строкой различать нельзя (закон 1.32.12).
+# Отсюда те же два правила, что у file_presence (1.32.14) и path_access_info
+# (1.32.20): право на «файла нет» имеет только достоверный список каталога, а
+# «прочитано и совпадений нет» говорит КОД ВОЗВРАТА — второй спрос к нему не
+# платится. Отдельно grep 126/127: списка каталога не спрашиваем, он ответа про
+# содержимое не даст (платить за то, что состояния не меняет, нельзя).
+FILE_PATTERN_CMD = 'grep -Eq'
+
+FILE_PATTERN_UNCHECKED_NOTE = (
+    'Содержимое не проверено: {why}. Это не ответ о файле, а отказ спросить: '
+    'grep его не прочитал, поэтому утверждать «паттерна нет» нельзя')
+
+
+def file_pattern_cmd(pattern, path):
+    """Форма запроса: сама команда, без заглушек канала и без &&-дополнения.
+
+    2>/dev/null глушил единственную подсказку о том, ПОЧЕМУ файл не открылся
+    (она живёт в stderr), а «&& echo ok» превращал любое состояние в готовое
+    слово. Форма собирается ЗДЕСЬ, а не на совести вызывающего (урок 1.32.11).
+    """
+    return FILE_PATTERN_CMD + ' ' + q(pattern) + ' ' + q(path)
+
+
+def file_pattern_info(checker, path, pattern, cache=None):
+    """Есть ли паттерн в файле: ответ в коде, «нет файла» — по списку каталога.
+
+    {path, pattern, state, checked, note}, state:
+    found      — rc=0: паттерн есть (это измерение, список к нему не спрашивается);
+    not_found  — rc=1: файл ОТКРЫТ и ПРОЧИТАН, совпадений нет. Единственный мир,
+                 где диагноз «не подключает — правьте вручную» честен;
+    unreadable — rc=2, но имя ЕСТЬ в достоверном списке родителя: «файл на месте,
+                 мы его не прочитали» — лечение правами, а не поиск конфига;
+    absent     — rc=2 и имени в достоверном списке нет: чинить надо путь к файлу;
+    unchecked  — grep недоступен (rc=126/127) либо список не прочитан: «не видно»
+                 и «нет» побайтово равны, поэтому здесь «не проверено».
+
+    Пустой паттерн отклоняется, а не принимается: пустой регуляр матчит любую
+    строку, и молчаливый такой спрос выдал бы «паттерн есть» в любом файле — это
+    активная ложь, а не «не проверено».
+
+    cache — словарь dir_listing_info: у нескольких конфигов общий предок
+    спрашивается один раз.
+    """
+    if not (pattern or '').strip():
+        raise ValueError('file_pattern_info: пустой паттерн — он матчит любую '
+                         'строку, ответ «паттерн есть» был бы ложью')
+    target = (path or '').strip()
+    info = {'path': target, 'pattern': pattern, 'state': 'unchecked',
+            'checked': False, 'note': ''}
+    if not target:
+        info['note'] = FILE_PATTERN_UNCHECKED_NOTE.format(why='пустой путь')
+        return info
+    out, err, rc = checker.run(file_pattern_cmd(pattern, target))
+    if rc == 0:
+        info['state'] = 'found'
+        info['checked'] = True
+        return info
+    if rc == 1:
+        info['state'] = 'not_found'
+        info['checked'] = True
+        info['note'] = 'файл прочитан (rc=1): совпадений с паттерном нет'
+        return info
+    why = _first_line(err) or _first_line(out)
+    if rc in (126, 127):
+        # Самого grep нет: список каталога ответа про содержимое не даст.
+        info['note'] = COMMAND_UNCHECKED_NOTE.format(
+            why=why or ('grep недоступен (rc=%s)' % rc))
+        return info
+    parent, _, name = target.rpartition('/')
+    parent = parent or '/'
+    listing = dir_listing_info(checker, parent, cache)
+    if listing['state'] == 'read':
+        # Ответ дал список: он достоверен (rc=0), и «файла нет» перестало быть
+        # догадкой — при rc=2 grep одинаково отвечает и на отсутствующий файл.
+        if name in listing['names'] or name + '/' in listing['names']:
+            # Файл на месте, но МЫ ЕГО НЕ ПРОЧИТАЛИ: существование — знание
+            # ПОБОЧНОЕ, а заданный признак («есть ли паттерн») остался без
+            # ответа, поэтому checked остаётся ложным. Иначе вызывающий,
+            # который смотрит на checked перед вылечивающим действием, записал
+            # бы тюнинг в конфиг, содержимого которого не видел. RED 1.32.21
+            # поймал это здесь: первая версия ставила checked=True ДО развилки,
+            # и мир «не прочитали» легализовывался ровно тем жестом, который
+            # слайс лечит.
+            info['state'] = 'unreadable'
+            info['note'] = FILE_PATTERN_UNCHECKED_NOTE.format(
+                why='«%s» есть в достоверном списке %s, а %s вернул rc=%s%s'
+                    % (name, parent, FILE_PATTERN_CMD, rc,
+                       ': ' + why if why else ''))
+            return info
+        # «Файла нет» — ответ на заданный вопрос: нет конфига, значит в нём и
+        # паттерна нет, признак измерен и лечимое действие разрешено.
+        info['checked'] = True
+        info['state'] = 'absent'
+        info['note'] = ('файла «%s» в достоверном списке %s нет (%s вернул '
+                        'rc=%s)' % (name, parent, FILE_PATTERN_CMD, rc))
+        return info
+    info['note'] = FILE_PATTERN_UNCHECKED_NOTE.format(
+        why='; '.join(x for x in (('%s вернул rc=%s%s'
+                                   % (FILE_PATTERN_CMD, rc,
+                                      ': ' + why if why else '')),
+                                  listing['note']) if x))
+    return info
+
+
+# ============ НАЛИЧИЕ ГРУППЫ: ответ в коде getent (1.32.21) ===================
+# Прежняя форма — «getent group ГРУППА >/dev/null && echo ok». Замер живьём
+# (PATH подменён в env дочернего процесса):
+#   группа есть        out='ok' rc=0
+#   группы нет         out=''   rc=2     ДОКАЗАННОЕ отсутствие
+#   getent нет в PATH  out=''   rc=127   мы НЕ СПРОСИЛИ
+# Слово в stdout сливало последние два мира, и панель печатала «Группы bitrix нет
+# в системе — прервано» на машине, где признак было нечем измерить: отказ лечить
+# права, порождённый нашей же слепотой. rc=2 здесь — НЕ unchecked (в отличие от
+# parse_command_probe, где любой rc!=0 при пустом stdout есть unchecked): у
+# getent это ровно измеренное «записи нет», и прежний честный отказ обязан
+# выжить.
+GROUP_CMD = 'getent group'
+GROUP_ABSENT_RC = 2
+
+
+def group_presence_info(checker, name):
+    """Существует ли группа: {group, state, checked, note}, state:
+    present / absent (rc=2 — измерено) / unchecked (126/127 и любой иной отказ).
+
+    Имя обязано быть непустым: «getent group ”» отвечает rc=2, и молчаливый
+    такой спрос выдал бы отказ лечить права по нашей же опечатке.
+    """
+    target = (name or '').strip()
+    info = {'group': target, 'state': 'unchecked', 'checked': False,
+            'note': ''}
+    if not target:
+        info['note'] = COMMAND_UNCHECKED_NOTE.format(why='пустое имя группы')
+        return info
+    out, err, rc = checker.run(GROUP_CMD + ' ' + q(target))
+    if rc == 0:
+        info['state'] = 'present'
+        info['checked'] = True
+        return info
+    if rc == GROUP_ABSENT_RC:
+        info['state'] = 'absent'
+        info['checked'] = True
+        info['note'] = ('%s ответил rc=%s: записи о группе «%s» нет'
+                        % (GROUP_CMD, rc, target))
+        return info
+    why = _first_line(err) or _first_line(out)
+    info['note'] = COMMAND_UNCHECKED_NOTE.format(
+        why=why or ('%s вернул rc=%s' % (GROUP_CMD, rc)))
     return info
 
 

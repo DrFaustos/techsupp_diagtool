@@ -289,7 +289,12 @@ class TestMySQL:
 
     def test_tune_refuses_without_includedir(self):
         store = FakeSftpClient()
-        c = FakeSSH(routes=[('free -m', MEM8)], client=store)
+        # 1.32.21: «паттерна нет» обязано быть названо КОДОМ (rc=1 у grep = файл
+        # прочитан, совпадений нет), а не пустым ответом двойника по
+        # умолчанию: rc=0 — это «паттерн ЕСТЬ», то есть прежняя фикстура
+        # доказывала отказ состоянием, противоположным задуманному.
+        c = FakeSSH(routes=[('free -m', MEM8), ('grep -Eq', ('', '', 1))],
+                    client=store)
         out = bx.bitrix_mysql_tune(c)
         assert '❌' in out and store.store == {}
         assert 'innodb_buffer_pool_size = 3200M' in out  # значения для ручной правки
@@ -670,8 +675,11 @@ class TestPerms:
         assert 'неполна' not in out, out
 
     def test_fix_requires_group(self):
-        # группы bitrix нет -> chown отправлять нельзя
-        c = FakeSSH()
+        # группы bitrix нет -> chown отправлять нельзя. 1.32.21: отсутствие
+        # группы — это rc=2 у getent (замер живьём), а НЕ пустой ответ
+        # двойника по умолчанию (rc=0 = «группа есть»): прежняя фикстура
+        # закрепляла ровно тот жест решения по пустоте, что слайс лечит.
+        c = FakeSSH(routes=[('getent group', ('', '', 2))])
         out = bx.bitrix_perms_fix(c)
         assert '❌' in out and 'bitrix' in out   # имя группы названо в ошибке
         assert c.find('chown') is None
@@ -1799,4 +1807,109 @@ class TestPermsAccessWorlds:
         for rel in bx.WRITABLE_DIRS:
             assert rel in out, (rel, out)
         assert out.count('не проверено') >= len(bx.WRITABLE_DIRS), out
+
+
+# ===== 1.32.21: панель читает конфиг и спрашивает группу ДОЛЖНЫМ способом ====
+# Прежнее поколение (замер .ai-free/localize13221.py, БОЕВЫЕ функции с
+# v1.32.20 на настоящих chmod и с подменой PATH) печатало:
+#   «❌ /…/my.cnf не подключает /etc/my.cnf.d — правку пришлось бы делать в сам
+#    my.cnf» — в мире, где my.cnf ЕСТЬ, но не читается (rc=2): утверждение о
+#    содержимом файла, которого мы не видели;
+#   «❌ Группы bitrix нет в системе — прервано» — в мире, где getent НЕТ в PATH
+#    (rc=127): отказ лечить права на машине, где признак было нечем измерить.
+# Фикстуры ниже говорят КОДАМИ ВОЗВРАТА, а не словом 'ok': 'ok' = rc=0 описывал
+# любой отказ как «нет», а живой bash различает 0 / 1 / 2 / 127 (закон серии:
+# фикстура обязана описывать измерение, а не готовое слово).
+MT_GREP_NO = ('', '', 1)              # файл ПРОЧИТАН, совпадений нет
+MT_GREP_UNREAD = ('', '', 2)          # файл не открылся (000 / нет / каталог)
+MT_LISTED = ('my.cnf' + chr(10), '', 0)
+MT_LISTED_OTHER = ('my.cnf.rpmsave' + chr(10), '', 0)
+GP_ABSENT = ('', '', 2)               # записи нет — измерено
+GP_NOTOOL = ('', 'bash: getent: command not found' + chr(10), 127)
+
+
+class TestMysqlTuneDistinguishesConfigWorlds:
+    '''«Паттерна нет», «файл не читается» и «конфига нет» — три разных отказа.'''
+
+    def test_unreadable_config_is_not_reported_as_no_includedir(self):
+        # Ядро слайса. Файл есть (имя в достоверном списке родителя), но grep
+        # его не открыл: прежний ответ предписывал оператору править вручную
+        # файл, который не открывается даже под root-сессией инструмента.
+        c = FakeSSH(routes=[('free -m', MEM8),
+                            ('grep -Eq', MT_GREP_UNREAD),
+                            ('ls -1 -p', MT_LISTED)],
+                    client=FakeSftpClient())
+        out = bx.bitrix_mysql_tune(c)
+        assert 'не проверено' in out, out
+        assert 'не подключает' not in out, out
+        assert c.find('chmod 600') is None, c.commands
+
+    def test_absent_config_says_absent(self):
+        # Обратная ветка: отсутствия ДОКАЗАНО списком родителя, где имени нет.
+        # Здесь честен вердикт «конфига нет», а не «не подключает»: оператору
+        # нужно чинить путь к конфигу, а не искать в нём !includedir.
+        c = FakeSSH(routes=[('free -m', MEM8),
+                            ('grep -Eq', MT_GREP_UNREAD),
+                            ('ls -1 -p', MT_LISTED_OTHER)],
+                    client=FakeSftpClient())
+        out = bx.bitrix_mysql_tune(c)
+        assert 'не найден' in out, out
+        assert 'не подключает' not in out, out
+        assert c.find('chmod 600') is None, c.commands
+
+    def test_config_without_pattern_keeps_the_honest_verdict(self):
+        # Обратный контроль (запрещающий guard обязан иметь контрпример): rc=1
+        # означает «файл прочитан, совпадений нет» — прежний диагноз здесь
+        # честен и обязан выжить, иначе «не проверено» вытеснит реальную
+        # проблему и значения для ручной правки пропадут из отчёта.
+        c = FakeSSH(routes=[('free -m', MEM8), ('grep -Eq', MT_GREP_NO)],
+                    client=FakeSftpClient())
+        out = bx.bitrix_mysql_tune(c)
+        assert 'не подключает' in out, out
+        assert 'не проверено' not in out, out
+        assert 'innodb_buffer_pool_size' in out, out
+
+    def test_question_does_not_mute_the_reason(self):
+        # Замок на ФОРМЕ: «2>/dev/null» глушил единственное доказательство
+        # (grep пишет «почему не открыл» в stderr), а «&& echo ok» — готовое
+        # слово, которое и было носителем. Проверяется форма спроса, а не то,
+        # что «ок больше не печатается».
+        c = FakeSSH(routes=[('free -m', MEM8), ('grep -Eq', MT_GREP_NO)],
+                    client=FakeSftpClient())
+        bx.bitrix_mysql_tune(c)
+        cmd = c.find('grep -Eq')
+        assert cmd is not None, c.commands
+        assert '2>/dev/null' not in cmd, c.commands
+        assert '&&' not in cmd and 'echo' not in cmd, c.commands
+
+
+class TestPermsFixNeedsAnAnswerAboutTheGroup:
+    '''Отказывать в починке прав можно по измеренному «нет», не по молчанию.'''
+
+    def test_unavailable_getent_does_not_refuse_as_no_group(self):
+        # Ядро слайса: у getent нет в PATH. Прежний код печатал «группы нет в
+        # системе» и отменял chown — лечение, которое оператор обязан сделать
+        # руками, было отменено нашей же слепотой.
+        c = FakeSSH(routes=[('getent group', GP_NOTOOL)])
+        out = bx.bitrix_perms_fix(c)
+        assert 'не проверено' in out, out
+        assert 'нет в системе' not in out, out
+        assert c.find('chown') is None, c.commands
+
+    def test_absent_group_keeps_the_honest_refusal(self):
+        # Обратный контроль: rc=2 — доказанное отсутствие группы, прежний
+        # отказ здесь правильный и обязан выжить слово в слово по смыслу.
+        c = FakeSSH(routes=[('getent group', GP_ABSENT)])
+        out = bx.bitrix_perms_fix(c)
+        assert 'нет в системе' in out, out
+        assert 'не проверено' not in out, out
+        assert c.find('chown') is None, c.commands
+
+    def test_question_asks_the_group_without_muting(self):
+        c = FakeSSH(routes=[('getent group', ('', '', 0))])
+        bx.bitrix_perms_fix(c)
+        cmd = c.find('getent group')
+        assert cmd is not None, c.commands
+        assert '>/dev/null' not in cmd, c.commands
+        assert '&&' not in cmd and 'echo' not in cmd, c.commands
 
