@@ -2,7 +2,7 @@
 import re
 import socket
 
-from common import (q, create_backup, write_remote_file,
+from common import (q, create_backup, write_remote_file, read_file_info,
                     # Состояние резолвера спрашивает ОДНА функция
                     # (1.32.6-1.32.7): пустой stdout systemctl —
                     # «система не ответила», а не «не активно», и
@@ -10,6 +10,42 @@ from common import (q, create_backup, write_remote_file,
                     # форме, здесь особенно: ветка пишет файл.
                     unit_status_info,
                     resolver_probe_info)
+
+# Пути объявлены константами, а не вшиты в строки: вопрос к файлу (чтение)
+# и ответ в него (запись) обязаны называть ОДНО значение. В прежнем коде
+# «/etc/resolv.conf» был написан пять раз: правка одного места разъезжалась с остальными
+# с остальными (тот же закон, что привёл к FSTAB_PATH в 1.32.22).
+RESOLV_CONF = '/etc/resolv.conf'
+RESOLVED_CONF = '/etc/systemd/resolved.conf'
+
+# Отказ чтения называется ОДНОЙ строкой во всех трёх точках: оператор читает
+# один диагноз, где бы он ни возник. Слово «не прочитан» — не «не найден» и
+# не «пуст»: причину называет носитель (RF_TEXT), поэтому здесь нет ни одной
+# выдуманной формулировки (закон серии: отчёт обязан называть источник).
+READ_GAP = '❌ {path} не прочитан: {reason}. Это НЕ «резолверов нет».'
+
+
+def _nameservers_from_text(text):
+    """Резолверы из содержимого resolv.conf — ОДИН парсер для отчёта и диалога.
+
+    Прежний код считывал одно и то же два раза разными способами: отчёт
+    разбирал строки python'ом (`startswith('nameserver')`), а диалог — пайпом
+    `grep -E "^nameserver" | awk`. Два парсера на один признак однажды
+    разъезжаются, и оператор видит в отчёте один список, а в диалоге другой.
+
+    Комментированная строка не резолвер: `# nameserver 9.9.9.9` — это не
+    работающий сервер, и прежний `grep -E "^nameserver"` её отбрасывал только
+    потому, что якорь `^` не пропускал '#'; здесь это сказано явно.
+    """
+    found = []
+    for line in (text or '').splitlines():
+        line = line.strip()
+        if not line.startswith('nameserver'):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            found.append(parts[1])
+    return found
 
 
 # ==================== DNS ФУНКЦИИ ====================
@@ -106,22 +142,34 @@ def dns_resolvers_report(checker):
     lines = []
     lines.append("=== DNS-РЕЗОЛВЕРЫ НА СЕРВЕРЕ ===")
 
-    out, _, _ = checker.run('cat /etc/resolv.conf 2>/dev/null')
-    if not out.strip():
-        lines.append("❌ Не удалось прочитать /etc/resolv.conf")
+    # Прежняя форма решала ПО ПУСТОТЕ stdout: `cat ПУТЬ 2>/dev/null` и
+    # `if not out.strip()`. Пустоту дают три РАЗНЫХ мира (замер, породивший
+    # read_file_info в 1.21.0: rc=1 у cat — это и «нет прав», и «нет файла», а
+    # rc=0 бывает у прочитанного пустого файла), а лечатся они противоположно:
+    # права, раскладка, и «резолвинг ведёт systemd-resolved — не трогай».
+    # Код возврата выбрасывался на входе в функцию (out, _, _), а канал с
+    # причиной глушил 2>/dev/null.
+    read = read_file_info(checker, RESOLV_CONF)
+    if read['content'] is None:
+        lines.append(READ_GAP.format(path=RESOLV_CONF,
+                                     reason=read['reason'] or ''))
         return "\n".join(lines)
 
-    lines.append("Содержимое /etc/resolv.conf:\n" + out)
+    content = read['content']
+    lines.append("Содержимое %s:\n%s" % (RESOLV_CONF,
+                                         content if content.strip() else '(пусто)'))
 
-    nameservers = []
-    for line in out.splitlines():
-        if line.strip().startswith('nameserver'):
-            parts = line.split()
-            if len(parts) >= 2:
-                nameservers.append(parts[1])
-
+    nameservers = _nameservers_from_text(content)
     if not nameservers:
-        lines.append("❌ В /etc/resolv.conf не найдены nameserver'ы")
+        if not content.strip():
+            # Прочитанный ПУСТОЙ файл — не «не удалось прочитать»: на хостах с
+            # resolved resolv.conf законно пуст, и «не удалось» отправило бы
+            # оператора проверять права там, где всё в порядке.
+            lines.append("❌ %s пуст: в нём не найдены nameserver'ы — вероятно, "
+                         "резолвинг ведёт systemd-resolved, и «сменить резолверы» "
+                         "здесь значит править не тот файл." % RESOLV_CONF)
+        else:
+            lines.append("❌ В %s не найдены nameserver'ы" % RESOLV_CONF)
         return "\n".join(lines)
 
     lines.append(f"\nНайдено DNS-серверов: {len(nameservers)}")
@@ -161,10 +209,23 @@ def dns_resolvers_report(checker):
 
 
 def get_current_dns_resolvers(checker):
-    out, _, _ = checker.run('grep -E "^nameserver" /etc/resolv.conf 2>/dev/null | awk \'{print $2}\'')
-    if out.strip():
-        return [ns.strip() for ns in out.splitlines() if ns.strip()]
-    return []
+    """Список резолверов либо СТРОКА-ОТЧЁТ, если файл не прочитан.
+
+    Контракт возвращаемого значения — не мелочь: значение ест gui_dns.
+    _open_edit_dns_dialog, и там список открывает диалог редактирования, а
+    строка только логируется (тот же контракт, что у get_domains). Прежний код
+    при отказе чтения возвращал [] — то есть «резолверов нет», — и диалог
+    открывался поверх признака, которого не было: оператор жмёт «Применить», и
+    set_dns_resolvers перезаписывает конфиг.
+
+    Пайп `grep -E "^nameserver" ... | awk` выбрасывал код grep (rc конвейера
+    принадлежит awk) и глушил причину, поэтому «не прочитали», «файла нет» и
+    «в файле нет записей» для него были одним [].
+    """
+    read = read_file_info(checker, RESOLV_CONF)
+    if read['content'] is None:
+        return READ_GAP.format(path=RESOLV_CONF, reason=read['reason'] or '')
+    return _nameservers_from_text(read['content'])
 
 
 def set_dns_resolvers(checker, nameservers):
@@ -196,31 +257,61 @@ def set_dns_resolvers(checker, nameservers):
         return "\n".join(lines)
 
     if resolved['status'] != 'active':
-        lines.append("systemd-resolved не активен. Редактируем /etc/resolv.conf напрямую.")
-        backup_path = create_backup(checker, '/etc/resolv.conf', 'dns')
+        lines.append("systemd-resolved не активен. Редактируем %s напрямую."
+                     % RESOLV_CONF)
+        backup_path = create_backup(checker, RESOLV_CONF, 'dns')
         if backup_path:
             lines.append(f"✅ Резервная копия создана: {backup_path}")
         else:
-            lines.append("⚠️ Не удалось создать резервную копию /etc/resolv.conf")
+            lines.append("⚠️ Не удалось создать резервную копию %s" % RESOLV_CONF)
 
         new_content = "# Generated by SSH Diagnostic Tool\n"
         for ns in valid_ns:
             new_content += f"nameserver {ns}\n"
 
-        ok, err = write_remote_file(checker, '/etc/resolv.conf', new_content)
+        ok, err = write_remote_file(checker, RESOLV_CONF, new_content)
         if not ok:
             lines.append(f"❌ Ошибка записи: {err}")
         else:
-            lines.append("✅ /etc/resolv.conf обновлён.")
-            out_check, _ = checker.exec_command('cat /etc/resolv.conf')
-            lines.append("\nСодержимое /etc/resolv.conf:\n" + out_check)
+            lines.append("✅ %s обновлён." % RESOLV_CONF)
+            # Проверка результата обязана смотреть ФАЙЛ, а не наше намерение:
+            # форма прежнего контроля (exec_command + cat без состояния) здесь
+            # оставлена намеренно — она только показывает, что записалось, и
+            # ничего не решает по пустоте.
+            out_check, _ = checker.exec_command('cat ' + q(RESOLV_CONF))
+            lines.append("\nСодержимое %s:\n%s" % (RESOLV_CONF, out_check))
         return "\n".join(lines)
 
     lines.append("Обнаружен systemd-resolved. Настраиваем глобальные DNS и интерфейсы.")
-    out_conf, _, _ = checker.run('cat /etc/systemd/resolved.conf 2>/dev/null')
+    # Это тяжёлое место слайса: ниже по new_conf_lines строится НОВЫЙ
+    # /etc/systemd/resolved.conf и уходит на машину через write_remote_file.
+    # Прежняя форма при отказе чтения давала out_conf == '' ->
+    # new_conf_lines == [] -> dns_found == False, и файл перезаписывался
+    # содержимым из двух строк: FallbackDNS, DNSSEC, Cache, Domains, MulticastDNS
+    # терялись молча (замер: cat различает «нет прав» и «нет файла» одним rc=1,
+    # а 2>/dev/null прятал единственную строку с причиной).
+    # Развилка смотрит state, а не только content: у read_file_info у missing
+    # content тоже None, но ОТСУТСТВИЕ доказано — создавать [Resolve] честно
+    # (терять нечего). Отказ — только unreadable / unchecked / isdir / readerr.
+    read_conf = read_file_info(checker, RESOLVED_CONF)
+    if read_conf['state'] != 'missing' and read_conf['content'] is None:
+        lines.append('❌ %s не прочитан: %s — файл НЕ меняем. Перезапись по '
+                     'непрочитанному конфигу оставила бы в нём только [Resolve] '
+                     'и DNS=, и прочие настройки резолвинга (FallbackDNS, '
+                     'DNSSEC, Cache, Domains) потерялись бы.'
+                     % (RESOLVED_CONF, read_conf['reason'] or ''))
+        lines.append('Пока файл не читается, не меняем и per-interface DNS, и '
+                     'службу: часть настроек мы не видели.')
+        return "\n".join(lines)
+    # Итерация — по ПРОЧИТАННОМУ содержимому (src_lines), накопление — в
+    # new_conf_lines. Два разных списка, и это не стиль: тело цикла делает
+    # append в new_conf_lines, поэтому обход того же списка не заканчивается
+    # никогда (замер: прогон test_dns висел 240 с, compile при этом зелёный).
+    src_lines = [] if read_conf['content'] is None \
+        else read_conf['content'].splitlines()
     new_conf_lines = []
     dns_found = False
-    for line in out_conf.splitlines():
+    for line in src_lines:
         if re.match(r'^#?\s*DNS\s*=', line):
             new_conf_lines.append(f'DNS={" ".join(valid_ns)}')
             dns_found = True
@@ -238,11 +329,11 @@ def set_dns_resolvers(checker, nameservers):
             new_conf_lines.append(f'DNS={" ".join(valid_ns)}')
     new_content = '\n'.join(new_conf_lines) + '\n'
 
-    ok, err = write_remote_file(checker, '/etc/systemd/resolved.conf', new_content)
+    ok, err = write_remote_file(checker, RESOLVED_CONF, new_content)
     if not ok:
-        lines.append(f"❌ Ошибка записи resolved.conf: {err}")
+        lines.append(f"❌ Ошибка записи {RESOLVED_CONF}: {err}")
     else:
-        lines.append("✅ /etc/systemd/resolved.conf обновлён.")
+        lines.append("✅ %s обновлён." % RESOLVED_CONF)
 
     out_ifaces, _, _ = checker.run("ip -o link show | awk -F': ' '{print $2}' | grep -v lo")
     interfaces = [iface.strip() for iface in out_ifaces.splitlines() if iface.strip()]

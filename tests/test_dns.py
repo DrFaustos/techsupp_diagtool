@@ -11,7 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from support import FakeSSH, FakeSftpClient
+from support import FakeSSH, FakeSftpClient, rf_answer
 import dns as dns_mod
 
 
@@ -123,33 +123,60 @@ class TestDnsReportLocal:
 
 # ==================== резолверы: чтение ====================
 class TestGetResolvers:
+    # Фикстуры 1.32.23 кормят НОСИТЕЛЬ (RFSTATE), а не текст по игле пути.
+    # Прежняя ('nameserver', '1.1.1.1\n8.8.8.8\n') подсовывала продукту ответ
+    # без маркера, то есть state=None («маркера не было» — совместимость с
+    # чужой командой), и тест зеленодел по НЕВЕРНОЙ причине: он проверял
+    # разбор строки, а не то, что чтение различает состояния.
+
     def test_parses_nameservers(self):
-        c = FakeSSH(routes=[('nameserver', '1.1.1.1\n8.8.8.8\n')])
+        c = FakeSSH(routes=[('resolv.conf', rf_answer(
+            'readable', 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n'))])
         assert dns_mod.get_current_dns_resolvers(c) == ['1.1.1.1', '8.8.8.8']
 
     def test_empty_when_nothing(self):
-        assert dns_mod.get_current_dns_resolvers(FakeSSH()) == []
+        # Прочитанный ПУСТОЙ файл — «резолверов нет», а не «не удалось»:
+        # read_file_info отдаёт readable с content == '' именно для этого.
+        c = FakeSSH(routes=[('resolv.conf', rf_answer('readable'))])
+        assert dns_mod.get_current_dns_resolvers(c) == []
 
 
 class TestResolversReport:
+    # Перевод на состояния см. выше в TestGetResolvers: игла по пути ловила и
+    # команду носителя, поэтому отчёт строился на ответе state=None.
+
     def test_lists_and_probes_each_ns(self):
         c = FakeSSH(routes=[
-            ('/etc/resolv.conf', 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n'),
+            ('/etc/resolv.conf', rf_answer(
+                'readable', 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n')),
             ('google.com A', DIG_NOERROR),
         ])
         out = dns_mod.dns_resolvers_report(c)
         assert 'Найдено DNS-серверов: 2' in out
         assert '1.1.1.1: доступен' in out
-        assert c.count('@') == 2  # по одному dig на каждый резолвер
+        assert c.count('dig') == 2  # по одному dig на каждый резолвер
+        # Норма: ровно ОДИН спрос состояния — второй читатель того же файла.
+        assert c.count('RFSTATE') == 1, c.commands
 
     def test_unreadable_resolv_conf(self):
-        out = dns_mod.dns_resolvers_report(FakeSSH())
-        assert 'Не удалось прочитать /etc/resolv.conf' in out
+        c = FakeSSH(routes=[('/etc/resolv.conf', (
+            rf_answer('unreadable'),
+            'cat: /etc/resolv.conf: Permission denied', 1))])
+        out = dns_mod.dns_resolvers_report(c)
+        assert 'не прочитан' in out, out
+        assert 'прав' in out, 'причина обязана доехать до оператора: ' + out
+        # Отказ обязан запретить и утверждение о содержимом, и диагноз
+        # «резолверов нет»: ниже по этому отчёту оператор жмёт «сменить
+        # резолверы», и set_dns_resolvers перезапишет файл.
+        assert 'Содержимое' not in out, out
+        assert 'не найдены nameserver' not in out, out
 
     def test_no_nameservers(self):
-        c = FakeSSH(routes=[('/etc/resolv.conf', '# пусто\n')])
+        c = FakeSSH(routes=[('/etc/resolv.conf', rf_answer('readable',
+                                                           '# comment\n'))])
         out = dns_mod.dns_resolvers_report(c)
         assert 'не найдены nameserver' in out
+        assert 'не прочитан' not in out  # файл ПРОЧИТАН: диагноз про содержимое
 
 
 # ==================== резолверы: замена ====================
@@ -260,15 +287,20 @@ class TestSetResolversPlain:
 class TestSetResolversResolved:
     """Сценарий с systemd-resolved: правим resolved.conf и resolvectl по интерфейсам."""
 
-    def _checker(self, resolved_conf='[Resolve]\n#DNS=8.8.8.8\nCache=yes\n'):
+    RESOLVED = '[Resolve]\n#DNS=8.8.8.8\nCache=yes\n'
+
+    def _checker(self, resolved_conf=None):
+        # resolved_conf — ОТВЕТ НОСИТЕЛЯ (rf_answer/кортеж), а не текст: игла
+        # по пути ловила и команду RFSTATE, и отчёт строился на state=None.
         client = FakeSftpClient()
         c = FakeSSH(routes=[
             ('is-active systemd-resolved', 'active\n'),
-            ('cat /etc/systemd/resolved.conf', resolved_conf),
+            ('systemd/resolved.conf', resolved_conf if resolved_conf
+             is not None else rf_answer('readable', self.RESOLVED)),
             ('ip -o link show', 'eth0\n'),
             ('resolvectl dns', ('', '', 0)),
             ('resolvectl status', '  DNS Servers: 1.1.1.1\n'),
-            ('cat /etc/resolv.conf', 'nameserver 127.0.0.53\n'),
+            ('/etc/resolv.conf', 'nameserver 127.0.0.53\n'),
         ], client=client)
         return c, client
 
@@ -282,7 +314,8 @@ class TestSetResolversResolved:
         assert 'resolvectl' in out or '✅' in out
 
     def test_dns_line_added_when_absent(self):
-        c, client = self._checker('[Resolve]\nCache=yes\n')
+        c, client = self._checker(
+            rf_answer('readable', '[Resolve]\nCache=yes\n'))
         dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
         written = client.store['/etc/systemd/resolved.conf']
         assert written.index('[Resolve]') < written.index('DNS=1.1.1.1')
@@ -412,13 +445,19 @@ class TestSetResolversResolvedFailures:
               ('resolvectl status', ''),
               ('cat /etc/resolv.conf', '')]
 
-    def _checker(self, resolved_conf, client):
-        return FakeSSH(routes=[('cat /etc/systemd/resolved.conf', resolved_conf)
+    def _checker(self, answer, client):
+        # answer — ОТВЕТ НОСИТЕЛЯ (rf_answer), а не текст. Прежняя игла
+        # 'cat /etc/systemd/resolved.conf' ловила и RFSTATE-команду, и ответ
+        # без маркера уходил в ветку совместимости state=None («ответ от чужой
+        # команды»): тест зеленодел по НЕВЕРНОЙ причине, не проверяя, что
+        # отказ чтения вообще различается (урок 1.32.23).
+        return FakeSSH(routes=[('systemd/resolved.conf', answer)
                               ] + self.ROUTES, client=client)
 
     def test_config_without_resolve_section_gets_section(self):
         client = FakeSftpClient()
-        c = self._checker('# тут секции нет\nCache=yes\n', client)
+        c = self._checker(rf_answer('readable', '# тут секции нет\nCache=yes\n'),
+                          client)
         dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
         written = client.store['/etc/systemd/resolved.conf']
         assert '[Resolve]' in written
@@ -430,16 +469,23 @@ class TestSetResolversResolvedFailures:
             def open_sftp(self):
                 raise IOError('ssh channel closed')
 
-        c = self._checker('[Resolve]\nCache=yes\n', NoSftp())
+        c = self._checker(rf_answer('readable', '[Resolve]\nCache=yes\n'),
+                          NoSftp())
         out = dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
-        assert '❌ Ошибка записи resolved.conf' in out
+        # Путь в отчёте теперь ПОЛНЫЙ (он пришёл из RESOLVED_CONF): отчёт
+        # обязан называть тот самый файл, в который не смог записать, —
+        # «resolved.conf» и «/etc/systemd/resolved.conf» для оператора разные
+        # файлы на экране (закон серии: называть источник).
+        assert '❌ Ошибка записи /etc/systemd/resolved.conf' in out, out
+        assert 'ssh channel closed' in out, 'причина обязана доехать: ' + out
         assert '✅ /etc/systemd/resolved.conf обновлён.' not in out
 
     def test_resolvectl_failure_reported_per_interface(self):
         client = FakeSftpClient()
         c = FakeSSH(routes=[
             ('is-active systemd-resolved', 'active\n'),
-            ('cat /etc/systemd/resolved.conf', '[Resolve]\nCache=yes\n'),
+            ('systemd/resolved.conf',
+             rf_answer('readable', '[Resolve]\nCache=yes\n')),
             ('ip -o link show', 'eth0\n'),
             # именно устанавливающая команда: сброс (resolvectl dns eth0 "")
             # остаётся с ответом по умолчанию
@@ -549,3 +595,182 @@ class TestResolversAvailability:
             assert '|' not in cmd, cmd
 
 
+
+
+# ==================== 1.32.23: чтение конфигов резолверов состоянием =========
+class TestResolversReportReadStates:
+    """«Не прочитали», «пуст» и «нет записей» — три разных ответа оператора.
+
+    Прежняя форма (dns.py:109):
+
+        out, _, _ = checker.run('cat /etc/resolv.conf 2>/dev/null')
+        if not out.strip():
+            return "Не удалось прочитать /etc/resolv.conf"
+
+    решает ПО ПУСТОТЕ stdout, а пустоту дают три мира: «файл не открылся»,
+    «файла нет» и «прочитан и пуст». Третий — не неудача: на части хостов
+    resolv.conf законно пуст (резолвинг ведёт resolved), и «не удалось
+    прочитать» отправляет оператора проверять права там, где всё в порядке.
+    Второй канал (причину отказа) глушил 2>/dev/null, а код возврата
+    выбрасывался на входе в функцию.
+    """
+
+    @staticmethod
+    def _report(answer):
+        c = FakeSSH(routes=[('/etc/resolv.conf', answer),
+                            ('google.com A', DIG_NOERROR)])
+        return c, dns_mod.dns_resolvers_report(c)
+
+    def test_missing_file_says_missing_not_failed_to_read(self):
+        c, out = self._report((
+            rf_answer('missing'),
+            'cat: /etc/resolv.conf: No such file or directory', 1))
+        assert 'не прочитан' in out, out
+        assert 'нет на сервере' in out, 'отсутствие — другой диагноз, чем ' \
+            'права: ' + out
+        assert 'Содержимое' not in out, out
+
+    def test_empty_read_is_reported_as_empty_not_as_failure(self):
+        c, out = self._report(rf_answer('readable'))
+        assert 'не прочитан' not in out, out
+        assert 'пуст' in out, 'прочитанный пустой файл обязан назваться ' \
+            'пустым: ' + out
+        assert 'не найдены nameserver' in out, out
+
+    def test_unreadable_does_not_probe_resolvers_it_never_saw(self):
+        c, out = self._report((
+            rf_answer('unreadable'),
+            'cat: /etc/resolv.conf: Permission denied', 1))
+        # Ни одного dig: проверять доступность резолверов, которых мы не
+        # видели, — второй выдуманный признак поверх первого.
+        assert c.find('dig') is None, c.commands
+        assert c.count('RFSTATE') == 1, 'цена отказа — один спрос: ' \
+            + str(c.commands)
+
+    def test_read_command_is_not_blinded(self):
+        c, _ = self._report(rf_answer('readable', 'nameserver 1.1.1.1\n'))
+        cmd = c.find('RFSTATE')
+        assert cmd is not None, c.commands
+        assert '2>/dev/null' not in cmd, cmd
+        # Путь проверяется защитным цитированием common.q(): оно кавычит
+        # ТОЛЬКО то, что требует кавычек (замер: '/etc/my file' — в кавычках,
+        # '/etc/resolv.conf' — без), поэтому требовать кавычки от безопасного
+        # пути значило бы краснеть по корректному продукту (1.32.22: та же
+        # ошибка формулировки была у сравнения grep -E/-F на записи без
+        # метасимволов). Проверяется то, что решает дело: путь ушёл НОСИТЕЛЮ и
+        # прежняя ложная форма (cat с заглушкой и без состояния) не вернулась.
+        assert '/etc/resolv.conf' in cmd, cmd
+        assert c.find('cat /etc/resolv.conf 2>/dev/null') is None, c.commands
+        assert c.count('RFSTATE') == 1, c.commands
+
+
+class TestGetResolversReadStates:
+    """Пустой список имеет право быть только ответом прочитанного файла.
+
+    Значение ест gui_dns: список открывает диалог редактирования, строка —
+    логируется как отчёт (тот же контракт, что у get_domains). Возвращать []
+    при «не прочитали» значит показать диалог перезаписи поверх признака,
+    которого нет: оператор нажмёт «Применить», и set_dns_resolvers перепишет
+    конфиг.
+    """
+
+    def test_unreadable_returns_a_report_not_an_empty_list(self):
+        c = FakeSSH(routes=[('/etc/resolv.conf', (
+            rf_answer('unreadable'),
+            'cat: /etc/resolv.conf: Permission denied', 1))])
+        got = dns_mod.get_current_dns_resolvers(c)
+        assert isinstance(got, str), 'список = «резолверов нет» = право на ' \
+            'диалог перезаписи: %r' % (got,)
+        assert 'не прочитан' in got and 'прав' in got, got
+
+    def test_silence_is_unchecked_not_absent(self):
+        # Молчание сервера (пустой ответ без маркера) — «не проверено», а не
+        # «резолверов нет» (закон 1.16-1.20; прежний тест требовал здесь []).
+        got = dns_mod.get_current_dns_resolvers(FakeSSH())
+        assert isinstance(got, str), repr(got)
+        assert 'не' in got, got
+
+    def test_parses_exactly_one_read_of_the_file(self):
+        c = FakeSSH(routes=[('/etc/resolv.conf', rf_answer(
+            'readable', 'nameserver 1.1.1.1\n# nameserver 9.9.9.9\n'))])
+        assert dns_mod.get_current_dns_resolvers(c) == ['1.1.1.1']
+        assert c.count('RFSTATE') == 1, c.commands
+        # Комментированная строка не резолвер: прежняя форма спрашивала
+        # grep -E "^nameserver", и это тот же парсер, что у отчёта.
+
+
+class TestSetResolversResolvedUnread:
+    """Непрочитанный resolved.conf не даёт права его перезаписать.
+
+    Прежняя форма (dns.py:220):
+
+        out_conf, _, _ = checker.run('cat /etc/systemd/resolved.conf 2>/dev/null')
+
+    При отказе чтения out_conf == '', new_conf_lines == [], dns_found == False,
+    и ниже код дописывает [Resolve] + DNS= и ОТПРАВЛЯЕТ файл на машину
+    (write_remote_file). Итог: все прочие настройки — FallbackDNS, DNSSEC,
+    Cache, Domains, MulticastDNS — теряются молча. Это тот же вес, что у
+    fstab-слайса 1.32.22: ложь заканчивается записью в файл, от которого
+    зависит сеть машины после перезагрузки.
+    """
+
+    def _checker(self, answer):
+        client = FakeSftpClient()
+        c = FakeSSH(routes=[
+            ('is-active systemd-resolved', 'active\n'),
+            ('systemd/resolved.conf', answer),
+            ('ip -o link show', 'eth0\n'),
+            ('resolvectl dns', ('', '', 0)),
+            ('resolvectl status', '  DNS Servers: 1.1.1.1\n'),
+            ('/etc/resolv.conf', 'nameserver 127.0.0.53\n'),
+        ], client=client)
+        return c, client
+
+    def test_unreadable_conf_is_not_overwritten(self):
+        c, client = self._checker((
+            rf_answer('unreadable'),
+            'cat: /etc/systemd/resolved.conf: Permission denied', 1))
+        out = dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
+        assert client.store == {}, 'запись по непрочитанному конфигу: %r' \
+            % (client.store,)
+        assert 'не меняем' in out, out
+        assert 'потер' in out, 'отчёт обязан назвать цену записи: ' + out
+
+    def test_unreadable_conf_does_not_touch_the_service(self):
+        c, _ = self._checker((
+            rf_answer('unreadable'),
+            'cat: /etc/systemd/resolved.conf: Permission denied', 1))
+        dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
+        # Раз конфиг не прочитан — не меняем НИЧЕГО: ни per-interface DNS, ни
+        # рестарт службы (рестарт — тоже действие над машиной).
+        assert c.find('resolvectl dns') is None, c.commands
+        assert c.find('systemctl restart') is None, c.commands
+
+    def test_unreadable_reason_reaches_operator(self):
+        c, _ = self._checker((
+            rf_answer('unreadable'),
+            'cat: /etc/systemd/resolved.conf: Permission denied', 1))
+        out = dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
+        assert 'прав' in out, out
+
+    def test_missing_conf_may_be_created(self):
+        # Обратный контроль: ОТСУТСТВИЕ доказано (файла нет — терять нечего),
+        # поэтому создание нового [Resolve] — честное лечение, а не отказ.
+        c, client = self._checker((
+            rf_answer('missing'),
+            'cat: /etc/systemd/resolved.conf: No such file or directory', 1))
+        out = dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
+        written = client.store['/etc/systemd/resolved.conf']
+        assert '[Resolve]' in written and 'DNS=1.1.1.1' in written, written
+        assert 'не меняем' not in out, out
+
+    def test_read_conf_command_is_not_blinded(self):
+        c, _ = self._checker(rf_answer('readable', self_resolved_body()))
+        dns_mod.set_dns_resolvers(c, ['1.1.1.1'])
+        cmd = c.find('RFSTATE')
+        assert cmd is not None, c.commands
+        assert '2>/dev/null' not in cmd, cmd
+
+
+def self_resolved_body():
+    return '[Resolve]\nDNS=8.8.8.8\nCache=yes\n'

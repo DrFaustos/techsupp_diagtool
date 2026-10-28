@@ -82,12 +82,21 @@ DETECTORS = (('CJK', CJK_DEFECT),
 # тем правится этим слайсом, потому что зависимость от стаба теперь заявлена в
 # нём явно. Файл, который серия трогает и который пишет текст для оператора
 # (gui_themes зовёт messagebox.showerror), обязан стоять под сканом.
+#
+# 1.32.23: здесь же tests/test_dns.py. Порядок тот же, что с test_gui_themes:
+# сначала ad-hoc замер боевыми детекторами по этому файлу (776 строк, 0
+# дефектов), только потом расширение списка — иначе список расширялся бы под
+# шум и переставал бы означать «проверено, чисто». Файл пишет текст, который
+# читает оператор (отчёт про резолверы, отказ перезаписывать resolved.conf), и
+# правится этим слайсом, поэтому вне скана он оставаться не может: следующий
+# слайс принёс бы в него строку со склейкой, и заметить её было бы нечем.
 HYGIENE_FILES = ('panels.py', 'common.py', 'logs.py', 'bitrix.py',
                  'files.py', 'dns.py', 'metrics.py', 'diagnostic.py',
                  'gui_bitrix.py', 'gui_swap.py',
                  'tests/test_panels.py', 'tests/support.py',
                  'tests/test_files.py',
                  'tests/test_common.py', 'tests/test_logs.py',
+                 'tests/test_dns.py',
                  'tests/test_bitrix.py', 'tests/test_gui_bitrix.py',
                  'tests/test_gui_swap.py', 'tests/test_gui_themes.py',
                  'tests/tkstub.py',

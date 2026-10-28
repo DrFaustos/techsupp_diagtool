@@ -231,6 +231,19 @@ class FakeSSH:
         return [c for c in self.commands if needle in c]
 
 
+def rf_answer(state, body=''):
+    """Ответ read_file_cmd (1.21.0): служебная первая строка + тело байт в байт.
+
+    Формат живёт ЗДЕСЬ, а не в каждом тестовом файле: docstring support.py
+    запрещает вторую реализацию протокола в тестах, а tests/test_common.py
+    вызывает именно эту функцию. Маркер обязан быть ПЕРВОЙ строкой (файл,
+    первой строкой которого стоит «RFSTATE readable», не должен выглядеть как
+    служебный ответ), поэтому тело приклеивается как есть — без rstrip: потеря
+    завершающего переноса однажды уже была тихой порчей данных (1.21.0).
+    """
+    return 'RFSTATE ' + state + chr(10) + body
+
+
 class _RecordFile:
     def __init__(self, store, path):
         self.store = store

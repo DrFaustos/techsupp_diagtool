@@ -13,7 +13,7 @@ import shlex
 
 import pytest
 
-from support import FakeSSH, FakeSftpClient
+from support import rf_answer, FakeSSH, FakeSftpClient
 import common
 
 
@@ -584,9 +584,7 @@ class TestReadFileContent:
     stderr свидетель, а python при Permission denied перекрывает missing.
     """
 
-    @staticmethod
-    def _ans(state, body=''):
-        return f'RFSTATE {state}\n' + body
+    _ans = staticmethod(rf_answer)  # формат в support: второй реализации нет
 
     def test_returns_text(self):
         c = FakeSSH(routes=[('cat ', 'hello\n')])
