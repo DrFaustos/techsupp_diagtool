@@ -257,6 +257,78 @@ class TestFastpanelStackStates:
         assert 'inactive' in line, line
         assert 'не провер' not in line, line
 
+    @staticmethod
+    def _stack_rc(states, rcs):
+        """Маркерный ответ ЦИКЛОВОЙ формы 1.32.27: '@юнит', статус, 'rc=N'.
+
+        Байты сняты живым циклом (замер этой машины): stdout службы и
+        printf rc-строка ДО следующей команды — rc принадлежит ровно своей
+        службе, потому что rc сборки достался бы последней команде. Так
+        двойник говорит правду о ФОРМЕ нового ответа, а не о желаемом.
+        """
+        lines = []
+        for unit in panels_mod.PANEL_STACK_UNITS:
+            lines.append('@' + unit)
+            if states.get(unit):
+                lines.append(states[unit])
+            lines.append('rc=%d' % rcs[unit])
+        return '\n'.join(lines) + '\n'
+
+    def test_not_installed_is_not_reported_as_inactive(self):
+        # RED слайса, измерен живьём: на машине без юнитов стека (оракул
+        # systemctl show -p LoadState = not-found по всем четырём) прежний
+        # цикл печатал «nginx: inactive» — «установлено, но остановлено»
+        # про службы, которых нет вовсе. Различие несёт rc (замер пары:
+        # 'inactive'/rc=3 против 'inactive'/rc=4 при побайтово равном
+        # stdout), а прежний код его выбрасывал: rc сборки принадлежал
+        # последней команде цикла.
+        units = panels_mod.PANEL_STACK_UNITS
+        c = FakeSSH(routes=[(self.STACK, (self._stack_rc(
+            {u: 'inactive' for u in units}, {u: 4 for u in units}), '', 4))])
+        out = panels_mod.fastpanel_status(c)
+        line = _report_line(out, 'nginx:')
+        assert 'nginx: не установлен' in line, line
+        assert 'nginx: inactive' not in line, line
+        assert 'не провер' not in line, line
+
+    def test_stopped_unit_stays_inactive_with_rc(self):
+        # Обратная сторона того же признака: rc=3 — ОТВЕТ «стоит, но
+        # остановлена». Назвать её «не установлен» было бы новой ложью
+        # вместо прежней, поэтому эталон пары фиксируется тестом.
+        units = panels_mod.PANEL_STACK_UNITS
+        c = FakeSSH(routes=[(self.STACK, (self._stack_rc(
+            {u: 'inactive' for u in units}, {u: 3 for u in units}), '', 3))])
+        out = panels_mod.fastpanel_status(c)
+        line = _report_line(out, 'nginx:')
+        assert 'nginx: inactive' in line, line
+        assert 'не установлен' not in line, line
+
+    def test_answer_without_rc_stays_status(self):
+        # Обратная совместимость (закон серии): байты прежней формы без
+        # rc-строк — ответ старшего сервера или чужого кода — обязаны
+        # читаться как раньше. Новый признак не имеет права превращать
+        # «inactive» в «не установлен» там, где rc никто не снимал.
+        units = panels_mod.PANEL_STACK_UNITS
+        c = FakeSSH(routes=[(self.STACK,
+                             (self._stack({u: 'inactive' for u in units}),
+                              '', 0))])
+        out = panels_mod.fastpanel_status(c)
+        line = _report_line(out, 'nginx:')
+        assert 'nginx: inactive' in line, line
+        assert 'не установлен' not in line, line
+
+    def test_probe_carries_rc_of_every_unit(self):
+        # Носитель признака — сама команда: без printf rc-строки внутри
+        # цикла rc каждой службы потерян (rc сборки принадлежит последней
+        # команде). Замок формы живёт здесь, а не в комментарии.
+        c = FakeSSH(routes=[(self.STACK, (self._stack(
+            {u: 'active' for u in panels_mod.PANEL_STACK_UNITS}), '', 0))])
+        panels_mod.fastpanel_status(c)
+        cmd = c.find('systemctl is-active')
+        assert cmd is not None
+        assert 'printf "rc=' in cmd, 'rc служб не снимается: ' + cmd[:80]
+        assert cmd.count('systemctl is-active') == 1, 'сборная строка: rc чужой'
+        assert '2>/dev/null' not in cmd, 'причина снова в /dev/null'
     def test_stack_asked_once_per_unit_with_markers(self):
         # Сборная строка `is-active a; is-active b` не различима в принципе:
         # rc принадлежит последней команде, а stdout четырёх служб свален без

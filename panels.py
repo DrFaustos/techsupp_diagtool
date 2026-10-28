@@ -470,11 +470,14 @@ def fastpanel_logs(checker):
 # печатал «nginx / php-fpm / mysql(mariadb): unknown», и оператор читал его как
 # «стек мёртв». Пустое ТЕЛО под маркером и есть признак «не проверено».
 #
-# Известное ограничение, которое здесь СОЗНАТЕЛЬНО не чинится (записано в
-# «остаточное враньё»): `systemctl is-active` для несуществующей службы
-# печатает 'inactive' — «юнита нет» и «стоит, но остановлена» через is-active
-# неразличимы. Различает их `systemctl cat` (примитив 1.28.0), но это +1 запрос
-# на службу; здесь важна подмена «не проверено» → «не работает», она снята.
+# Ограничение закрыто в 1.32.27: `systemctl is-active` для несуществующей
+# службы печатает 'inactive' — «юнита нет» и «стоит, но остановлена» по
+# stdout неразличимы (замер пары на живом systemd: побайтово равный вывод,
+# rc 4 против 3; оракул — systemctl show -p LoadState). Раньше это
+# называлось «сознательно не чинится», потому что различать обещали только
+# через `systemctl cat` (+1 запрос на службу). Код возврата лежал в том же
+# канале: цикл снимает rc ВНУТРИ итерации (у сборки он принадлежал последней
+# команде), и parse_stack_unit_state читает его из тела секции.
 PANEL_STACK_UNITS = ('nginx', 'php-fpm', 'mysql', 'mariadb')
 
 # Порт веб-интерфейса панели. Литерал 8888 до этого был вшит в код в трёх
@@ -502,6 +505,7 @@ CURL_RC_ANSWER = {
 }
 
 STACK_NO_ANSWER = 'не проверено'
+STACK_UNIT_ABSENT = 'не установлен'
 ENDPOINT_NO_ANSWER = 'не проверено'
 
 STACK_UNCHECKED_NOTE = (
@@ -544,23 +548,56 @@ def _first_line(text):
                  if ln.strip()), '')[:200]
 
 
+def parse_stack_unit_state(body):
+    """Статус одной службы по телу её маркерной секции (форма 1.32.27).
+
+    Тело цикла — строки между маркерами: статус и 'rc=N'. «Юнита нет» и
+    «стоит, но остановлена» stdout-ом неразличимы: на живом systemd пара
+    несуществующей и остановленной службы даёт побайтово равный 'inactive',
+    различие несёт только rc (4 против 3; оракул — systemctl show
+    -p LoadState). Прежний код бросал rc: у цикла он принадлежит последней
+    команде. Поэтому здесь:
+      rc=4 при наличии статуса -> «не установлен»;
+      rc=0/3 при наличии статуса -> сам статус (active / inactive / failed);
+      статуса нет (bus dead: тело состоит только из 'rc=1') -> None, то есть
+        «не проверено», а не выдуманное «не установлен»;
+      rc-строки нет вовсе (ответ прежней формы) -> прежний статус без изменений.
+    """
+    rc = None
+    status = ''
+    for line in body:
+        s = line.strip()
+        if s.startswith('rc=') and s[3:].isdigit():
+            rc = int(s[3:])
+        elif s and not status:
+            status = s
+    if not status:
+        return None
+    if rc == 4:
+        return STACK_UNIT_ABSENT
+    return status
+
+
 def panel_stack_view(out, err):
     """(строка служб, признание|None) по маркерному ответу `is-active`.
 
-    Различение — по КАНАЛУ, а не по тексту: сообщение про bus локализуется так
-    же, как вывод dpkg (урок 1.28.0). Пустое тело при непустом stderr = ответ
-    про канал; пустое тело при пустом stderr = обрыв. Оба — «не проверено».
+    Различение — по КАНАЛУ и по КОДУ ВОЗВРАТА (1.32.27). Сообщение про bus
+    локализуется так же, как вывод dpkg (урок 1.28.0), поэтому текст им
+    не признак: статуса в теле нет (bus dead даёт только 'rc=N') — это
+    «не проверено». Статус есть — это ответ системы; rc=4 при статусе —
+    «не установлен» (см. parse_stack_unit_state).
     """
     sections = parse_marker_sections(out)
     why = _first_line(err)
     parts, missing = [], 0
     for unit in PANEL_STACK_UNITS:
         body = sections.get(unit) or []
-        if body:
-            parts.append(f'{unit}: {body[0]}')
-        else:
+        state = parse_stack_unit_state(body)
+        if state is None:
             parts.append(f'{unit}: {STACK_NO_ANSWER}')
             missing += 1
+        else:
+            parts.append(f'{unit}: {state}')
     note = None
     if missing:
         note = STACK_UNCHECKED_NOTE.format(
@@ -635,7 +672,8 @@ def _stack_probe_cmd():
     """Одна SSH-команда, спрашивающая все службы стека с маркерами."""
     names = ' '.join(q(unit) for unit in PANEL_STACK_UNITS)
     return ('for s in %s; do printf "@%%s\\n" "$s"; '
-            'LC_ALL=C systemctl is-active "$s"; done' % names)
+            'LC_ALL=C systemctl is-active "$s"; '
+            'printf "rc=%%s\n" "$?"; done' % names)
 
 
 def _endpoint_probe_cmd(port=FASTPANEL_PORT, schemes=PANEL_SCHEMES):
