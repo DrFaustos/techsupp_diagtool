@@ -2575,3 +2575,101 @@ class TestGroupPresenceDistinguishesWorlds:
         assert info['state'] == 'unchecked' and info['checked'] is False, info
         assert c.commands == [], c.commands
 
+
+# ===== 1.32.22: фиксированная строка — тоже вопрос к содержимому файла ======
+# Носитель 1.32.21 решал вопрос «есть ли в файле СОВПАДЕНИЕ С РЕГУЛЯРОМ». У
+# панели Битрикс есть второй вопрос той же формы: «есть ли в /etc/fstab СТРОКА
+# /swapfile». Это фиксированная строка, а не регуляр, и подмена одного другим
+# опасна в обе стороны. Замер живьём (приманка построена так, что регуляр обязан
+# сматчить; первый черновик замера был подписан «регуляр матчит» при приманке,
+# которую он НЕ матчил, то есть подпись к печати не была подтверждена цифрами):
+#   файл:  '/swapXfile none swap sw 0 0'
+#   grep -E  '/swap.file' -> rc=0  stdout='/swapXfile none swap sw 0 0'
+#   grep -F  '/swap.file' -> rc=1  stdout=''
+# Ложноположительный ответ регуляр значит для fstab ОТКАЗ в действии: панель
+# решит «запись уже есть» и не допишет её. Ковычки кавычением не починить —
+# решает только режим.
+F2_FOUND = ('', '', 0)
+F2_NOT_FOUND = ('', '', 1)
+F2_NOT_READABLE = ('', '', 2)
+F2_LISTED = ('fstab' + chr(10) + 'fstab.bak' + chr(10), '', 0)
+F2_LISTED_NO_FSTAB = ('fstab.bak' + chr(10), '', 0)
+F2_NO_GREP = ('', 'bash: grep: command not found' + chr(10), 127)
+ENTRY = '/swapfile none swap sw 0 0'
+
+
+class TestFixedStringModeIsStillTheSameQuestion:
+    """Режим «фиксированная строка» не имеет права заводить второго читателя."""
+
+    def test_fixed_mode_asks_grep_fixed_strings(self):
+        # Статический замок на ФОРМЕ: -F (фиксированные строки) и -q (молчать).
+        # Без -F искомый путь молча трактуется регулярным выражением, и это
+        # меняет ОТВЕТ, а не только его форму (замер с приманкой выше).
+        c = FakeSSH(routes=[('grep -Fq', F2_FOUND)])
+        info = common.file_pattern_info(c, '/etc/fstab', ENTRY, fixed=True)
+        assert info['state'] == 'found', info
+        assert c.commands and c.commands[0].startswith('grep -Fq '), c.commands
+        for s in c.commands:
+            assert '&&' not in s and '||' not in s and 'echo' not in s, s
+            assert '2>/dev/null' not in s, s
+
+    def test_default_mode_is_unchanged(self):
+        # Обратный контроль (запрещающий guard обязан иметь контрпример):
+        # расширение не имеет права перекроить режим 1.32.21, под которым уже
+        # живут две кнопки Битрикса и 16 тестов.
+        c = FakeSSH(routes=[('grep -Eq', F2_FOUND)])
+        info = common.file_pattern_info(c, '/etc/my.cnf', '^!includedir')
+        assert info['state'] == 'found', info
+        assert c.commands[0].startswith('grep -Eq '), c.commands
+
+    def test_fixed_found_is_a_measurement_without_paying_listing(self):
+        # rc=0 от грепа — это измерение. Второй спрос за уже известное — ровно
+        # то, за что серия ругает «умные» проверки (1.32.14, 1.32.20).
+        c = FakeSSH(routes=[('grep -Fq', F2_FOUND)])
+        common.file_pattern_info(c, '/etc/fstab', ENTRY, fixed=True)
+        assert c.count('grep -Fq') == 1, c.commands
+        assert c.count('ls -1 -p') == 0, c.commands
+
+    def test_fixed_rc1_is_read_and_absent_of_the_entry(self):
+        # rc=1: файл ОТКРЫТ и ПРОЧИТАН, совпадения нет. Единственный мир, где
+        # панели разрешено дописывать запись.
+        c = FakeSSH(routes=[('grep -Fq', F2_NOT_FOUND)])
+        info = common.file_pattern_info(c, '/etc/fstab', ENTRY, fixed=True)
+        assert info['state'] == 'not_found', info
+        assert info['checked'] is True, info
+        assert c.count('ls -1 -p') == 0, c.commands
+
+    def test_fixed_unreadable_file_is_not_reported_as_no_entry(self):
+        # Ядро слайса на уровне носителя: файл есть (имя в достоверном списке),
+        # но мы его не прочитали. «Записи нет» там — утверждение о содержимом,
+        # которого мы не видели, а следствие у него хуже, чем ложная строка
+        # отчёта: панель ДОПИШЕТ запись в файл, который не открывался.
+        c = FakeSSH(routes=[('grep -Fq', F2_NOT_READABLE),
+                            ('ls -1 -p', F2_LISTED)])
+        info = common.file_pattern_info(c, '/etc/fstab', ENTRY, fixed=True)
+        assert info['state'] == 'unreadable', info
+        assert info['checked'] is False, info
+        assert 'не проверено' in info['note'].lower(), info
+
+    def test_fixed_absent_file_is_proven_by_the_listing(self):
+        c = FakeSSH(routes=[('grep -Fq', F2_NOT_READABLE),
+                            ('ls -1 -p', F2_LISTED_NO_FSTAB)])
+        info = common.file_pattern_info(c, '/etc/fstab', ENTRY, fixed=True)
+        assert info['state'] == 'absent', info
+        assert info['checked'] is True, info
+
+    def test_fixed_mode_without_grep_is_unchecked_without_extra_cost(self):
+        c = FakeSSH(routes=[('grep -Fq', F2_NO_GREP)])
+        info = common.file_pattern_info(c, '/etc/fstab', ENTRY, fixed=True)
+        assert info['state'] == 'unchecked', info
+        assert info['checked'] is False, info
+        assert c.count('ls -1 -p') == 0, c.commands
+
+    def test_pattern_travels_quoted_and_lands_literally(self):
+        # Кавычение обязано сохранять спецсимволы ИСКОМОГО текста: точка в
+        # пути (/swap.file) до грепа обязана доехать побайтово, иначе спор
+        # «регуляр или фиксация» решится не режимом, а потерей символа.
+        c = FakeSSH(routes=[('grep -Fq', F2_FOUND)])
+        common.file_pattern_info(c, '/etc/fstab', '/swap.file', fixed=True)
+        assert any('/swap.file' in s for s in c.commands), c.commands
+

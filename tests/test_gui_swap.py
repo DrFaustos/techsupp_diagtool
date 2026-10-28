@@ -17,6 +17,14 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from support import FakeSSH
+# tkstub обязан стоять ДО импорта gui_swap: модуль делает
+# «from tkinter import messagebox, simpledialog» на уровне файла, а в этом
+# интерпретаторе tkinter отсутствует физически, и порядок принципиален — импорт
+# ниже уже не спасёт, если боевой импорт произошёл первым. Стаб узкий и
+# подключён ЯВНО этим тестом, а не глобальным conftest: причины измерены и
+# описаны в tkstub.py (глобальный хук поднял 6 файлов и внёс 9 реальных
+# падений, то есть подменил «неизвестно» на «известно неправильно»).
+import tkstub  # noqa: F401
 import gui_swap as gs
 from gui_swap import SwapMixin
 
@@ -208,15 +216,24 @@ class TestCreateSwapFile:
 # ==================== запись в fstab ====================
 class TestAddSwapToFstab:
     def test_existing_entry_is_not_duplicated(self):
-        # grep находит /swapfile — добавляющую команду слать нельзя
-        c = FakeSSH(routes=[('grep -q', 'yes\n')])
+        # grep находит /swapfile — добавляющую команду слать нельзя.
+        # 1.32.22: ответ обязан быть назван КОДОМ (rc=0 = совпадение найдено),
+        # а не готовым словом 'yes': именно «&& echo yes || echo no» и есть
+        # носитель лжи, который слайс лечит, и прежняя фикстура закрепляла его
+        # как ответ сервера.
+        c = FakeSSH(routes=[('grep -Fq', ('', '', 0))])
         out = _Host(c)._do_add_swap_to_fstab()
         assert 'уже присутствует' in out
         assert c.find('>> /etc/fstab') is None
 
     def test_missing_entry_appends_line_and_shows_tail(self):
+        # rc=1 у грепа: файл ОТКРЫТ и ПРОЧИТАН, совпадений нет — единственный
+        # мир, где дописывание разрешено (замер живьём, .ai-free/
+        # localize13222.py). Слово 'no' прежняя фикстура брала у оболочки, а не
+        # у грепа: rc всей прежней строки всегда 0, то есть фикстура описывала
+        # ложь, а не измерение.
         c = FakeSSH(routes=[
-            ('grep -q', 'no\n'),
+            ('grep -Fq', ('', '', 1)),
             ('tail -3', '/dev/sda1 none swap sw 0 0\n'),
         ])
         out = _Host(c)._do_add_swap_to_fstab()
@@ -227,8 +244,11 @@ class TestAddSwapToFstab:
         assert '/dev/sda1 none swap sw 0 0' in out
 
     def test_append_error_reports_stderr(self):
+        # 1.32.22: тот же перевод — отказ дописывания по READ-ONLY файлу
+        # обязан опираться на rc грепа (1 = прочитан, совпадений нет), иначе
+        # тест проходил бы по готовому слову.
         c = FakeSSH(routes=[
-            ('grep -q', 'no\n'),
+            ('grep -Fq', ('', '', 1)),
             ('>> /etc/fstab', ('', 'bash: /etc/fstab: Read-only file system', 1)),
         ])
         out = _Host(c)._do_add_swap_to_fstab()
@@ -270,3 +290,81 @@ class TestWiring:
         assert 'command=self.create_swap' in src or 'command=self.create_swap)' in src
         assert hasattr(SwapMixin, 'create_swap')
         assert hasattr(SwapMixin, 'add_swap_to_fstab')
+
+# ===== 1.32.22: панель не имеет права дописывать fstab, не прочитав его =====
+# Замер живьём (.ai-free/localize13222.py, настоящий bash 5.3, uid=1000,
+# настоящие chmod, точечная подмена PATH; прежняя боевая функция v1.32.21
+# вызвана НАСТОЯЩИМ bash'ом на ТЕХ ЖЕ мирах, путь /etc/fstab переписан в
+# песочницу, хеш боевого /etc/fstab сверен до и после). Форма
+# «grep -q '/swapfile' /etc/fstab && echo 'yes' || echo 'no'» даёт ПЯТЬ миров с
+# побайтово одинаковым out='no' rc=0, и прежняя функция во ВСЕХ ПЯТИ отправила
+# «echo "/swapfile none swap sw 0 0" >> /etc/fstab»:
+#   записи нет (файл прочитан)  rc=1 у грепа  — дописать верно
+#   файл есть, chmod 000        rc=2          — дописать НЕЛЬЗЯ
+#   файла нет                   rc=2          — дописать НЕЛЬЗЯ
+#   каталог вместо файла        rc=2          — дописать НЕЛЬЗЯ
+#   grep НЕТ в PATH             rc=127        — мы НЕ СПРОСИЛИ
+# Конструкция && || съедает коды: оба ответа печатает оболочка, и rc всей строки
+# всегда 0. Здесь ложь этого класса впервые кончается не строкой отчёта, а
+# записью в файл, от которого зависит загрузка машины.
+GS_UNREADABLE = ('', '', 2)
+GS_LISTED = ('fstab' + chr(10), '', 0)
+GS_LISTED_NO_FSTAB = ('fstab.bak' + chr(10), '', 0)
+GS_NO_GREP = ('', 'bash: grep: command not found' + chr(10), 127)
+
+
+class TestFstabAppendNeedsAReadFile:
+    """Дописывание в fstab разрешено только по ПРОЧИТАННОМУ файлу."""
+
+    def test_unreadable_fstab_is_not_reported_as_no_entry(self):
+        # Ядро слайса. Прежний ответ: «$ echo ... >> /etc/fstab» — запись
+        # дубля в файл, который греп не открыл.
+        c = FakeSSH(routes=[('grep -Fq', GS_UNREADABLE),
+                            ('ls -1 -p', GS_LISTED)])
+        out = _Host(c)._do_add_swap_to_fstab()
+        assert 'не проверено' in out, out
+        assert c.find('>> /etc/fstab') is None, c.commands
+        assert 'уже присутствует' not in out, out
+
+    def test_absent_fstab_says_absent_and_does_not_append(self):
+        # Отсутствующий fstab — отдельный мир: дописывание создало бы файл с
+        # одной строкой swap вместо починки пути (и на systemd-хосте fstab
+        # законно не используется вовсе).
+        c = FakeSSH(routes=[('grep -Fq', GS_UNREADABLE),
+                            ('ls -1 -p', GS_LISTED_NO_FSTAB)])
+        out = _Host(c)._do_add_swap_to_fstab()
+        assert 'не найден' in out, out
+        assert c.find('>> /etc/fstab') is None, c.commands
+
+    def test_unavailable_grep_does_not_append(self):
+        # rc=127: «нечем спросить». Прежний код в этом мире тоже дописывал —
+        # то есть отсутствие утилиты на сервере заканчивалось правкой fstab.
+        c = FakeSSH(routes=[('grep -Fq', GS_NO_GREP)])
+        out = _Host(c)._do_add_swap_to_fstab()
+        assert 'не проверено' in out, out
+        assert c.find('>> /etc/fstab') is None, c.commands
+
+    def test_read_file_without_entry_appends(self):
+        # Обратный контроль нормы: rc=1 (файл прочитан, совпадений нет) —
+        # единственный мир, где дописывание разрешено, и оно обязано остаться.
+        c = FakeSSH(routes=[('grep -Fq', ('', '', 1)),
+                            ('tail -3', '/dev/sda1 / ext4 defaults 0 1\n')])
+        out = _Host(c)._do_add_swap_to_fstab()
+        assert c.find('>> /etc/fstab') is not None, c.commands
+        assert 'не проверено' not in out, out
+        assert '/swapfile none swap sw 0 0' in c.find('>> /etc/fstab')
+
+    def test_question_is_fixed_strings_and_carries_no_ready_word(self):
+        # Замок на ФОРМЕ спроса. «&& echo yes || echo no» — это и есть носитель
+        # лжи: готовые слова, которые печатает оболочка, а rc строки всегда 0.
+        # -F обязателен: без него искомый путь трактуется регулярным выражением,
+        # и ложное «уже есть» отказало бы в дописывании (замер с приманкой в
+        # red13222_common.txt).
+        c = FakeSSH(routes=[('grep -Fq', ('', '', 1))])
+        _Host(c)._do_add_swap_to_fstab()
+        cmd = c.find('grep')
+        assert cmd is not None, c.commands
+        assert cmd.startswith('grep -Fq '), c.commands
+        assert '&&' not in cmd and '||' not in cmd, c.commands
+        assert 'echo' not in cmd, c.commands
+

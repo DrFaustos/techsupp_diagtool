@@ -17,6 +17,24 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+# tkstub обязан стоять ДО импорта gui_themes: модуль делает
+# «from tkinter import messagebox» на уровне файла, а в этом интерпретаторе
+# tkinter отсутствует физически.
+#
+# ПОЧЕМУ СТАБ ПРОПИСАН ЗДЕСЬ ЯВНО, а не приезжает сам. Он и так приезжал: до
+# этой строки файл собирался ТОЛЬКО когда рядом в прогоне стоял
+# tests/test_gui_swap.py — он импортирует tkstub, а sys.modules глобален на
+# процесс. Замер 1.32.22: изолированно «1 error during collection», сразу после
+# test_gui_swap — «45 tests collected». Собираемость файла решал алфавитный
+# порядок, а не сам файл; принять это молча означало бы оставить в репозитории
+# тест, зелёный по чужой подмене (тот же класс подмены, из-за которого был
+# снесён глобальный conftest, только пришедший боком). Тесты тем при этом
+# честные по существу: get_theme_colors — чистая функция, detect_system_theme
+# спрашивается через двойник модуля subprocess, миксин работает на
+# записях-заглушках, а messagebox в тесте отказа подменяется СВОИМ двойником
+# (monkeypatch), то есть от стаба здесь нужна ровно импортируемость — и теперь
+# она заявлена явно, а не унаследована от соседа по алфавиту.
+import tkstub  # noqa: F401
 import gui_themes
 from gui_themes import (DARK_THEMES, ThemesMixin, detect_system_theme,
                         get_theme_colors)

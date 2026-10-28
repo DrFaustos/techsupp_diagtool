@@ -64,13 +64,33 @@ DETECTORS = (('CJK', CJK_DEFECT),
 # Расширение по прежнему правилу сделано после замера: ad-hoc проход по
 # всем кандидатам (files.py, dns.py, metrics.py, diagnostic.py и их тесты)
 # дал НОЛЬ нарушений, поэтому список не тонет в шуме.
+# 1.32.22: в список внесены gui_swap.py, tests/test_gui_swap.py и
+# tests/tkstub.py. Причина ровно та же, из-за чего существует список: этот
+# слайс писал в gui_swap.py новые строки отчёта («содержимое не проверено —
+# дописывание НЕ отправлено»), а под сканом файл не стоял, то есть сторож
+# молчал именно там, где дефект мог быть написан. Замер перед расширением:
+# ad-hoc проход по всем кандидатам этого слайса (gui_swap.py, его тест,
+# tkstub.py, а также gui.py, gui_admin.py, main.py, reports.py, ssh_client.py,
+# discovery.py, fmanager.py, webcheck.py — 10 файлов) дал НОЛЬ нарушений.
+# Остальные восемь кандидатов в список НЕ внесены: расширение без собственного
+# замера и без файлов, которые правит серия, — это шум, в котором настоящая
+# находка тонет (замер 1.32.0: 98 ложных срабатываний против 2 настоящих).
+# 1.32.22 (второй заход): сюда же внесён tests/test_gui_themes.py. Причина не в
+# том, что файл плохой, а в измеренной утечке: до этого слайса он собирался
+# ТОЛЬКО когда рядом в прогоне стоял test_gui_swap.py (изолированно — 1 error
+# during collection, сразу после swap — 45 tests collected на двоих), а тест
+# тем правится этим слайсом, потому что зависимость от стаба теперь заявлена в
+# нём явно. Файл, который серия трогает и который пишет текст для оператора
+# (gui_themes зовёт messagebox.showerror), обязан стоять под сканом.
 HYGIENE_FILES = ('panels.py', 'common.py', 'logs.py', 'bitrix.py',
                  'files.py', 'dns.py', 'metrics.py', 'diagnostic.py',
-                 'gui_bitrix.py',
+                 'gui_bitrix.py', 'gui_swap.py',
                  'tests/test_panels.py', 'tests/support.py',
                  'tests/test_files.py',
                  'tests/test_common.py', 'tests/test_logs.py',
                  'tests/test_bitrix.py', 'tests/test_gui_bitrix.py',
+                 'tests/test_gui_swap.py', 'tests/test_gui_themes.py',
+                 'tests/tkstub.py',
                  'tests/test_text_hygiene.py', 'tests/test_git_history.py',
                  'CHANGELOG.md', 'README.md')
 

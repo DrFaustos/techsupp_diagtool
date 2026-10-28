@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.21"
+__version__ = "1.32.22"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -1415,38 +1415,64 @@ def path_access_info(checker, path, mode='w', cache=None):
 # платится. Отдельно grep 126/127: списка каталога не спрашиваем, он ответа про
 # содержимое не даст (платить за то, что состояния не меняет, нельзя).
 FILE_PATTERN_CMD = 'grep -Eq'
+# Фиксированный режим (1.32.22). Отличие этого слайса от 1.32.21: вопрос «есть
+# ли в /etc/fstab СТРОКА /swapfile none swap sw 0 0» — про фиксированный текст,
+# а молчаливая трактовка его как регулярного выражения меняет ОТВЕТ, а не только
+# его форму. Замер живьём (приманка построена так, что регуляр ОБЯЗАН сматчить;
+# первый черновик замера был подписан «регуляр матчит» при приманке, которую он
+# не матчил, то есть подпись к печати цифрами не подтверждалась):
+#   файл:  '/swapXfile none swap sw 0 0', запрос: '/swap.file'
+#   grep -E  -> rc=0  stdout='/swapXfile none swap sw 0 0'
+#   grep -F  -> rc=1  stdout=''
+# Для fstab ложноположительный ответ значит ОТКАЗ в действии: панель решила бы
+# «запись уже есть» и не дописала её. Кавычение (q()) не помогает — оно бережёт
+# символы от оболочки, а не от интерпретации грепом: решает только режим.
+FILE_PATTERN_FIXED_CMD = 'grep -Fq'
 
 FILE_PATTERN_UNCHECKED_NOTE = (
     'Содержимое не проверено: {why}. Это не ответ о файле, а отказ спросить: '
     'grep его не прочитал, поэтому утверждать «паттерна нет» нельзя')
 
 
-def file_pattern_cmd(pattern, path):
+def file_pattern_cmd(pattern, path, fixed=False):
     """Форма запроса: сама команда, без заглушек канала и без &&-дополнения.
 
     2>/dev/null глушил единственную подсказку о том, ПОЧЕМУ файл не открылся
     (она живёт в stderr), а «&& echo ok» превращал любое состояние в готовое
     слово. Форма собирается ЗДЕСЬ, а не на совести вызывающего (урок 1.32.11).
+
+    fixed=True переключает греп на фиксированные строки (-F): когда искомое —
+    текст, а не регуляр, молчаливый -E меняет ответ (замер с приманкой выше).
     """
-    return FILE_PATTERN_CMD + ' ' + q(pattern) + ' ' + q(path)
+    cmd = FILE_PATTERN_FIXED_CMD if fixed else FILE_PATTERN_CMD
+    return cmd + ' ' + q(pattern) + ' ' + q(path)
 
 
-def file_pattern_info(checker, path, pattern, cache=None):
+def file_pattern_info(checker, path, pattern, cache=None, fixed=False):
     """Есть ли паттерн в файле: ответ в коде, «нет файла» — по списку каталога.
 
     {path, pattern, state, checked, note}, state:
     found      — rc=0: паттерн есть (это измерение, список к нему не спрашивается);
     not_found  — rc=1: файл ОТКРЫТ и ПРОЧИТАН, совпадений нет. Единственный мир,
-                 где диагноз «не подключает — правьте вручную» честен;
+                 где разрешено вылечивающее действие — «правьте вручную» у тюнинга
+                 MySQL, «допишите запись» у fstab;
     unreadable — rc=2, но имя ЕСТЬ в достоверном списке родителя: «файл на месте,
                  мы его не прочитали» — лечение правами, а не поиск конфига;
     absent     — rc=2 и имени в достоверном списке нет: чинить надо путь к файлу;
     unchecked  — grep недоступен (rc=126/127) либо список не прочитан: «не видно»
                  и «нет» побайтово равны, поэтому здесь «не проверено».
 
-    Пустой паттерн отклоняется, а не принимается: пустой регуляр матчит любую
-    строку, и молчаливый такой спрос выдал бы «паттерн есть» в любом файле — это
-    активная ложь, а не «не проверено».
+    fixed=True (1.32.22) означает «искомое — фиксированный текст, а не регуляр», и
+    тогда греп спрашивается с -F. Режим обязан называть вызывающий, потому что
+    молчаливый -E меняет ОТВЕТ, а не только форму запроса (замер с приманкой у
+    FILE_PATTERN_FIXED_CMD: -E находит /swapXfile по запросу '/swap.file', -F —
+    нет). Для fstab цена ошибки обратная ложью: ложное «запись уже есть» значит
+    ОТКАЗ дописать, то есть молчаливый swap, который не включится после
+    перезагрузки.
+
+    Пустой паттерн отклоняется, а не принимается: пустая строка матчит любую
+    строку в обоих режимах (-F '' находит всё), и молчаливый такой спрос выдал бы
+    «паттерн есть» в любом файле — это активная ложь, а не «не проверено».
 
     cache — словарь dir_listing_info: у нескольких конфигов общий предок
     спрашивается один раз.
@@ -1455,12 +1481,17 @@ def file_pattern_info(checker, path, pattern, cache=None):
         raise ValueError('file_pattern_info: пустой паттерн — он матчит любую '
                          'строку, ответ «паттерн есть» был бы ложью')
     target = (path or '').strip()
+    # Имя команды в признании обязано быть ТОЙ, что реально спросили: при
+    # fixed=True писать в note «grep -Eq» значило бы объяснить отказ не тем
+    # вопросом, и оператор чинил бы по отчёту не ту команду (закон серии:
+    # отчёт обязан называть источник признака).
+    cmd_name = FILE_PATTERN_FIXED_CMD if fixed else FILE_PATTERN_CMD
     info = {'path': target, 'pattern': pattern, 'state': 'unchecked',
             'checked': False, 'note': ''}
     if not target:
         info['note'] = FILE_PATTERN_UNCHECKED_NOTE.format(why='пустой путь')
         return info
-    out, err, rc = checker.run(file_pattern_cmd(pattern, target))
+    out, err, rc = checker.run(file_pattern_cmd(pattern, target, fixed))
     if rc == 0:
         info['state'] = 'found'
         info['checked'] = True
@@ -1494,7 +1525,7 @@ def file_pattern_info(checker, path, pattern, cache=None):
             info['state'] = 'unreadable'
             info['note'] = FILE_PATTERN_UNCHECKED_NOTE.format(
                 why='«%s» есть в достоверном списке %s, а %s вернул rc=%s%s'
-                    % (name, parent, FILE_PATTERN_CMD, rc,
+                    % (name, parent, cmd_name, rc,
                        ': ' + why if why else ''))
             return info
         # «Файла нет» — ответ на заданный вопрос: нет конфига, значит в нём и
@@ -1502,11 +1533,11 @@ def file_pattern_info(checker, path, pattern, cache=None):
         info['checked'] = True
         info['state'] = 'absent'
         info['note'] = ('файла «%s» в достоверном списке %s нет (%s вернул '
-                        'rc=%s)' % (name, parent, FILE_PATTERN_CMD, rc))
+                        'rc=%s)' % (name, parent, cmd_name, rc))
         return info
     info['note'] = FILE_PATTERN_UNCHECKED_NOTE.format(
         why='; '.join(x for x in (('%s вернул rc=%s%s'
-                                   % (FILE_PATTERN_CMD, rc,
+                                   % (cmd_name, rc,
                                       ': ' + why if why else '')),
                                   listing['note']) if x))
     return info
