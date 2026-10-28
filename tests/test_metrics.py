@@ -196,6 +196,168 @@ class TestWebConfig:
         assert 'не обнаружен' not in out
 
 
+# ==== веб-конфиг: веб-сервер регистрируется кодом возврата, а не словом ====
+# RED этого слайса (1.32.25) красен ПО СУЩЕСТВУ, а не по отсутствию имени: все
+# три теста гонят существующую check_web_config на ЖИВЫХ байтах этой машины
+# (замер: nginx/apache2ctl отсутствуют -> rc=127 со stdout «command not found»,
+# настоящий httpd на битом конфиге -> rc=1 «AH00526: Syntax error on line 376»).
+# Прежняя решалка (`if 'nginx' in out` на выводе `nginx -t 2>&1`, там же)
+# вывернута: регистрирует сервер по имени ОТСУТСТВУЮЩЕЙ команды и НЕ
+# регистрирует apache при честном отказе конфига.
+class TestWebConfigAbsentVsBroken:
+    """Веб-сервер регистрируется кодом возврата, а не словом в выводе (1.32.25).
+
+    Миры взяты замером на этой машине (nginx и apache2ctl отсутствуют, httpd
+    есть): `nginx -t 2>&1` без бинарника даёт rc=127 и НЕПУСТОЙ stdout со словом
+    «command not found», а честный `httpd -t` на битом конфиге — rc=1 и AH00526 в
+    stderr. Прежняя решалка (`if 'nginx' in out` по выводу `2>&1`, куда rc вообще
+    не доезжал через exec_command) вывернута: она регистрирует сервер по имени
+    ОТСУТСТВУЮЩЕЙ команды и теряет настоящую ошибку синтаксиса конфига.
+
+    Ложный мир обязан ехать в том же канале, что боевой: прежняя решалка смотрит
+    только stdout, и на пустом stdout она согласилась бы — такой «зелёный» тест
+    проверял бы не дефект (ложнозелёный RED хуже красного).
+    """
+    ABSENT = 'command not found'  # живое слово rc=127 (замер: stdout при 2>&1)
+
+    def test_absent_nginx_not_registered_as_config_check(self):
+        c = FakeSSH(routes=[
+            ('nginx -t', ('/bin/bash: line 1: nginx: command not found', '', 127)),
+            ('apache2ctl', ('/bin/bash: line 1: apache2ctl: command not found',
+                            '', 127)),
+            ('httpd', ('/bin/bash: line 1: httpd: command not found', '', 127)),
+        ])
+        res = metrics_mod.check_web_config(c)
+        assert res == {}, res
+        out = metrics_mod.web_config_report(c)
+        assert 'не обнаружен' in out
+        assert self.ABSENT not in out
+
+    def test_broken_apache_config_is_registered_not_dropped(self):
+        c = FakeSSH(routes=[
+            ('nginx -t', ('/bin/bash: line 1: nginx: command not found', '', 127)),
+            ('apache2ctl', ('/bin/bash: line 1: apache2ctl: command not found',
+                            '', 127)),
+            ('httpd', ('', 'AH00526: Syntax error on line 376 of /tmp/broken.conf',
+                       1)),
+        ])
+        res = metrics_mod.check_web_config(c)
+        assert 'apache' in res, res
+        assert 'Syntax error' in res['apache'], res['apache']
+        assert self.ABSENT not in res['apache'], res['apache']
+
+    def test_working_nginx_still_registered(self):
+        c = FakeSSH(routes=[
+            ('nginx -t', ('nginx: configuration file /etc/nginx/nginx.conf '
+                          'test is successful', '', 0)),
+            ('apache2ctl', ('/bin/bash: line 1: apache2ctl: command not found',
+                            '', 127)),
+            ('httpd', ('/bin/bash: line 1: httpd: command not found', '', 127)),
+        ])
+        res = metrics_mod.check_web_config(c)
+        assert set(res) == {'nginx'}, res
+        assert 'successful' in res['nginx']
+
+class TestParseWebConfigProbe:
+    """Парсер состояний — чистая функция: миры проверяются без SSH.
+
+    Байты миров сняты живой программой на этой машине (httpd 2.4.69 есть,
+    nginx/apache2ctl нет): rc=0 + AH00558 в stderr (исправный конфиг), rc=1 +
+    AH00526 в stderr (битый конфиг), rc=127 + «command not found» в stdout при
+    боевом 2>&1 (бинарника нет).
+    """
+
+    def test_rc_zero_with_body_is_ok(self):
+        state, text, why = metrics_mod.parse_web_config_probe(
+            'nginx: configuration file /etc/nginx/nginx.conf test is successful',
+            '', 0)
+        assert state == 'ok'
+        assert 'successful' in text
+        assert why is None
+
+    def test_rc_zero_warning_in_stderr_is_ok(self):
+        # Именно этот мир прежняя решалка превращала в «apache не обнаружен»:
+        # ответ есть, канал — stderr, код нулевой.
+        state, text, why = metrics_mod.parse_web_config_probe(
+            '', "AH00558: Could not reliably determine the server's fqdn", 0)
+        assert state == 'ok'
+        assert 'AH00558' in text
+
+    def test_rc_zero_silence_is_unchecked_not_ok(self):
+        state, text, why = metrics_mod.parse_web_config_probe('', '', 0)
+        assert state == 'unchecked'
+        assert text == ''
+        assert why
+
+    def test_broken_config_is_broken_not_unchecked(self):
+        state, text, why = metrics_mod.parse_web_config_probe(
+            '', 'AH00526: Syntax error on line 376 of /tmp/broken.conf', 1)
+        assert state == 'broken'
+        assert 'Syntax error' in text
+        assert why is None
+
+    def test_absent_binaries_carry_the_measured_reason(self):
+        for rc in (127, 126):
+            state, text, why = metrics_mod.parse_web_config_probe(
+                '/bin/sh: foo: command not found', '', rc)
+            assert state == 'absent', rc
+            assert text == '', rc  # отсутствие не едет в отчёт телом ответа
+            assert 'command not found' in why, rc
+
+    def test_absent_without_any_text_still_names_rc(self):
+        state, text, why = metrics_mod.parse_web_config_probe('', '', 127)
+        assert state == 'absent'
+        assert 'rc=127' in why
+
+    def test_silent_failure_is_unchecked(self):
+        state, text, why = metrics_mod.parse_web_config_probe('', '', 137)
+        assert state == 'unchecked'
+        assert 'rc=137' in why
+
+
+class TestWebConfigProbeForm:
+    """Форма запроса: код возврата обязан принадлежать самой команде.
+
+    Конвейер `||` и смешивание каналов `2>&1` были нужны прежней решалке,
+    которая решала по слову. С конвейером код принадлежит ПОСЛЕДНЕЙ команде, и
+    «apache2ctl не запустился» неотличим от «httpd ответил» (замер: обе боевые
+    формы дали rc=127, хотя httpd на машине есть).
+    """
+
+    def test_command_has_no_channel_blinding_and_no_pipe(self):
+        cmd = metrics_mod.web_config_probe_cmd('nginx')
+        assert cmd == 'nginx -t'
+        for blind in ('2>&1', '2>/dev/null', '||'):
+            assert blind not in cmd, cmd
+
+    def test_each_binary_asked_separately_and_stops_at_answer(self):
+        c = FakeSSH(routes=[
+            ('nginx -t', ('nginx: configuration file test is successful', '', 0)),
+            ('apache2ctl', ('/bin/bash: line 1: apache2ctl: command not found',
+                            '', 127)),
+            ('httpd', ('', 'AH00558: could not reliably determine', 0)),
+        ])
+        res = metrics_mod.check_web_config(c)
+        assert set(res) == {'nginx', 'apache'}
+        asked = [x for x in c.commands if ' -t' in x]
+        assert asked == ['nginx -t', 'apache2ctl -t', 'httpd -t'], asked
+        for x in asked:
+            assert '2>&1' not in x, x
+            assert '||' not in x, x
+
+    def test_unchecked_never_becomes_a_finding(self):
+        # Пустой вывод при rc=0 — «не проверено»: он не должен ни регистрировать
+        # сервер, ни превращаться в «конфиг в порядке».
+        c = FakeSSH(routes=[
+            ('nginx -t', ('', '', 0)),
+            ('apache2ctl', ('', '', 0)),
+            ('httpd', ('', '', 0)),
+        ])
+        assert metrics_mod.check_web_config(c) == {}
+        out = metrics_mod.web_config_report(c)
+        assert 'не обнаружен' in out
+
+
 # ============ файрвол: молчание не есть «не установлено» (1.32.11) ============
 # Замер живьём (этот хост, непривилегированный пользователь): iptables и nft
 # УСТАНОВЛЕНЫ (/usr/sbin), но iptables -L -n даёт rc=4 Permission denied,

@@ -271,14 +271,120 @@ def network_report(checker):
 
 
 # ==================== ВЕБ-КОНФИГУРАЦИЯ ====================
+# Прежняя решалка выглядела так (и была зелёной, потому что фикстуры подавали
+# только честные ответы):
+#
+#     out, _ = checker.exec_command('nginx -t 2>&1')
+#     if 'nginx' in out or 'syntax is ok' in out.lower():
+#         results['nginx'] = out.strip()
+#
+# exec_command контрактом отдаёт только пару каналов: код возврата выбрасывается
+# в ssh_client.exec_command, поэтому решать было слову. Замер живьём на этой
+# машине (nginx и apache2ctl ОТСУТСТВУЮТ, httpd есть) дал решалку, вывернутую
+# наизнанку:
+#
+#     nginx -t 2>&1                        rc=127  'nginx: command not found'
+#         -> 'nginx' in out есть ИСТИНА, в отчёте «nginx: command not found»
+#     apache2ctl -t 2>&1 || httpd -t 2>&1  rc=127  'apache2ctl: command not found'
+#         -> 'apache' in out.lower() есть ИСТИНА: apache появляется в отчёте из
+#            текста ОТСУТСТВИЯ бинарника
+#     httpd -t  на битом конфиге           rc=1    'AH00526: Syntax error ...'
+#         -> прежняя решалка apache НЕ регистрирует: настоящая ошибка конфига
+#            теряется
+#
+# То есть отчёт заявлял проверку конфигурации несуществующего веб-сервера и
+# молчал, когда конфиг действительно сломан. Плюс конвейер ||: код возврата
+# принадлежит ПОСЛЕДНЕЙ команде, поэтому «apache2ctl не запустился» и «httpd
+# ответил» имели один код — бинарники спрашиваются раздельно.
+#
+# command_probe_info (1.32.11) здесь НЕ переиспользуется: он отвечает на вопрос
+# «состоялся ли спрос» и на rc != 0 с пустым stdout даёт unchecked, а здесь
+# честный отказ веб-сервера (rc != 0 с текстом ошибки) — ценность, а не провал
+# спроса. Второй читатель того же сигнала разъезжается релизами, поэтому
+# состояния описаны своим парсером, а не натянуты на чужой.
+
+# Порядок обхода прежний (сначала apache2ctl, потом httpd), чтобы поведение на
+# машинах, где apache2ctl есть, не поехало.
+WEB_PROBE_BINS = (
+    ('nginx', ('nginx',)),
+    ('apache', ('apache2ctl', 'httpd')),
+)
+
+
+def web_config_probe_cmd(binary):
+    '''Форма запроса: без смешивания каналов и без ||-дополнения.
+
+    2>&1 был нужен прежней решалке: она решала по слову и слову надо было
+    собраться в один канал. Решалке по коду возврата каналы нужны порознь —
+    «command not found» пишет в stderr оболочка, а тест конфигурации пишет
+    веб-сервер, и путать эти два источника нельзя.
+    '''
+    return binary + ' -t'
+
+
+def parse_web_config_probe(out, err, rc):
+    '''('ok' | 'broken' | 'absent' | 'unchecked', тело ответа, причина|None).
+
+    Четыре состояния, а не два: «конфиг сломан» — ответ программы, «сервера нет»
+    — доказательство отсутствия (rc=127/126), «не проверено» — молчание или
+    странный код. Пустой вывод НЕ является основанием назвать сервер
+    отсутствующим: отсутствие доказывает только код возврата оболочки.
+    '''
+    def first_line(text):
+        lines = (text or '').strip().splitlines()
+        return lines[0][:200] if lines else ''
+
+    out_t = (out or '').strip()
+    err_t = (err or '').strip()
+    body = chr(10).join(p for p in (out_t, err_t) if p)
+    if rc == 127:
+        return 'absent', '', first_line(err_t or out_t) or 'rc=127'
+    if rc == 126:
+        return 'absent', '', first_line(err_t or out_t) or 'rc=126'
+    if rc == 0:
+        if not body:
+            return 'unchecked', '', 'пустой вывод при rc=0'
+        return 'ok', body, None
+    if not body:
+        return 'unchecked', '', 'пустой вывод при rc=%s' % rc
+    return 'broken', body, None
+
+
+def web_config_probe(checker, kind, binaries):
+    '''Один веб-сервер: {'kind', 'binary', 'state', 'text', 'why', 'checked'}.
+
+    Бинарники обходятся по очереди, обход останавливается на ПЕРВОМ ответившем:
+    отсутствующий бинарник — не повод молчать о втором, а ответивший — не повод
+    спрашивать следующего (его код возврата ничего не скажет о первом).
+    '''
+    why = ''
+    for binary in binaries:
+        out, err, rc = checker.run(web_config_probe_cmd(binary))
+        state, text, why = parse_web_config_probe(out, err, rc)
+        if state != 'absent':
+            return {'kind': kind, 'binary': binary, 'state': state,
+                    'text': text, 'why': why or '',
+                    'checked': state != 'unchecked'}
+    return {'kind': kind, 'binary': '', 'state': 'absent', 'text': '',
+            'why': why or 'ни один бинарник не найден (rc=127)',
+            'checked': True}
+
+
 def check_web_config(checker):
+    '''{имя сервера: текст его ответа} — только на ДОСТОВЕРНЫЙ ответ.
+
+    Отсутствие (rc=127/126) в словарь не попадает: его и ждёт ветка «не
+    обнаружен». «Не проверено» не попадает тоже: печатать молчание как результат
+    проверки конфига — тот самый дефект, который серия закрывает состоянием
+    «не проверено». Общая строка отчёта («не обнаружен или не удалось
+    проверить») покрывает оба отрицания честнее, чем ложное «конфиг в порядке».
+    '''
     results = {}
-    out, _ = checker.exec_command('nginx -t 2>&1')
-    if 'nginx' in out or 'syntax is ok' in out.lower():
-        results['nginx'] = out.strip()
-    out, _ = checker.exec_command('apache2ctl -t 2>&1 || httpd -t 2>&1')
-    if 'syntax ok' in out.lower() or 'apache' in out.lower():
-        results['apache'] = out.strip()
+    for kind, binaries in WEB_PROBE_BINS:
+        probe = web_config_probe(checker, kind, binaries)
+        if probe['state'] in ('absent', 'unchecked'):
+            continue
+        results[kind] = probe['text']
     return results
 
 
