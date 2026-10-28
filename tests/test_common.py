@@ -2249,3 +2249,126 @@ class TestBackupCarriesOriginalText:
         assert info['text'] == CR_DONE[0]
         assert len([s for s in c.commands if 'crontab -l' in s]) == 1, \
             c.commands
+
+# ===== 1.32.20: доступ к пути — «нет прав», «нет пути» и «не видно» =========
+# Замер живьём (настоящий bash 5.3, uid=1000, настоящие chmod на реальном
+# каталоге; инструмент .ai-free/localize13220.py) показал, что формы
+# «test -x PATH && echo ok» и «test -d P && (test -w P && echo ok || echo ro)»
+# решают по СЛОВУ и сливают разные миры в побайтово одинаковый ответ:
+#
+#   test -x BIN:   есть+x            out='ok' rc=0   верный «запускаем»
+#                  есть, mode 644    out=''   rc=1   «нужен chmod +x»
+#                  есть, каталог 000 out=''   rc=1   «нет прав на каталог»
+#                  файла нет         out=''   rc=1   «установите dehydrated»
+#   test -w DIR:   есть, 755         out='ok' rc=0
+#                  есть, 555 / 000   out='ro' rc=0   верный «не пишется»
+#                  есть, родитель 000 out='' rc=1   ПОБАЙТОВО == «каталога нет»
+#
+# Лечение у миров противоположное (chmod против прав на предок против переноса
+# сайта), поэтому право на «нет» имеет только достоверный список каталога —
+# тот же носитель dir_listing_info (1.32.14), что у file_presence, а не новый.
+# Ответ даёт КОД ВОЗВРАТА теста доступа: это измерение, а не пустота stdout.
+AP_DENIED = ('', '', 1)                       # бита нет / прав нет — rc=1
+AP_LISTING_UP = ('bitrix/' + chr(10) + 'upload/', '', 0)   # список достоверен
+AP_BLOCKED = ('ls: cannot open directory: Permission denied' + chr(10), '', 2)
+
+
+class TestPathAccessDistinguishesWorlds:
+    """Спрос «доступен ли путь» обязан называть мир, а не слово."""
+
+    def test_allowed_answers_by_return_code_alone(self):
+        # Норма: rc=0 от test -w — это измерение. Список каталога к нему НЕ
+        # спрашивается (замер 1.32.14: в мире 111 список прочесть нельзя, а
+        # доступ есть; второй спрос был бы платой за то, что уже известно).
+        c = FakeSSH(routes=[('test -w', ('', '', 0))])
+        info = common.path_access_info(c, '/home/bitrix/www/upload', mode='w')
+        assert info['state'] == 'allowed', info
+        assert info['checked'] is True, info
+        assert c.count('test -w') == 1, c.commands
+        assert c.count('ls -1 -p') == 0, c.commands
+
+    def test_denied_with_proven_existence_is_not_absent(self):
+        # Мир 555/000: теста доступа нет, но родитель прочитан и имя в списке
+        # есть (каталог — с суффиксом «/»). Здесь честен вердикт «есть, но не
+        # пишется»: прежнее «каталог не найден» отправило бы оператора искать
+        # отсутствующий каталог там, где нужен chmod.
+        c = FakeSSH(routes=[('test -w', AP_DENIED),
+                            ('ls -1 -p', AP_LISTING_UP)])
+        info = common.path_access_info(c, '/home/bitrix/www/upload', mode='w')
+        assert info['state'] == 'denied', info
+        assert info['checked'] is True, info
+
+    def test_absent_needs_the_proven_listing(self):
+        # Обратная ветка: отсутствия ДОКАЗАНО достоверным списком, где имени
+        # нет. Прежний контракт обязан выжить — иначе «не проверено» вытеснит
+        # честное «нет», и оператор перестанет видеть реальную проблему.
+        c = FakeSSH(routes=[('test -x', AP_DENIED),
+                            ('ls -1 -p', ('bin/' + chr(10) + 'etc/', '', 0))])
+        info = common.path_access_info(c, '/home/bitrix/dehydrated', mode='x')
+        assert info['state'] == 'absent', info
+
+    def test_unreadable_parent_is_unchecked_not_absent(self):
+        # Ровно тот мир, где прежний код соврал: объект ЕСТЬ, а список не
+        # читается (rc=2). «Не видно» и «нет» неразличимы побайтово, поэтому
+        # здесь рождается «не проверено», а не догадка.
+        c = FakeSSH(routes=[('test -w', AP_DENIED), ('ls -1 -p', AP_BLOCKED)])
+        info = common.path_access_info(c, '/home/bitrix/www/upload', mode='w')
+        assert info['state'] == 'unchecked', info
+        assert info['checked'] is False, info
+        assert 'не проверено' in info['note'].lower(), info
+
+    def test_mode_is_not_hardcoded_to_write(self):
+        # Исполняемый бит — тот же корень: панель спрашивает «запускаема ли
+        # утилита». Носитель обязан различать режимы, иначе вторая форма
+        # завела бы свой дубль (закон серии: признак спрашивает ОДНА функция).
+        c = FakeSSH(routes=[('test -x', AP_DENIED),
+                            ('ls -1 -p', ('dehydrated' + chr(10), '', 0))])
+        info = common.path_access_info(c, '/usr/local/bin/dehydrated', mode='x')
+        assert info['state'] == 'denied', info
+        assert any('test -x' in s for s in c.commands), c.commands
+        assert not any('test -w' in s for s in c.commands), c.commands
+
+    def test_empty_path_is_unchecked_without_asking(self):
+        # Пустой путь — не «доступа нет»: спрашивать нечего. Прежние формы на
+        # пустом пути печатали диагноз «не найден» (test -f '' тоже rc=1).
+        c = FakeSSH()
+        info = common.path_access_info(c, '', mode='w')
+        assert info['state'] == 'unchecked' and info['checked'] is False, info
+        assert c.commands == [], c.commands
+
+    def test_unknown_mode_is_rejected_not_guessed(self):
+        # Режим из списка: молчаливый default к «w» означал бы, что опечатка
+        # в вызове спрашивает про запись там, где нужен исполняемый бит.
+        c = FakeSSH()
+        try:
+            common.path_access_info(c, '/a/b', mode='q')
+        except ValueError as exc:
+            assert 'q' in str(exc)
+        else:
+            raise AssertionError('режим q принят молча: %s' % c.commands)
+
+    def test_question_carries_no_ready_word(self):
+        # Статический замок на ФОРМЕ спроса: «&& echo ok» — это и есть носитель
+        # лжи (слово вместо кода). Проверяется не «ок больше не печатается»,
+        # а что носитель такого слова не отправляет вовсе.
+        c = FakeSSH(routes=[('test -w', ('', '', 0))])
+        common.path_access_info(c, '/a/b', mode='w')
+        assert c.commands, 'носитель ничего не спросил'
+        assert all('echo' not in s for s in c.commands), c.commands
+        assert all('&&' not in s for s in c.commands), c.commands
+
+    def test_cache_pays_the_parent_once(self):
+        # Отчёт прав спрашивает несколько путей ОБЩЕГО предка: цена различения
+        # не имеет права расти линейно. Фикстура обязана быть именно про общий
+        # предок: с вложенными rel (bitrix/cache) родители разные, и проверка
+        # цены краснела бы по неверной причине (замер 1.32.20 на первом
+        # черновике этого теста).
+        cache = {}
+        c = FakeSSH(routes=[('test -w', AP_DENIED),
+                            ('ls -1 -p', AP_LISTING_UP)])
+        for rel in ('upload', 'www', 'site'):
+            common.path_access_info(c, '/home/bitrix/www/' + rel,
+                                    mode='w', cache=cache)
+        assert c.count('test -w') == 3, c.commands
+        assert c.count('ls -1 -p') == 1, c.commands
+

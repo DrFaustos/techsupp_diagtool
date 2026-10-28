@@ -9,7 +9,12 @@ Access denied для пользователя БД из dbconn.php, молчащ
 import re
 from datetime import datetime, timezone
 
-from common import (q, save_crontab_backup_info, crontab_read_info,
+from common import (
+                    # Признак «доступен ли путь» спрашивает ОДНА функция
+                    # (1.32.20): раньше каждая кнопка решала по готовому
+                    # слову, и они разъехались бы релизами.
+                    path_access_info,
+                    q, save_crontab_backup_info, crontab_read_info,
                     file_presence, write_remote_file,
                     prepare_secret_file, remove_remote_path,
                     count_find_info,
@@ -478,9 +483,37 @@ def bitrix_ssl_report(checker):
 
 
 def bitrix_ssl_renew(checker):
+    """Перевыпустить сертификаты dehydrated — если утилита правда запускается.
+
+    Прежняя форма решала по СЛОВУ:
+
+        out, _, _ = checker.run(f'test -x {q(DEHYDRATED_BIN)} && echo ok')
+        if out.strip() != 'ok': ...не найден, стоит certbot...
+
+    Замер живьём (настоящий bash, настоящие chmod; прежняя функция — боевая из
+    закреплённого v1.32.19): «скрипт есть, но mode 644», «скрипт есть, а каталог
+    000» и «скрипта нет» дают ПОБАЙТОВО одинаковый out='' rc=1, а лечение у них
+    противоположное — chmod +x, права на каталог и «установите dehydrated».
+    Живой прогон прежнего кода в мире 644 напечатал: «❌ … не найден — выпуск
+    сертификатов не настроен (BitrixVM < 7.2 или стоит certbot)», то есть
+    отправил оператора переустанавливать панель там, где нужен один chmod.
+    Носитель — path_access_info (1.32.20), тот же, что у отчёта прав.
+    """
     lines = ['=== ПЕРЕВЫПУСК СЕРТИФИКАТОВ DEHYDRATED ===']
-    out, _, _ = checker.run(f'test -x {q(DEHYDRATED_BIN)} && echo ok')
-    if out.strip() != 'ok':
+    acc = path_access_info(checker, DEHYDRATED_BIN, mode='x')
+    if acc['state'] == 'denied':
+        # Файл на месте: это не «не настроен», это один chmod.
+        lines.append(f'❌ {DEHYDRATED_BIN} не исполняется: бита +x нет — '
+                     f'chmod +x {DEHYDRATED_BIN} (запуск не отправлен)')
+        return '\n'.join(lines)
+    if acc['state'] == 'unchecked':
+        # Кнопка отправляет до 2 минут чужих запросов к Let's Encrypt с лимитом
+        # 5 ошибок/час, поэтому «мы не спросили» отменяет её, а не превращается
+        # в «не найден».
+        lines.append(f'❌ Доступ к {DEHYDRATED_BIN}: {acc["note"]} — запуск '
+                     'отменён, сначала нужны права на каталог')
+        return '\n'.join(lines)
+    if acc['state'] != 'allowed':
         lines.append(f'❌ {DEHYDRATED_BIN} не найден — выпуск сертификатов '
                      'не настроен (BitrixVM < 7.2 или стоит certbot)')
         return '\n'.join(lines)
@@ -950,18 +983,26 @@ def bitrix_perms_report(checker):
         '⚠️ Не удалось посчитать world-writable файлы: счётчик не ответил — '
         'о дырах такого рода ничего не известно'))
 
+    # Прежняя форма спрашивала слово ('ok'/'ro'/пусто) и на пустоте объявляла
+    # «каталог не найден». Замер живьём: если документ-корень закрыт chmod 000,
+    # а каталоги ВНУТРИ него есть и пишутся, прежний отчёт печатал «каталог не
+    # найден» по каждому из пяти — то есть звал переносить сайт там, где нужно
+    # посмотреть права на предка. Право на «не найден» теперь имеет только
+    # достоверный список каталога; общий предок спрашивается один раз (cache).
+    access_cache = {}
     for rel in WRITABLE_DIRS:
         path = f'{BITRIX_DOCROOT}/{rel}'
-        out, _, _ = checker.run(
-            f'test -d {q(path)} && (test -w {q(path)} && echo ok || echo ro)')
-        mark = out.strip()
-        if mark == 'ok':
+        acc = path_access_info(checker, path, mode='w', cache=access_cache)
+        if acc['state'] == 'allowed':
             lines.append(f'✅ {rel}: запись есть')
-        elif mark == 'ro':
+        elif acc['state'] == 'denied':
             lines.append(f'❌ {rel}: каталог есть, но НЕ доступен для записи — '
                          'кеш/агенты работать не будут')
-        else:
+        elif acc['state'] == 'absent':
             lines.append(f'⚠️ {rel}: каталог не найден')
+        else:
+            lines.append(f'⚠️ {rel}: {acc["note"]} — «нет каталога» и «нет прав '
+                         'на предка» этим спросом не различаются')
     return '\n'.join(lines)
 
 

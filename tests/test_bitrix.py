@@ -236,10 +236,15 @@ class TestSSL:
             assert path in grep_cmd, f'{path} не ищется'
 
     def test_renew_requires_binary(self):
-        c = FakeSSH()
+        # Переписан объявленно (1.32.20): прежняя версия звала пустой ответ
+        # двойника по умолчанию (rc=0!) доказательством «файла нет», то есть
+        # закрепляла ровно тот жест — решение по пустоте, — который слайс
+        # лечит. Отсутствие обязано быть доказанным списком каталога.
+        c = FakeSSH(routes=[('test -x', ('', '', 1)),
+                            ('ls -1 -p', ('bin/' + chr(10), '', 0))])
         out = bx.bitrix_ssl_renew(c)
-        assert '❌' in out
-        assert c.find('cd /home/bitrix/dehydrated') is None
+        assert 'не найден' in out, out
+        assert c.find('cd /home/bitrix/dehydrated') is None, c.commands
 
     def test_renew_runs_dehydrated(self):
         c = FakeSSH(routes=[
@@ -562,8 +567,19 @@ class TestTopTables:
 
 # ==================== права файлов сайта ====================
 def _perms_routes(owner_cnt='FCOUNT 0\nFRC 0\n',
-                  world_cnt='FCOUNT 0\nFRC 0\n', dirs='ok'):
-    """Маршруты для bitrix_perms_report: dirs — ответ на test -d/test -w.
+                  world_cnt='FCOUNT 0\nFRC 0\n', dirs=('', '', 0),
+                  listing=('bitrix/' + chr(10) + 'cache/'
+                           + chr(10) + 'managed_cache/' + chr(10)
+                           + 'data/' + chr(10) + 'php_interface/'
+                           + chr(10) + 'upload/', '', 0)):
+    """Маршруты для bitrix_perms_report.
+
+    1.32.20: язык сменился с готового слова ('ok'/'ro'/'') на ПАРУ — dirs это
+    ответ на «test -w ПУТЬ» (rc=0 — измерение), listing — достоверный список
+    родителя, который и решает «есть, но без прав» / «нет» / «не видно».
+    Прежний dirs='' описывал «каталога нет» как rc=0, а замер живьём даёт там
+    rc=1: молчаливая старым языком фикстура дала бы зелёный тест по НЕВЕРНОЙ
+    причине.
 
     Дефолты заговорили НОВЫМ протоколом (1.32.5): FCOUNT/FRC вместо голого
     числа от wc. Прежние '0\\n' описывают команду, которую больше не
@@ -575,7 +591,8 @@ def _perms_routes(owner_cnt='FCOUNT 0\nFRC 0\n',
         ('ls -ld', 'drwxr-xr-x 42 bitrix bitrix 4096 Oct 10 12:00 /home/bitrix/www'),
         ('! -user', owner_cnt + '\n'),
         ('-perm -o+w', world_cnt + '\n'),
-        ('test -d', dirs + '\n'),
+        ('ls -1 -p', listing),
+        ('test -w', dirs),
     ]
 
 
@@ -598,12 +615,12 @@ class TestPerms:
         assert 'доступных на запись всем (o+w): 7' in out
 
     def test_report_readonly_cache_dir(self):
-        routes = _perms_routes()
-        # кеш-каталог есть, но без записи — кеш и агенты работать не будут
-        routes.append(('bitrix/cache', 'ro\n'))
-        c = FakeSSH(routes=[routes[-1]] + routes[:-1])
+        # Кеш-каталог есть, но без записи — кеш и агенты работать не будут.
+        # 1.32.20: мир кодируется парой (test -w rc=1 + достоверный список,
+        # где имя есть), а не словом «ro»: готовое слово и было носителем.
+        c = FakeSSH(routes=_perms_routes(dirs=('', '', 1)))
         out = bx.bitrix_perms_report(c)
-        assert '❌ bitrix/cache' in out
+        assert '❌ bitrix/cache' in out, out
 
     def test_report_missing_docroot_stops(self):
         c = FakeSSH(routes=[('ls -ld', ('', 'No such file or directory', 1))])
@@ -1220,11 +1237,13 @@ class TestGrantsErrorPaths:
 
 class TestPermsMissingDirs:
     def test_absent_writable_dir_is_warning(self):
-        # ни ok, ни ro: каталога нет (например, merged_cache в старой сборке) —
-        # ⚠️ «каталог не найден», а не ❌ «нет доступа»
-        c = FakeSSH(routes=_perms_routes(dirs=''))
+        # Каталога нет (например, merged_cache в старой сборке) — ⚠️ «каталог
+        # не найден», а не ❌ «нет доступа». 1.32.20: отсутствие ДОКАЗЫВАЕТСЯ
+        # достоверным пустым списком родителя (rc=0), а не пустотой stdout.
+        c = FakeSSH(routes=_perms_routes(dirs=('', '', 1),
+                                         listing=('', '', 0)))
         out = bx.bitrix_perms_report(c)
-        assert 'каталог не найден' in out
+        assert 'каталог не найден' in out, out
 
     def test_world_writable_count_unparsable_stays_quiet(self):
         # счётчик o+w не разобрался — врать про «дыру» нельзя: строки с числом
@@ -1679,3 +1698,105 @@ class TestCronInstallNeedsProvenScript:
         out = bx.bitrix_cron_install(c)
         assert '❌' in out and 'cron.sh' in out, out
         assert c.find('| crontab -') is None, c.commands
+
+# ===== 1.32.20: панель Битрикс спрашивает про доступ, а не про слово =========
+# Прежнее поколение (замер .ai-free/localize13220.py, боевая функция с v1.32.19
+# на реальных chmod) печатало:
+#   «❌ /…/dehydrated не найден — выпуск сертификатов не настроен (BitrixVM <
+#    7.2 или стоит certbot)» там, где файл есть и нужен chmod +x;
+#   «⚠️ bitrix/cache: каталог не найден» — все пять каталогов — там, где они
+#    есть и пишутся, а прав нет на документ-корень.
+# Фикстуры ниже говорят НОВЫМ языком: мир кодируется парой (код возврата теста
+# доступа, достоверный список родителя), а не словом 'ok'/'ro'/'' в stdout —
+# иначе фикстура описывала бы команду, которую больше не отправляют (тот же
+# закон, что заперт в 1.32.5 про FCOUNT/FRC и в v1.27.0).
+BX_DENIED = ('', '', 1)
+BX_LISTING = ('bitrix/' + chr(10) + 'cache/' + chr(10) + 'managed_cache/'
+              + chr(10) + 'data/' + chr(10) + 'php_interface/' + chr(10)
+              + 'upload/', '', 0)
+BX_BLOCKED = ('ls: cannot open directory: Permission denied' + chr(10), '', 2)
+
+
+class TestSslRenewSaysWhyItCannotRun:
+    """«Не найден», «не исполняется» и «не видно» — три разных отказа кнопки."""
+
+    def test_non_executable_says_chmod_not_certbot(self):
+        # Ядро слайса: скрипт на месте, но mode 644. Прежний ответ отправлял
+        # оператора «ставить certbot / обновлять BitrixVM», то есть лечение из
+        # чужого мира; здесь назван chmod и запуск не отправляется.
+        c = FakeSSH(routes=[('test -x', BX_DENIED),
+                            ('ls -1 -p', ('dehydrated' + chr(10), '', 0))])
+        out = bx.bitrix_ssl_renew(c)
+        assert 'не исполняется' in out, out
+        assert 'chmod' in out, out
+        assert 'не настроен' not in out, out
+        assert c.find('dehydrated -c') is None, c.commands
+
+    def test_unreadable_directory_aborts_without_running(self):
+        # Кнопка — действие (до 2 минут чужих запросов к Let's Encrypt и лимит
+        # 5 ошибок/час), поэтому «не проверено» отменяет её, а не превращается
+        # в «не найден».
+        c = FakeSSH(routes=[('test -x', BX_DENIED), ('ls -1 -p', BX_BLOCKED)])
+        out = bx.bitrix_ssl_renew(c)
+        assert 'не проверено' in out, out
+        assert 'не найден' not in out, out
+        assert c.find('dehydrated -c') is None, c.commands
+
+    def test_executable_binary_still_runs(self):
+        # Обратный контроль: норма не имеет права деградировать. Прежняя
+        # фикстура ('test -x', 'ok') = rc=0, и rc=0 остаётся ответом — значит
+        # этот тест обязан пережить слайс без правок.
+        c = FakeSSH(routes=[('test -x', 'ok'),
+                            ('dehydrated -c', 'Processing domain site.ru')])
+        out = bx.bitrix_ssl_renew(c)
+        assert 'Код завершения: 0' in out and 'site.ru' in out, out
+
+    def test_absent_binary_still_refuses(self):
+        # Прежний контракт выживает: ДОКАЗАННОЕ отсутствие (список родителя без
+        # имени) обязано остаться честным «не найден» — иначе «не проверено»
+        # вытеснит реальную проблему и кнопка пойдёт запускать несуществующее.
+        c = FakeSSH(routes=[('test -x', BX_DENIED),
+                            ('ls -1 -p', ('bin/' + chr(10) + 'etc/', '', 0))])
+        out = bx.bitrix_ssl_renew(c)
+        assert 'не найден' in out, out
+        assert 'не проверено' not in out, out
+        assert c.find('dehydrated -c') is None, c.commands
+
+
+class TestPermsAccessWorlds:
+    """Отчёт прав: «не пишется», «нет каталога» и «не видно» — не одно слово."""
+
+    def test_unreadable_docroot_is_not_reported_as_missing(self):
+        # Пять «каталог не найден» там, где каталоги есть и пишутся, а прав нет
+        # на документ-корень: прежний ответ звал переносить сайт.
+        c = FakeSSH(routes=_perms_routes(dirs=BX_DENIED, listing=BX_BLOCKED))
+        out = bx.bitrix_perms_report(c)
+        assert 'не проверено' in out, out
+        assert 'каталог не найден' not in out, out
+
+    def test_denied_dir_with_proven_listing_keeps_readonly_verdict(self):
+        # Прежний ❌-вердикт обязан выжить и остаться доказанным: имя есть в
+        # достоверном списке родителя, значит «есть, но не пишется».
+        c = FakeSSH(routes=_perms_routes(dirs=BX_DENIED, listing=BX_LISTING))
+        out = bx.bitrix_perms_report(c)
+        assert '❌ bitrix/cache' in out, out
+        assert 'не найден' not in out, out
+
+    def test_writable_norm_pays_no_listing(self):
+        # Цена различения: когда ответ дал код возврата, список каталога не
+        # спрашивается ни разу (пять каталогов = пять вопросов, как и раньше).
+        c = FakeSSH(routes=_perms_routes(dirs=('', '', 0)))
+        out = bx.bitrix_perms_report(c)
+        assert '✅ upload: запись есть' in out, out
+        assert c.count('ls -1 -p') == 0, c.commands
+        assert c.count('test -w') == len(bx.WRITABLE_DIRS), c.commands
+
+    def test_unchecked_dir_does_not_offer_the_fix_button_as_done(self):
+        # Строка «не проверено» обязана доноситься по каждому каталогу, а не
+        # сливаться в один общий отказ: оператор ищет конкретный путь.
+        c = FakeSSH(routes=_perms_routes(dirs=BX_DENIED, listing=BX_BLOCKED))
+        out = bx.bitrix_perms_report(c)
+        for rel in bx.WRITABLE_DIRS:
+            assert rel in out, (rel, out)
+        assert out.count('не проверено') >= len(bx.WRITABLE_DIRS), out
+
