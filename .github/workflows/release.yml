@@ -1,0 +1,75 @@
+name: release
+
+# Сборка под Linux и выкладка ассета. Раньше бинарь клал в Release человек
+# (ассеты есть только у v1.0.0..v1.1.0), и релиз без бинаря означал «руки не
+# дошли». Теперь артефакт делает прогон: токена разработчика для этого нет и
+# не нужно — достаточно GITHUB_TOKEN с правами на contents.
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+jobs:
+  linux-onefile:
+    name: Linux onefile (Tkinter + Xvfb)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # fetch-depth: 0 обязателен и здесь: спека и тесты читают историю, а
+      # дефолт checkout (1) присылает shallow-клон - ровно та причина, по
+      # которой tests.yml был красным 28 прогонов подряд.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Tkinter, venv and Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk python3-venv xvfb
+
+      - name: Build standalone binary
+        run: |
+          python3 -m venv .venv-build
+          .venv-build/bin/python -m pip install --upgrade pip
+          .venv-build/bin/python -m pip install -r requirements.txt pyinstaller
+          .venv-build/bin/python -c "import tkinter, PyInstaller; \
+            print('Tcl', tkinter.TclVersion, 'PyInstaller', \
+            PyInstaller.__version__)"
+          .venv-build/bin/pyinstaller --noconfirm --clean ServerDiagnostic.spec
+          ls -l dist/ServerDiagnostic
+          file dist/ServerDiagnostic
+
+      - name: Smoke run under Xvfb
+        run: |
+          chmod +x dist/ServerDiagnostic
+          xvfb-run -a ./dist/ServerDiagnostic > smoke.log 2>&1 &
+          pid=$!
+          sleep 20
+          if ! kill -0 "$pid"; then
+            echo "бинарь умер, не дожив до 20 с"
+            cat smoke.log
+            exit 1
+          fi
+          kill "$pid"
+          if grep -q Traceback smoke.log; then
+            echo "бинарь жив, но в выводе traceback"
+            cat smoke.log
+            exit 1
+          fi
+          echo "бинарь прожил 20 с под Xvfb без traceback"
+
+      - name: Publish asset to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          asset="ServerDiagnostic-${tag#v}-linux-x86_64"
+          cp dist/ServerDiagnostic "$asset"
+          sha256sum "$asset"
+          notes=$(git tag -l --format='%(contents:subject)' "$tag")
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --notes "$notes"
+          fi
+          gh release upload "$tag" "$asset" --clobber
+          gh release view "$tag"
