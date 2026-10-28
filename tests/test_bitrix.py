@@ -704,9 +704,16 @@ class TestPhp:
 
 class TestCron:
     def test_present_cron_entry(self):
+        # Честная фикстура 1.32.19. Прежняя не имела
+        # иглы «crontab -l», и после перехода отчёта
+        # на носитель тест остался бы зелёным по
+        # НЕВЕРНОЙ причине: пустой ответ носителя
+        # дал бы «заданий нет», а проверяется
+        # «задание есть».
         c = FakeSSH(routes=[
-            ('test -f', 'ok'),
-            ('grep -F cron.sh', '7:* * * * * sudo -u bitrix /home/bitrix/www/bitrix/modules/main/tools/cron.sh'),
+            ('test -f', ('', '', 0)),
+            ('crontab -l', '7:* * * * * sudo -u bitrix ' + bx.CRON_SH
+                           + ' >/dev/null 2>&1' + chr(10)),
         ])
         out = bx.bitrix_cron_report(c)
         assert '✅' in out and 'cron.sh' in out
@@ -849,7 +856,14 @@ def _install_routes(grep_out='', cur='', setup=('', '', 0),
 
 class TestCronInstall:
     def test_missing_script_does_not_touch_crontab(self):
-        c = FakeSSH()          # test -f -> '' (скрипта нет)
+        # Прежняя фикстура была лживой: голое
+        # FakeSSH() отвечает rc=0 на ЛЮБУЮ команду, что
+        # для носителя присутствия означает
+        # «скрипт ЕСТЬ» (урок 1.32.16 про default
+        # «успех»). Здесь — доказанное отсутствие:
+        # rc=1 и достоверный список без имени.
+        c = FakeSSH(routes=[('ls -1 -p', ('www/ ' + chr(10), '', 0)),
+                            ('test -f', ('', '', 1))])
         out = bx.bitrix_cron_install(c)
         assert '❌' in out and 'cron.sh' in out
         assert c.find('| crontab -') is None
@@ -1535,3 +1549,133 @@ class TestCronInstallReadsBeforeWriting:
         setup = c.find('| crontab -')
         assert setup is not None
         assert 'crontab -l 2>/dev/null' not in setup
+
+# ==================== cron.sh: «не видно» ≠ «нет» (1.32.19) ==================
+# Замер живьём (настоящий /bin/bash, uid=1000, реальные chmod на каталоге;
+# прежнее поколение — НАСТОЯЩАЯ bitrix.bitrix_cron_report из v1.32.18):
+#
+#   мир            test -f PATH && echo ok        прежний отчёт
+#   есть           out='ok'   rc=0                ✅ на месте            верно
+#   нет файла      out=''     rc=1                ⚠️ не найден           верно
+#   каталог 000    out=''     rc=1                ⚠️ не найден — «проверьте,
+#                                                  что сайт на Битрикс стоит
+#                                                  в /home/bitrix/www»       ЛОЖЬ
+#   каталог 0111   out='ok'   rc=0                ✅ на месте            верно
+#
+# «Нет файла» и «нет прав на каталог» дают ПОБАЙТОВО одинаковый ответ — признак
+# физически не различает миры, а лечение у них противоположное (править права
+# против искать установку сайта). Носитель — file_presence (1.32.14).
+#
+# Второй носитель той же функции: `crontab -l 2>/dev/null | grep -F cron.sh`.
+# Замер: миры «заданий нет», «crontab ещё не заводили» и «НЕ ЧИТАЕТСЯ» дают не
+# только одинаково пустой вывод, но и ОДИНАКОВЫЙ rc=1 (код конвейера принадлежит
+# grep). Отличие живёт в тексте канала, который 2>/dev/null и глушит. Носитель —
+# crontab_read_info (1.32.17).
+CRON_IO_FAIL = ('', 'crontab: cannot open: Input/output error' + chr(10), 1)
+CRON_NOJOBS = ('', 'no crontab for root' + chr(10), 1)
+CRON_ONE_JOB = ('0 3 * * * /usr/sbin/logrotate' + chr(10), '', 0)
+
+
+def _presence_routes(test_rc=1, ls=('other.sh/', '', 0)):
+    """Пути фикстуры file_presence: сначала специфичные иглы, потом широкие."""
+    return [('ls -1 -p', ls), ('test -f', ('', '', test_rc))]
+
+
+class TestCronReportDistinguishesWorlds:
+    """Отчёт о cron.sh обязан называть мир, а не прятать его за «не найден»."""
+
+    def test_present_script_costs_one_question(self):
+        # Норма: ответ даёт код возврата, список каталога не спрашивается
+        # (замер 1.32.14: в мире 0111 список прочесть нельзя, а файл есть).
+        c = FakeSSH(routes=[('test -f', ('', '', 0)),
+                            ('crontab -l', (bx.CRON_LINE + chr(10), '', 0))])
+        out = bx.bitrix_cron_report(c)
+        assert '✅' in out and 'cron.sh' in out, out
+        assert c.count('test -f') == 1, c.commands
+        assert c.count('ls -1 -p') == 0, c.commands
+
+    def test_genuinely_absent_script_says_not_found(self):
+        # Обратная ветка: отсутствие ДОКАЗАНО достоверным списком каталога.
+        # Прежний контракт обязан выжить — иначе «не проверено» вытеснит
+        # честное «нет» и оператор перестанет видеть реальную проблему.
+        c = FakeSSH(routes=_presence_routes(
+            ls=('www/ ' + chr(10) + 'index.php /', '', 0)))
+        out = bx.bitrix_cron_report(c)
+        assert 'не найден' in out, out
+        assert 'не проверено' not in out, out
+
+    def test_unreadable_directory_is_not_reported_as_missing(self):
+        # Ровно тот мир, где прежний код соврал «проверьте, что сайт на Битрикс
+        # стоит в /home/bitrix/www»: файл есть, прав на каталог нет.
+        c = FakeSSH(routes=_presence_routes(
+            ls=('ls: cannot open: Permission denied' + chr(10), '', 2)))
+        out = bx.bitrix_cron_report(c)
+        assert 'не проверено' in out, out
+        assert 'не найден' not in out, out
+        assert '❌' in out or '⚠️' in out, out
+
+    def test_forbidden_shape_is_gone_from_the_report(self):
+        # Запрещена форма решения по СЛОВУ, а не сам `test -f`: носитель тоже
+        # им пользуется, но решает кодом возврата. Проверка «test -f больше нет»
+        # была бы ложной.
+        c = FakeSSH(routes=[('test -f', ('', '', 0)),
+                            ('crontab -l', (bx.CRON_LINE + chr(10), '', 0))])
+        bx.bitrix_cron_report(c)
+        asked = [s for s in c.commands if 'test -f' in s]
+        assert asked, c.commands
+        assert all('&&' not in s and 'echo' not in s for s in asked), asked
+
+    def test_unreadable_crontab_is_not_reported_as_no_job(self):
+        # Три мира дают одинаковый пустой вывод И одинаковый rc=1: решает текст
+        # канала, который прежняя форма прятала в /dev/null.
+        c = FakeSSH(routes=[('test -f', ('', '', 0)),
+                            ('crontab -l', CRON_IO_FAIL)])
+        out = bx.bitrix_cron_report(c)
+        assert 'Задания cron.sh в crontab нет' not in out, out
+        assert 'не прочитан' in out, out
+        assert 'Input/output error' in out, out
+
+    def test_fresh_machine_stays_calm_and_shows_the_recommendation(self):
+        # Обратная ветка (ложная тревога дороже лжи): «no crontab for root» —
+        # штатный ответ чистой машины. Прежний контракт обязан выжить.
+        c = FakeSSH(routes=[('test -f', ('', '', 0)),
+                            ('crontab -l', CRON_NOJOBS)])
+        out = bx.bitrix_cron_report(c)
+        assert '✅' in out, out
+        assert 'sudo -u bitrix' in out and '*/1 * * * *' in out, out
+
+    def test_job_is_found_in_the_read_text_without_grep_pipe(self):
+        # Задание ищется в ПРОЧИТАННОМ тексте; признак поиска (слово cron.sh)
+        # сохранён прежним, чтобы не сузить его без замера.
+        c = FakeSSH(routes=[('test -f', ('', '', 0)),
+                            ('crontab -l', (bx.CRON_LINE + chr(10), '', 0))])
+        out = bx.bitrix_cron_report(c)
+        assert '✅' in out, out
+        cr = [s for s in c.commands if 'crontab' in s]
+        assert len(cr) == 1, cr
+        assert all('2>/dev/null' not in s for s in cr), cr
+        assert all('grep' not in s for s in cr), cr
+
+
+class TestCronInstallNeedsProvenScript:
+    """Кнопка установки не имеет права решать по пустоте stdout."""
+
+    def test_unreadable_directory_aborts_without_writing(self):
+        # Прежний код: «❌ не найден — добавлять в cron нечего» там, где файл
+        # есть, а прав нет. Запись crontab — действие, этого уровня отказа
+        # недостаточно.
+        c = FakeSSH(routes=_presence_routes(
+            ls=('ls: cannot open: Permission denied' + chr(10), '', 2)))
+        out = bx.bitrix_cron_install(c)
+        assert 'не проверено' in out, out
+        assert 'не найден' not in out, out
+        assert c.find('| crontab -') is None, c.commands
+        assert c.find('crontab -l >') is None, c.commands
+
+    def test_absent_script_still_refuses_to_write(self):
+        # Прежний контракт обязан выжить: доказанного отсутствия достаточно
+        # для отказа (иначе «не проверено» вытеснит и этот честный отказ).
+        c = FakeSSH(routes=_presence_routes(ls=('www/ ' + chr(10), '', 0)))
+        out = bx.bitrix_cron_install(c)
+        assert '❌' in out and 'cron.sh' in out, out
+        assert c.find('| crontab -') is None, c.commands

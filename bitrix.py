@@ -10,7 +10,7 @@ import re
 from datetime import datetime, timezone
 
 from common import (q, save_crontab_backup_info, crontab_read_info,
-                    write_remote_file,
+                    file_presence, write_remote_file,
                     prepare_secret_file, remove_remote_path,
                     count_find_info,
                     # Признак юнита спрашивает ОДНА функция на весь проект
@@ -1030,18 +1030,60 @@ def bitrix_php_report(checker):
 
 # ==================== CRON-АГЕНТЫ ====================
 def bitrix_cron_report(checker):
+    """Cron-агенты: состояние скрипта и задания в crontab.
+
+    Прежняя форма решала по СЛОВУ и по ПУСТОТЕ:
+
+        out, _, _ = checker.run(f'test -f {q(CRON_SH)} && echo ok')
+        if out.strip() == 'ok': ...
+        out, _, _ = checker.run('crontab -l 2>/dev/null | grep -F cron.sh')
+
+    Замер живьём (настоящий bash, uid=1000, реальные chmod на каталоге; прежнее
+    поколение — настоящая функция из закреплённого v1.32.18) по скрипту:
+
+        есть          out='ok' rc=0   ✅ на месте      верно
+        нет файла     out=''   rc=1   ⚠️ не найден     верно
+        каталог 000   out=''   rc=1   ⚠️ не найден     ЛОЖЬ: файл есть, нет
+                                      прав на каталог, а лечение у миров
+                                      противоположное (права против переноса
+                                      сайта)
+        каталог 0111  out='ok' rc=0   ✅ на месте      верно
+
+    «Нет файла» и «не видно» неразличимы побайтово, поэтому право на слово «не
+    найден» даёт только достоверный список каталога — носитель file_presence
+    (1.32.14), тот же, что у логов панели. Мир 0111 показывает, почему нельзя
+    было решить ОДНИМ списком: там test -f отвечает ВЕРНО, а список родителя не
+    читается (rc=2).
+
+    По crontab признак был хуже, чем казалось: миры «заданий нет», «crontab ещё
+    не заводили» и «НЕ ЧИТАЕТСЯ» дают не только одинаково пустой вывод, но и
+    ОДИНАКОВЫЙ rc=1 — код конвейера принадлежит grep, а различие живёт в тексте
+    канала, который 2>/dev/null и глушил. Поэтому задание ищется в ПРОЧИТАННОМ
+    тексте, а спрашивает его одна функция на весь проект — crontab_read_info.
+    """
     lines = ['=== CRON-АГЕНТЫ БИТРИКС ===']
-    out, _, _ = checker.run(f'test -f {q(CRON_SH)} && echo ok')
-    if out.strip() == 'ok':
+    presence = file_presence(checker, CRON_SH)
+    if presence['state'] == 'found':
         lines.append(f'✅ {CRON_SH} на месте')
-    else:
+    elif presence['state'] == 'absent':
         lines.append(f'⚠️ {CRON_SH} не найден — проверьте, что сайт на '
                      f'Битрикс стоит в {BITRIX_DOCROOT}')
+    else:
+        # Слова «не найден» здесь нет намеренно: оно отправило бы оператора
+        # переносить сайт, когда достаточно посмотреть права на каталог.
+        lines.append(f'⚠️ Состояние {CRON_SH} не проверено: '
+                     f'{presence["note"]} — «файла нет» и «нет прав на '
+                     f'каталог» этим спросом не различаются')
 
-    out, _, _ = checker.run('crontab -l 2>/dev/null | grep -F cron.sh')
-    if out.strip():
+    read = crontab_read_info(checker)
+    if read['state'] == 'failed':
+        lines.append(f'❌ Текущий crontab не прочитан ({read["note"]}) — о '
+                     f'задании cron.sh ничего не известно')
+        return '\n'.join(lines)
+    hits = [ln for ln in (read['text'] or '').splitlines() if 'cron.sh' in ln]
+    if hits:
         lines.append('✅ Задание cron.sh в crontab root:')
-        lines.append(out.strip())
+        lines.extend(hits)
     else:
         lines.append('⚠️ Задания cron.sh в crontab нет: агенты крутятся на каждом')
         lines.append('   хите и тормозят отдачу страниц. Рекомендуемая строка')
@@ -1058,8 +1100,15 @@ def bitrix_cron_install(checker):
     после — строка читается обратно, а не верится на слово.
     """
     lines = ['=== УСТАНОВКА CRON-АГЕНТОВ В CRONTAB ===']
-    out, _, _ = checker.run(f'test -f {q(CRON_SH)} && echo ok')
-    if out.strip() != 'ok':
+    presence = file_presence(checker, CRON_SH)
+    if presence['state'] == 'unchecked':
+        # Здесь не отчёт, а действие: править crontab по ответу, который не
+        # различает «файла нет» и «не видно», недопустимо. Замер: в мире
+        # «каталог 000» прежний код отказывался ПО ЛОЖНОЙ причине.
+        lines.append(f'❌ Состояние {CRON_SH} не проверено: {presence["note"]} '
+                     f'— установку отменяю, сначала нужны права на каталог')
+        return '\n'.join(lines)
+    if presence['state'] == 'absent':
         lines.append(f'❌ {CRON_SH} не найден — добавлять в cron нечего')
         return '\n'.join(lines)
 
