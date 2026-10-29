@@ -21,7 +21,8 @@ import shlex
 # зависимости: следующий читатель решит, что «читать без состояния» тут ещё
 # можно, и вернёт ту же ложь.
 from common import (q, find_files_info, read_file_info,
-                    write_remote_file, prepare_secret_file, remove_remote_path)
+                    write_remote_file, prepare_secret_file, remove_remote_path,
+                    UNIT_NO_ANSWER)
 from logs import (find_logs, mail_log_snapshot_lines,
                   mail_delivery_digest_lines)
 from metrics import detect_panel, services_status_cmd, parse_service_statuses
@@ -1179,8 +1180,18 @@ def mail_overview_report(checker, panel_type=None):
         checker.exec_command(services_status_cmd(list(MAIL_SERVICES)))[0])
     lines.append("\nПочтовые службы:")
     for svc in MAIL_SERVICES:
-        status = statuses.get(svc)
+        if svc not in statuses:
+            # Ключа нет — службу не спрашивали (ответ другой ветки кода).
+            # По НЕспрошенным молчать можно; поспрошенным без ответа —
+            # нельзя, для этого ниже None.
+            continue
+        status = statuses[svc]
         if status is None:
+            # Спрос состоялся, ответа нет (bus dead): признание прямо в
+            # списке служб. Прежний `if status is None: continue` выдавал
+            # молчаливый перечень, и сводка закрывала тикет ложным
+            # «службы в порядке».
+            lines.append(f"  ⚠️ {svc}: {UNIT_NO_ANSWER}")
             continue
         icon = {'active': '✅', 'inactive': '⚪'}.get(status, '⚠️')
         lines.append(f"  {icon} {svc}: {status}")

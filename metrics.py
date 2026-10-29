@@ -2,8 +2,9 @@
 import ipaddress
 
 from common import (LOG_PATHS, DOMAIN_PATHS, get_domain_from_config, q,
-                    command_probe_info,
-                     path_entry_state)
+                    command_probe_info, path_entry_state,
+                    parse_marker_sections, parse_unit_state,
+                    UNIT_NO_ANSWER)
 
 
 # ==================== ОПРЕДЕЛЕНИЕ ПАНЕЛИ ====================
@@ -143,32 +144,49 @@ SERVICES_TO_CHECK = [
 
 
 def services_status_cmd(services=None):
-    """Shell-команда, печатающая строку 'имя=статус' для каждой службы.
+    """Shell-команда: маркер '@имя', статус и 'rc=N' на каждую службу.
 
-    Почему так, а не `systemctl is-active NAME || echo "inactive"`:
-    `systemctl is-active` пишет статус в stdout даже когда служба не активна
-    (rc != 0), поэтому `|| echo "inactive"` добавлял ВТОРУЮ строку. Список
-    строк становился длиннее списка имён, и статусы съезжали: nginx мог
-    показать статус apache2 и т.д. Формат 'имя=статус' делает рассинхрон
-    невозможным — имя едет вместе со своим статусом.
+    Почему решает КОД ВОЗВРАТА (1.32.29): `is-active` пишет ОДИНАКОВЫЙ
+    stdout 'inactive' и для остановленной службы (rc=3), и для юнита,
+    которого нет вовсе (rc=4) — различие несёт только rc (замер на живом
+    systemd 259; оракул — `systemctl show -p LoadState --value`). Прежняя
+    форма теряла rc: `st=$(...)` оставлял код присваивания, а цикл отдал бы
+    код ПОСЛЕДНЕЙ команды, поэтому rc снимается ВНУТРИ итерации, сразу за
+    systemctl. `2>/dev/null` больше не ставим: при мёртвом bus stdout пуст,
+    и единственная строка с причиной живёт в stderr — заглушив её, прошлый
+    код выдумывал 'unknown' вместо честного «не проверено». Имя едет вместе
+    со своим статусом (маркерная секция) — рассинхрон старых `|| echo`
+    невозможен. Имя иглы `__svc_status` сохранено: на неё сажаются маршруты
+    тестов и счётчик одного зонда на отчёт (tests/test_reports.py).
     """
     services = services if services is not None else SERVICES_TO_CHECK
     args = ' '.join(q(s) for s in services)
     return (
-        '__svc_status() { st=$(systemctl is-active "$1" 2>/dev/null); '
-        '[ -n "$st" ] || st=unknown; '
-        "printf '%s=%s\\n' \"$1\" \"$st\"; }; "
+        '__svc_status() { printf "@%s\\n" "$1"; '
+        'LC_ALL=C systemctl is-active "$1"; '
+        'printf "rc=%s\\n" "$?"; }; '
         f'for __s in {args}; do __svc_status "$__s"; done'
     )
 
 
 def parse_service_statuses(out):
-    """Разбирает вывод 'имя=статус' в dict. Чистая функция (тесты без SSH).
+    """Разбирает ответ зонда служб в dict. Чистая функция (тесты без SSH).
 
+    Формы ответа читаются ОБЩИМ носителем (common.parse_marker_sections /
+    common.parse_unit_state — тот же код, что у panels, 1.32.29):
+      '@имя' + статус + 'rc=N' — состояние решает rc: rc=4 при статусе ->
+        «не установлен»; статуса нет (bus dead) -> None;
+      'имя=статус' (ответ ПРЕЖНЕЙ команды) -> читается ровно как раньше.
     Пустой вывод (система без systemd / systemctl недоступен) -> {}.
+    Отсутствующий ключ — службу не спрашивали; None — спросили, ответа нет.
+    Это разные миры: первый молчит законно, второй обязан быть назван.
     """
+    text = out or ''
+    if any(line.startswith('@') for line in text.splitlines()):
+        return {name: parse_unit_state(body) for name, body
+                in parse_marker_sections(text).items()}
     statuses = {}
-    for line in (out or '').splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line or '=' not in line:
             continue
@@ -540,6 +558,10 @@ def metrics_report(checker, metrics=None):
     lines.append("Слушающие порты:\n" + metrics['listening_ports'])
     lines.append("Статусы служб:")
     for svc, status in metrics['services'].items():
+        if status is None:
+            # Ответ системы не дошёл (bus dead): признаться СЛОВОМ, а не
+            # напечатать 'None' и не выдумать диагноз (1.32.29).
+            status = UNIT_NO_ANSWER
         lines.append(f"  {svc}: {status}")
     return "\n".join(lines)
 

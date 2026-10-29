@@ -4,7 +4,9 @@ import re
 from common import (q, find_files_info,
                      file_presence, process_kill, process_probe,
                      crontab_read_info, save_crontab_backup_info,
-                     crontab_write_info)
+                     crontab_write_info,
+                     parse_marker_sections, parse_unit_state,
+                     UNIT_NO_ANSWER, UNIT_ABSENT)
 
 
 # ==================== УПРАВЛЕНИЕ ISPmanager ====================
@@ -504,8 +506,14 @@ CURL_RC_ANSWER = {
     35: 'слушает, но не по TLS — стучимся не туда',
 }
 
-STACK_NO_ANSWER = 'не проверено'
-STACK_UNIT_ABSENT = 'не установлен'
+# Один носитель состояния юнита (1.32.29): значения-признания живут в common
+# (UNIT_NO_ANSWER / UNIT_ABSENT). Здесь — алиасы, чтобы второй читатель того
+# же systemd-сигнала (metrics / discovery) и стек панели не разъехались:
+# закон серии — один общий разбор, а не второй экземпляр.
+STACK_NO_ANSWER = UNIT_NO_ANSWER
+STACK_UNIT_ABSENT = UNIT_ABSENT
+# ENDPOINT_NO_ANSWER — ДРУГОЙ сигнал (curl к порту, не systemctl), поэтому
+# остаётся отдельной константой, даже если слово совпадает.
 ENDPOINT_NO_ANSWER = 'не проверено'
 
 STACK_UNCHECKED_NOTE = (
@@ -523,26 +531,6 @@ ENDPOINT_UNCHECKED_NOTE = (
     "«{why}». Это пробел, а не диагноз порту: без curl проверка невозможна")
 
 
-def parse_marker_sections(out):
-    """Разобрать stdout с маркерами '@метка' в {метка: [непустые строки]}.
-
-    Маркеры нужны потому, что вывод нескольких команд в один поток неразличим:
-    без них не понять, где кончается ответ одной службы и начинается другой.
-    Метка заводится printf'ом НАМЕРЕННО — это единственный способ сохранить
-    структуру, не раздувая число SSH-запросов.
-    """
-    sections = {}
-    key = None
-    for line in (out or '').splitlines():
-        if line.startswith('@'):
-            key = line[1:].strip()
-            sections.setdefault(key, [])
-            continue
-        if key is not None and line.strip():
-            sections[key].append(line.strip())
-    return sections
-
-
 def _first_line(text):
     return next((ln.strip() for ln in (text or '').splitlines()
                  if ln.strip()), '')[:200]
@@ -551,31 +539,14 @@ def _first_line(text):
 def parse_stack_unit_state(body):
     """Статус одной службы по телу её маркерной секции (форма 1.32.27).
 
-    Тело цикла — строки между маркерами: статус и 'rc=N'. «Юнита нет» и
-    «стоит, но остановлена» stdout-ом неразличимы: на живом systemd пара
-    несуществующей и остановленной службы даёт побайтово равный 'inactive',
-    различие несёт только rc (4 против 3; оракул — systemctl show
-    -p LoadState). Прежний код бросал rc: у цикла он принадлежит последней
-    команде. Поэтому здесь:
-      rc=4 при наличии статуса -> «не установлен»;
-      rc=0/3 при наличии статуса -> сам статус (active / inactive / failed);
-      статуса нет (bus dead: тело состоит только из 'rc=1') -> None, то есть
-        «не проверено», а не выдуманное «не установлен»;
-      rc-строки нет вовсе (ответ прежней формы) -> прежний статус без изменений.
+    Разбор — ОБЩИЙ с metrics/discovery (common.parse_unit_state, 1.32.29):
+    «юнита нет» и «стоит, но остановлена» stdout-ом неразличимы (на живом
+    systemd пара даёт побайтово равный 'inactive'), различие несёт только
+    rc (4 против 3; оракул — systemctl show -p LoadState), поэтому правило
+    живёт ОДНОМ месте, а не в двух копиях, которые разъедутся релизом.
+    Имя функции сохранено: на него опирается panel_stack_view.
     """
-    rc = None
-    status = ''
-    for line in body:
-        s = line.strip()
-        if s.startswith('rc=') and s[3:].isdigit():
-            rc = int(s[3:])
-        elif s and not status:
-            status = s
-    if not status:
-        return None
-    if rc == 4:
-        return STACK_UNIT_ABSENT
-    return status
+    return parse_unit_state(body)
 
 
 def panel_stack_view(out, err):

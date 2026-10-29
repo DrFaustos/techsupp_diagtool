@@ -86,9 +86,14 @@ class TestDetectPanel:
 # ==================== команда статусов служб ====================
 class TestServicesStatusCmd:
     def test_names_quoted_and_key_value_format(self):
+        # ЗАЯВЛЕННАЯ ПЕРЕПИСКА ЗАМКА ФОРМЫ (1.32.29): прежний замок '%s=%s'
+        # охранял форму, в которой 'inactive' отсутствующего юнита и
+        # остановленного побайтово равны, — ровно ту ложь, что лечит слайс.
+        # Новый замок — маркерная форма: имя в маркере, состояние решает rc.
         cmd = metrics_mod.services_status_cmd(['nginx', 'php 8.2-fpm'])
         assert "'php 8.2-fpm'" in cmd
-        assert '%s=%s' in cmd
+        assert 'printf "@%s' in cmd
+        assert 'printf "rc=%s' in cmd
 
     def test_default_list_used(self):
         cmd = metrics_mod.services_status_cmd()
@@ -1030,3 +1035,76 @@ class TestPanelLabel:
         text = io.open(path, encoding='utf-8').read()
         assert 'panel_label(self.panel_type)' in text
         assert 'Панель управления: {self.panel_type}' not in text
+
+
+# ====== СОСТОЯНИЕ СЛУЖБЫ: решается кодом возврата, а не словом (1.32.29) ======
+# Замер живьём (systemd 259, этот хост; независимый оракул
+# `systemctl show -p LoadState --value`): services_status_cmd спрашивал
+# службы ОДНИМ циклом и терял код возврата каждой (rc сборки принадлежит
+# ПОСЛЕДНЕЙ команде), а is-active пишет ОДИН И ТОТ ЖЕ stdout `inactive` для
+# несуществующей службы (rc=4) и для остановленной (rc=3). По боевому
+# SERVICES_TO_CHECK оракул отвечает not-found по 10 из 11 служб (жив только
+# httpd), а parse_service_statuses на реальных байтах отдаёт 'inactive' всем
+# — «установлено, но остановлено» про юниты, которых нет вовсе.
+# Вторая половина того же дефекта: `2>/dev/null` глошила единственную строку
+# с причиной, а `[ -n "$st" ] || st=unknown` превращала «мы не смогли
+# спросить» в unknown, который оператор читает как диагноз.
+class TestServiceStateIsDecidedByExitCode:
+    def test_probe_carries_rc_of_every_service(self):
+        # rc обязан сниматься ВНУТРИ итерации: иначе он принадлежит последней
+        # службе и остальные приходят без ответа (замер 1.32.27).
+        cmd = metrics_mod.services_status_cmd(['nginx', 'php-fpm'])
+        assert 'printf "rc=' in cmd, cmd
+        assert cmd.count('systemctl is-active') == 1, cmd
+        # Причина живёт в stderr: заглушить её — значит оставить ответ без
+        # единственного доказательства (тот же закон, что в 1.32.26).
+        assert '2>/dev/null' not in cmd, cmd
+
+    def test_absent_unit_is_not_reported_as_inactive(self):
+        # Ключевой RED: эти байты машина выдаёт на НЕ существующую службу
+        # (rc=4, LoadState=not-found), а прежний разбор читал их как
+        # `inactive`, то есть как «установлено, но остановлено».
+        out = '@nginx' + chr(10) + 'inactive' + chr(10) + 'rc=4' + chr(10)
+        assert metrics_mod.parse_service_statuses(out) == {
+            'nginx': 'не установлен'}
+
+    def test_stopped_service_stays_inactive(self):
+        # Та же пара байтов, но rc=3 (юнит load'ится): остановленный обязан
+        # остаться остановленным, иначе правка переложит ложь, а не снимет.
+        out = '@httpd' + chr(10) + 'inactive' + chr(10) + 'rc=3' + chr(10)
+        assert metrics_mod.parse_service_statuses(out) == {'httpd': 'inactive'}
+
+    def test_silence_of_the_system_is_unchecked_not_unknown(self):
+        # bus dead: stdout пуст, ответ системы — в stderr (замер). Ни
+        # `unknown`, ни `inactive`, ни «не установлен»: только непроверено.
+        out = '@nginx' + chr(10) + 'rc=1' + chr(10)
+        assert metrics_mod.parse_service_statuses(out) == {'nginx': None}
+
+    def test_previous_answer_form_still_reads(self):
+        # Обратная совместимость заперта: ответ ПРЕЖНЕЙ команды (старший
+        # сервер, чужая ветка кода) читается ровно как раньше, а не
+        # превращается в молчание или в выдуманное «не установлен».
+        out = 'nginx=active' + chr(10) + 'mysql=inactive' + chr(10)
+        assert metrics_mod.parse_service_statuses(out) == {
+            'nginx': 'active', 'mysql': 'inactive'}
+
+    def test_report_names_the_gap_instead_of_printing_none(self):
+        # Молчание системы не имеет права исчезнуть из отчёта. Искать
+        # признание по всему выводу нельзя: «не проверено» печатает и
+        # секция файрвола, тогда проверка была бы зеленой молча. Берём
+        # ровно блок служб и требуем, что заголовок в выводе один.
+        routes = [
+            ('df -h', 'Filesystem  Size  Used' + chr(10)),
+            ('df -i', 'Filesystem Inodes' + chr(10)),
+            ('free -m', 'total  used' + chr(10)),
+            ('uptime', 'up 3 days'),
+            ('ss -tulpn', 'tcp  LISTEN  0  128  *:22'),
+            ('__svc_status', '@nginx' + chr(10) + 'rc=1' + chr(10)),
+        ]
+        out = metrics_mod.metrics_report(FakeSSH(routes=routes))
+        assert out.count('Статусы служб:') == 1, out
+        block = out.split('Статусы служб:')[-1]
+        assert 'nginx' in block, block
+        assert 'не проверено' in block, block
+        assert 'unknown' not in block, block
+        assert 'nginx: None' not in block, block

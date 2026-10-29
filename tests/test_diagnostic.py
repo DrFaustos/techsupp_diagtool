@@ -455,9 +455,14 @@ class TestServicesStatusCmd:
         for svc in metrics_mod.SERVICES_TO_CHECK:
             assert svc in cmd
 
-    def test_output_format_is_name_equals_status(self):
+    def test_output_format_is_marker_sections(self):
+        # ЗАЯВЛЕННАЯ ПЕРЕПИСКА ЗАМКА ФОРМЫ (1.32.29): прежний замок держал
+        # форму 'имя=статус', где «юнита нет» и «остановлена» неразличимы.
+        # Маркер + rc сохраняют гарантию «имя едет со своим статусом» и
+        # добавляют единственное различие, которое несёт rc.
         cmd = metrics_mod.services_status_cmd(['nginx', 'php8.2-fpm'])
-        assert "printf '%s=%s\\n'" in cmd
+        assert 'printf "@%s\\n"' in cmd
+        assert 'printf "rc=%s\\n"' in cmd
         assert 'nginx' in cmd and 'php8.2-fpm' in cmd
 
     def test_service_names_are_shell_quoted(self):

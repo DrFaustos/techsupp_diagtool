@@ -3586,3 +3586,48 @@ class TestMailboxActionsFastpanel:
         assert 'не предусмотрена' in out
         assert c.find('boxes create') is None
         assert c.find('boxes delete') is None
+
+
+class TestMailServiceStateIsNotSilence:
+    """Непроверенное состояние почтовой службы не имеет права исчезнуть.
+
+    В mail_overview_report стоит `if status is None: continue`, т.е. None
+    для него означает МОЛЧАНИЕ. После правки парсера (1.32.29) None — это
+    честный ответ «мы не смогли спросить», и промолчать по нему хуже, чем
+    соврать: сводка с молчаливым списком служб закрыла бы тикет ложным
+    «службы в порядке».
+
+    Признание ищем ровно в блоке «Почтовые службы:»: слово postfix стоит и
+    в строке очереди, а «не провер...» — в блоке лога, поэтому проверка по
+    всему выводу была бы зеленой молча (тот же закон, что в 1.32.26).
+    """
+
+    @staticmethod
+    def _block(out):
+        assert out.count('Почтовые службы:') == 1, out
+        block = out.split('Почтовые службы:')[-1]
+        assert block.strip() != '', out
+        return block
+
+    def test_absent_mail_service_is_named_absent(self):
+        # Замер: по MAIL_SERVICES оракул LoadState отвечает not-found по
+        # всем пяти, а прежний отчёт рисовал dovecot «inactive».
+        c = FakeSSH(routes=[('mailq', 'Mail queue is empty'),
+                            ('__svc_status',
+                             '@dovecot' + chr(10) + 'inactive' + chr(10)
+                             + 'rc=4' + chr(10))])
+        out = dc.mail_overview_report(c, 'none')
+        block = self._block(out)
+        assert 'dovecot: не установлен' in block, block
+        assert 'dovecot: inactive' not in block, block
+
+    def test_unasked_service_is_admitted_not_dropped(self):
+        # bus dead: ответа нет ни по одной службе. Отчёт обязан сказать, что
+        # спросить не удалось, а не вывести пустой список.
+        c = FakeSSH(routes=[('mailq', 'Mail queue is empty'),
+                            ('__svc_status',
+                             '@postfix' + chr(10) + 'rc=1' + chr(10))])
+        out = dc.mail_overview_report(c, 'none')
+        block = self._block(out)
+        assert 'postfix' in block, block
+        assert 'не проверено' in block, block

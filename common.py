@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.28"
+__version__ = "1.32.29"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -2418,3 +2418,61 @@ def get_domain_from_config(checker, config_path):
     get_domain_from_config_info.
     """
     return get_domain_from_config_info(checker, config_path)[0]
+
+
+# ============ СОСТОЯНИЕ ЮНИТА: РЕШАЕТ КОД ВОЗВРАТА, А НЕ СЛОВО (1.32.29) ======
+# Носитель закона серии для ВСЕХ читателей `systemctl is-active` (panels,
+# metrics, discovery): stdout не различает «юнита нет» и «стоит, но
+# остановлена» — обе ситуации дают побайтово равный 'inactive'. Различие
+# несёт только код возврата: 4 против 3 (оракул — `systemctl show
+# -p LoadState --value`, замер на живом systemd 259, локаль не влияет).
+# Мёртвый bus даёт пустой stdout, а ответ системы живёт в stderr: это
+# «не проверено», а не диагноз юниту. Выдуманное 'unknown' оператор читает
+# как диагноз, поэтому ниже — два честных значения-признания.
+UNIT_NO_ANSWER = 'не проверено'
+UNIT_ABSENT = 'не установлен'
+
+
+def parse_marker_sections(out):
+    """Разобрать stdout с маркерами '@метка' в {метка: [непустые строки]}.
+
+    Маркеры нужны потому, что вывод нескольких команд в один поток
+    неразличим: без них не понять, где кончается ответ одной службы и
+    начинается другой. Метка заводится printf'ом НАМЕРЕННО — это
+    единственный способ сохранить структуру, не раздувая число запросов.
+    """
+    sections = {}
+    key = None
+    for line in (out or '').splitlines():
+        if line.startswith('@'):
+            key = line[1:].strip()
+            sections.setdefault(key, [])
+            continue
+        if key is not None and line.strip():
+            sections[key].append(line.strip())
+    return sections
+
+
+def parse_unit_state(body):
+    """Состояние одного юнита по телу его маркерной секции.
+
+    Тело — строки между маркерами: статус и 'rc=N'. Различает только rc:
+      rc=4 при наличии статуса -> UNIT_ABSENT («юнита нет»);
+      rc=0/3 при наличии статуса -> сам статус (active / inactive / failed);
+      статуса нет (bus dead: тело состоит только из 'rc=N') -> None, то есть
+        «не проверено», а не выдуманное «не установлен»;
+      rc-строки нет вовсе (ответ прежней формы) -> прежний статус как есть.
+    """
+    rc = None
+    status = ''
+    for line in body:
+        s = line.strip()
+        if s.startswith('rc=') and s[3:].isdigit():
+            rc = int(s[3:])
+        elif s and not status:
+            status = s
+    if not status:
+        return None
+    if rc == 4:
+        return UNIT_ABSENT
+    return status
