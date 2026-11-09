@@ -10,6 +10,65 @@ from common import (q, find_files_info,
 
 
 # ==================== УПРАВЛЕНИЕ ISPmanager ====================
+# Формы ошибки mgrctl — измеренные, а не на глаз: `ERROR=текст` и `ERROR:
+# текст` С НАЧАЛА строки (тот же разбор для всего вывода mgrctl живёт в
+# discovery._mgrctl_says_error; фикстура «ERROR: Access to the panel is
+# blocked by the administrator» снята с живого ответа панели). Поле, в ИМЕНИ
+# или значении которого просто есть «error» (errordocs=1, errorlog=...,
+# last_error=0), статусом ошибки не является — поэтому проверка идёт по
+# началу ключа статуса, а не по подстроке во всём выводе (1.32.31, живая
+# панель: безобидное «error» в данных sysinfo давало ложное ⚠️ о неудачном
+# перезапуске).
+ISP_ERROR_STATUS_PREFIXES = ('error=', 'error:')
+
+
+def isp_sysinfo_view(out, rc):
+    """(строка вердикта, ⚠️-заметка либо None) по ответу `mgrctl sysinfo`.
+
+    Почему вердикт решает КОД ВОЗВРАТА, а не слово в выводе. Пайпа с head
+    больше нет, поэтому rc принадлежит mgrctl: 126/127 — утилиту не удалось
+    запустить, то есть панель мы не спросили (не проверено); rc=0 при пустом
+    ответе — панель не ответила, сокет мёртв (замер ревью 1.32.30); rc != 0 —
+    mgrctl вернул ошибку (панель, вероятно, не поднялась); rc=0 с непустым
+    ответом — панель ОТВЕТИЛА на запрос, и только это есть факт, на который
+    опирается вердикт «работает». Слово «error» где угодно в выводе фактом
+    отказа не является: оно живёт в именах полей и в значениях, и вердикт по
+    подстроке на здоровой панели печатал ложное ⚠️.
+
+    Ошибку внутри ответа различает СТРУКТУРА: строка статуса ошибки в
+    измеренной форме (см. ISP_ERROR_STATUS_PREFIXES) — это отказ панели, и
+    вердикт становится ⚠️. «error» вне строки статуса и вне строки поля
+    key=value (лог-строка, произвольный текст) вердикт менять не может —
+    вердикт уже решён кодом возврата, — и выдаётся отдельной ⚠️-заметкой:
+    взгляд на вывод оператору полезен, но диагноза из него не делаем.
+    """
+    body = (out or '').strip()
+    why = next((line.strip() for line in body.splitlines() if line.strip()),
+               '')[:160]
+    if rc in (126, 127):
+        return (f"❓ Состояние панели не проверено: mgrctl не запустился "
+                f"(rc={rc}): {why or 'нет вывода'}"), None
+    if rc == 0 and not body:
+        return ("❓ Состояние панели не проверено: sysinfo вернул rc=0 "
+                "без ответа"), None
+    if rc == 0:
+        for line in body.splitlines():
+            if line.strip().lower().startswith(ISP_ERROR_STATUS_PREFIXES):
+                return (f"⚠️ Панель, возможно, не запустилась (строка статуса "
+                        f"ошибки): {line.strip()[:160]}"), None
+        noise = next((line.strip() for line in body.splitlines()
+                      if '=' not in line and 'error' in line.lower()), '')
+        note = None
+        if noise:
+            note = ("⚠️ Панель, возможно, не запустилась (заметка, а не "
+                    "вердикт): слово error в выводе вне поля key=value — "
+                    f"{noise[:160]}. Вердикт выше решён кодом возврата "
+                    "mgrctl: rc=0 — сокет панели ответил.")
+        return "✅ Панель работает (mgrctl sysinfo rc=0)", note
+    return (f"⚠️ Панель, вероятно, не поднялась: sysinfo вернул "
+            f"rc={rc}: {why or 'нет вывода'}"), None
+
+
 def ispmanager_restart(checker):
     lines = ["=== ПЕРЕЗАПУСК ISPmanager ==="]
     out, err, rc = checker.run('/usr/local/mgr5/sbin/mgrctl -m ispmgr exit 2>&1')
@@ -18,8 +77,19 @@ def ispmanager_restart(checker):
     else:
         lines.append("✅ Команда на перезапуск отправлена через mgrctl")
     checker.exec_command('sleep 3')
-    out2, _, _ = checker.run('/usr/local/mgr5/sbin/mgrctl -m ispmgr sysinfo 2>&1 | head -1')
-    lines.append("✅ Панель работает" if 'error' not in out2.lower() else "⚠️ Панель возможно не запустилась")
+    # Прежняя проверка решала по ОТСУТСТВИЮ слова 'error' в выводе
+    # `mgrctl ... sysinfo | head -1`: пустой ответ (панель лежит, сокет мёртв),
+    # «mgrctl: command not found» и украденный head'ом rc давали «✅ Панель
+    # работает» ровно там, где панель не поднялась (1.32.30, ревью). Пайпа
+    # больше нет: rc принадлежит mgrctl. Сам вердикт и различение «слово error
+    # в данных» / «строка статуса ошибки» — в isp_sysinfo_view (1.32.31:
+    # подстрока по всему выводу давала ложное ⚠️ на здоровой панели).
+    out2, _err2, rc2 = checker.run(
+        '/usr/local/mgr5/sbin/mgrctl -m ispmgr sysinfo 2>&1')
+    verdict, note = isp_sysinfo_view(out2, rc2)
+    lines.append(verdict)
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
@@ -108,13 +178,60 @@ def ispmanager_ssl_issue(checker):
 
 
 def ispmanager_disable(checker):
+    """Отключает панель: снимает +x с core и завершает процессы по pid.
+
+    Прежняя форма не проверяла НИ ОДНУ из трёх команд (exec_command rc не
+    возвращает вовсе) и печатала «✅ Панель отключена» при полном отказе всех
+    трёх; killall core бил ЯЩУ ЦЕЛЬЮ по имени — тот же модуль документировал,
+    почему именем нельзя (тот же файл из другой установки, совпадения по
+    подстроке — см. ispmanager_kill_core). Право на «отключена» даёт снятый +x
+    (перечитанный доступ) и перечитанный список процессов (1.32.30, ревью).
+    """
     lines = ["=== ОТКЛЮЧЕНИЕ ISPmanager ==="]
     lines.append("⚠️ Панель будет остановлена!")
-    checker.exec_command('chmod -x /usr/local/mgr5/bin/core 2>&1')
-    checker.exec_command('killall core 2>&1')
-    checker.exec_command('killall ihttpd 2>&1')
-    lines.append("✅ Панель отключена")
-    lines.append("⚠️ Для включения выполните: chmod +x /usr/local/mgr5/bin/core && /usr/local/mgr5/bin/core")
+    out, err, rc = checker.run(f'chmod -x {q(ISP_CORE_BIN)} 2>&1')
+    if rc != 0:
+        lines.append(f"❌ chmod -x {ISP_CORE_BIN} вернул rc={rc}: "
+                     f"{(out or err).strip() or 'нет вывода'} — отключение "
+                     "остановлено: без снятого +x панель вернётся после "
+                     "рестарта, а гасить процессы без гарантии отмены нельзя")
+        return "\n".join(lines)
+    lines.append(f"✅ Исполнение снято: chmod -x {ISP_CORE_BIN}")
+    halted, unchecked = True, []
+    for name, binary in (('core', ISP_CORE_BIN), ('ihttpd', ISP_IHTTPD_BIN)):
+        probe = process_probe(checker, binary)
+        if not probe['checked']:
+            halted = False
+            unchecked.append(name + ': ' + (probe['note']
+                                            or 'список процессов не прочитан'))
+            continue
+        if probe['state'] == 'absent':
+            lines.append(f"⏭️ {name}: процесса нет (список прочитан)")
+            if probe['note']:
+                lines.append(f"   ℹ️ {probe['note']}")
+            continue
+        result = process_kill(checker, probe['pids'], target=binary)
+        if result['state'] == 'gone':
+            lines.append(f"✅ {name}: процессы завершены")
+        elif result['state'] == 'alive':
+            halted = False
+            lines.append(f"⚠️ {name}: процессы всё ещё работают"
+                         + (' — ' + result['note'] if result['note'] else ''))
+        else:
+            halted = False
+            unchecked.append(name + ': ' + (result['note']
+                                            or 'состояние не проверено'))
+        if result['similar']:
+            lines.append(f"   ℹ️ {name}: тот же файл запущен из другого пути "
+                         "— его не трогаем")
+    for note in unchecked:
+        lines.append("⚠️ " + note)
+    if halted:
+        lines.append("✅ Панель отключена")
+    else:
+        lines.append("⚠️ Отключение НЕ подтверждено целиком — см. строки выше")
+    lines.append("⚠️ Для включения выполните: chmod +x /usr/local/mgr5/bin/core"
+                 " && /usr/local/mgr5/bin/core")
     return "\n".join(lines)
 
 
@@ -719,14 +836,21 @@ def php_fpm_units(checker):
 
 
 def fastpanel_restart_web(checker):
-    """Перезапуск веб-стека, которым управляет панель (nginx + все php-fpm)."""
+    """Перезапуск веб-стека, которым управляет панель (nginx + все php-fpm).
+
+    Гейт решается КОДОМ возврата nginx -t без пайпа: прежняя форма
+    `nginx -t 2>&1 | tail -2` теряла rc (он принадлежал tail) и решала по
+    слову 'ok'/'successful' в выводе (1.32.30, ревью) — тот же урок, что уже
+    был вылечен выше в этом файле для отчёта о синтаксисе.
+    """
     lines = ["=== ПЕРЕЗАПУСК WEB-СТЕКА (nginx + php-fpm) ==="]
-    out, _, _ = checker.run('nginx -t 2>&1 | tail -2')
-    if 'ok' not in out.lower() and 'successful' not in out.lower():
-        lines.append(f"❌ nginx -t не пройден, перезапуск не выполнен: "
-                     f"{out.strip() or 'нет вывода'}")
+    out, err, rc = checker.run('LC_ALL=C nginx -t 2>&1')
+    if rc != 0:
+        shown = '\n'.join((out or err).strip().splitlines()[-2:])
+        lines.append(f"❌ nginx -t не пройден (rc={rc}), перезапуск не "
+                     f"выполнен: {shown or 'нет вывода'}")
         return "\n".join(lines)
-    lines.append("✅ nginx -t пройден")
+    lines.append("✅ nginx -t пройден (rc=0)")
 
     out, err, rc = checker.run('systemctl restart nginx 2>&1')
     lines.append("✅ nginx перезапущен" if rc == 0
@@ -1493,7 +1617,14 @@ def fastpanel_diag(checker):
 
 
 def fastpanel_reset_password(checker, new_password):
-    """mogwai chpasswd: сброс пароля fastuser (доступен только под root)."""
+    """mogwai chpasswd: сброс пароля fastuser (доступен только под root).
+
+    Пароль уходит аргументом — это документированный интерфейс mogwai; другие
+    каналы (stdin/файл) у mogwai не измерены, а неотмеренный канал — это
+    сломанный сброс, поэтому форма сохранена. Митигация того, что доехало
+    обратно: вывод mogwai маскируется до печати (эхо пароля в отчёт уехать не
+    должно), а видимость в ps названа оператору прямо.
+    """
     lines = ["=== СБРОС ПАРОЛЯ fastuser (FASTPANEL) ==="]
     if not new_password:
         lines.append("❌ Пароль не задан")
@@ -1503,10 +1634,13 @@ def fastpanel_reset_password(checker, new_password):
         return "\n".join(lines)
     out, err, rc = checker.run(
         f'mogwai chpasswd --username=fastuser --password={q(new_password)} 2>&1')
+    body = (err.strip() or out.strip())
+    if new_password in body:
+        body = body.replace(new_password, '***')
     if rc == 0:
         lines.append("✅ Пароль изменён (логин входа в панель: fastuser)")
     else:
-        lines.append(f"❌ Не удалось (rc={rc}): {err.strip() or out.strip()}")
+        lines.append(f"❌ Не удалось (rc={rc}): {body or 'нет вывода'}")
     lines.append("⚠️ Пароль передавался аргументом команды и был виден в ps:")
     lines.append("   при возможности смените его на постоянный через панель.")
     return "\n".join(lines)

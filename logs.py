@@ -583,8 +583,8 @@ def classify_delivery(entry):
     hint = mail_failure_hint(reason)
     if hint is None and entry.get('dsn', '').startswith(DSN_TEMPORARY_PREFIX):
         hint = ('временный отказ по коду 4xx',
-                f'Postfix повторит попытку сам и сдастся только через '
-                f'maximal_queue_lifetime (по умолчанию 5 дней).')
+                'Postfix повторит попытку сам и сдастся только через '
+                'maximal_queue_lifetime (по умолчанию 5 дней).')
     return icon, line, hint
 
 

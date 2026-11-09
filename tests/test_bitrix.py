@@ -187,13 +187,15 @@ class TestSSL:
         assert 'пусто' in out
 
     def test_find_dehydrated_cron_root_wins(self):
-        # игла 'grep -rlF' отличается от команды root crontab — маршруты не спорят
+        # 1.32.30: root crontab читается crontab_read_info (одним `crontab -l`,
+        # носитель различает «пусто»/«не прочитали»), а не слепым конвейером.
+        # Игла 'grep -rlF' отличается от команды crontab — маршруты не спорят.
         c = FakeSSH(routes=[
-            ('crontab -l 2>/dev/null | grep -F dehydrated',
-             '30 3 * * * /home/bitrix/dehydrated/dehydrated -c\n'),
+            ('crontab -l', '30 3 * * * /home/bitrix/dehydrated/dehydrated -c\n'),
             ('grep -rlF', '/etc/cron.d/bx-dehydrated\n'),
         ])
-        root, files = bx.find_dehydrated_cron(c)
+        root, files, note = bx.find_dehydrated_cron(c)
+        assert note == ''
         assert 'dehydrated -c' in root and files == ['/etc/cron.d/bx-dehydrated']
 
     def test_find_dehydrated_cron_dedups_and_sorts(self):
@@ -201,9 +203,39 @@ class TestSSL:
             ('grep -rlF', '/etc/cron.daily/x\n/etc/cron.d/dehydrated\n'
                          '/etc/cron.daily/x\n'),
         ])
-        root, files = bx.find_dehydrated_cron(c)
+        root, files, note = bx.find_dehydrated_cron(c)
         assert root == ''
         assert files == ['/etc/cron.d/dehydrated', '/etc/cron.daily/x']
+
+    def test_unreadable_root_crontab_is_not_absent(self):
+        # 1.32.30 (ревью): нечитаемый root crontab и «заданий нет» были
+        # схлопнуты в пустоту; теперь нечтение — отдельное note.
+        c = FakeSSH(routes=[
+            ('crontab -l', ('', 'crontab: can not open file', 1)),
+            ('grep -rlF', ('', '', 0)),
+        ])
+        root, files, note = bx.find_dehydrated_cron(c)
+        assert root == '' and files == [] and note
+
+    def test_unreadable_cron_dirs_are_not_absent(self):
+        # 1.32.31 (ревью): вторая половина — grep -rlF по cron-каталогам —
+        # глушила stderr и бросала rc: при rc=2 (обход не дошёл) отчёт
+        # утверждал «задания нет», хотя каталоги не прочитаны.
+        c = FakeSSH(routes=[
+            ('crontab -l', ''),
+            ('grep -rlF', ('', 'grep: /etc/cron.d: Permission denied', 2)),
+        ])
+        root, files, note = bx.find_dehydrated_cron(c)
+        assert root == '' and files == []
+        assert 'не полностью' in note
+
+    def test_report_with_unreadable_cron_dirs_says_unchecked(self):
+        c = FakeSSH(routes=[
+            ('grep -rlF', ('', 'grep: /etc/cron.d: Permission denied', 2)),
+        ])
+        out = bx.bitrix_ssl_report(c)
+        assert 'не проверено' in out
+        assert 'перевыпускать придётся вручную' not in out
 
     def test_report_cron_d_is_not_an_error(self):
         # штатная раскладка BitrixVM: задания нет в root crontab, оно в cron.d
@@ -219,12 +251,25 @@ class TestSSL:
 
     def test_report_root_cron_shows_the_line(self):
         c = FakeSSH(routes=[
-            ('crontab -l 2>/dev/null | grep -F dehydrated',
-             '30 3 * * * cd /home/bitrix/dehydrated && ./dehydrated -c\n'),
+            ('crontab -l', '30 3 * * * cd /home/bitrix/dehydrated && '
+                           './dehydrated -c\n'),
         ])
         out = bx.bitrix_ssl_report(c)
         assert '✅ Перевыпуск настроен в crontab root' in out
         assert '30 3 * * *' in out
+
+    def test_report_unreadable_crontab_says_unchecked(self):
+        # 1.32.30 (ревью): «перевыпускать придётся вручную» на нечитаемом
+        # crontab — утверждение без права на него.
+        c = FakeSSH(routes=[
+            ('ls -1', 'site.ru\n'),
+            ('openssl', 'notAfter=Oct 12 13:45:00 2099 GMT'),
+            ('crontab -l', ('', 'crontab: can not open file', 1)),
+            ('grep -rlF', ('', '', 0)),
+        ])
+        out = bx.bitrix_ssl_report(c)
+        assert 'не проверено' in out
+        assert 'придётся вручную' not in out
 
     def test_report_searches_all_cron_dirs(self):
         # отчёт обязан смотреть не только spool root: периодика BitrixVM — в cron.*
@@ -253,6 +298,24 @@ class TestSSL:
         ])
         out = bx.bitrix_ssl_renew(c)
         assert 'Код завершения: 0' in out and 'site.ru' in out
+
+    def test_renew_reports_the_real_exit_code_not_the_pager(self):
+        # 1.32.30 (ревью): прежняя форма `dehydrated -c 2>&1 | tail -25`
+        # отдавала право на вердикт хвостовику: rc конвейера принадлежит
+        # tail (всегда 0), и провалившийся выпуск оператор читал
+        # «Код завершения: 0». Обёртка обязана донести rc dehydrated.
+        c = FakeSSH(routes=[
+            ('test -x', 'ok'),
+            ('dehydrated -c', ('ERROR: deploy hook failed', '', 1)),
+        ])
+        out = bx.bitrix_ssl_renew(c)
+        assert 'Код завершения: 1' in out
+        assert 'Код завершения: 0' not in out
+        assert 'deploy hook failed' in out
+        # Пайп на хвост в БУЮЩЕЙ команде запрещён: хвост снимает обёртка
+        # (`tail -n N "$t"`), а вердикт решает `exit $rc`.
+        renew_cmd = c.find('dehydrated -c')
+        assert 'exit $rc' in renew_cmd and '| tail' not in renew_cmd, renew_cmd
 
 
 # ==================== MySQL ====================
@@ -285,7 +348,11 @@ class TestMySQL:
         assert '✅' in out and 'restart mysqld' in out
         content = store.store[bx.TUNE_FILE]
         assert 'innodb_buffer_pool_size = 3200M' in content
-        assert c.find('chmod 600') is not None
+        # 1.32.30 (ревью): было chmod 600 вслепую (rc выброшен, stderr
+        # заглушен) — mysqld от пользователя mysql такой файл не прочитал бы,
+        # и тюнинг молча не применялся бы. Теперь 644 с проверкой rc.
+        assert c.find('chmod 644') is not None
+        assert c.find('chmod 600') is None
 
     def test_tune_refuses_without_includedir(self):
         store = FakeSftpClient()
@@ -315,7 +382,9 @@ class TestDbCheck:
         assert '✅' in out and 'DBPassword=задан' in out
         # пароль уехал только в protected-файл, но не в командную строку
         assert 'sup3r-secret' not in ' '.join(c.commands)
-        assert store.store[bx.DBCHECK_CNF].count('sup3r-secret') == 1
+        # Двойник счищает rm-нутые файлы в store.deleted: доказывает и что
+        # файл с паролем создавался (состав), и что его реально сняли.
+        assert store.deleted[bx.DBCHECK_CNF].count('sup3r-secret') == 1
         assert c.find('rm -f') is not None
         assert c.find('chmod 600') is not None
 
@@ -691,16 +760,24 @@ class TestPerms:
         assert '✅ Каталогам выставлены 755' in out
         assert '✅ Файлам выставлены 644' in out
         assert 'upload' in out
-        # {} в find -exec обязан доехать буквально, без удвоения
-        assert c.find('-exec chmod 755 {} +') is not None
-        assert c.find("-exec chmod g+w {} +") is not None
-        # q() НЕ кавычит путь из одних безопасных символов — проверяем аргумент
-        # разбором, а не поиском кавычек в строке.
+        # 1.32.30 (ревью): правки идут без пайпа на tail (тот ел rc), хвост
+        # снимает обёртка mktemp+tail с `exit $rc`. Разбираем внутреннюю команду
+        # обёртки, а не строку целиком.
         chown_cmd = c.find('chown -R')
         assert chown_cmd is not None
-        parts = shlex.split(chown_cmd)
+        assert 'exit $rc' in chown_cmd, 'rc правки обязан доезжать до вердикта'
+        # Обёртка: `t=$(mktemp) || { ...; }; { КОМАНДА; } > "$t"; ...`.
+        # Внутренний спрос — между `; }; { ` и `; } > "$t"`.
+        inner = chown_cmd.split('; }; { ', 1)[1].split('; } > "$t"', 1)[0]
+        parts = shlex.split(inner)
         assert parts[:3] == ['chown', '-R', 'bitrix:bitrix']
         assert '/home/bitrix/www' in parts
+        assert '|' not in inner, inner
+        assert c.find('-exec chmod 755 {} +') is not None
+        # upload: chmod по symlink'ам запрещён (эскалация через посаженную
+        # ссылку) — find обязан отсекать их ДО -exec.
+        upl = c.find('-exec chmod g+w {} +')
+        assert upl is not None and '! -type l' in upl
 
     def test_fix_reports_chown_failure(self):
         c = FakeSSH(routes=[
@@ -1333,8 +1410,9 @@ class TestDbSecretSurvivesCancel:
         assert any('[ -e ' + bx.DBCHECK_CNF in cmd for cmd in c.cleaned), c.cleaned
         assert c.find('rm -f ' + bx.DBCHECK_CNF) is not None
         assert 'sup3r-secret' not in ' '.join(c.commands)
-        # файл с паролем реально создавался (иначе проверять было бы нечего)
-        assert store.store[bx.DBCHECK_CNF].count('sup3r-secret') == 1
+        # файл с паролем реально создавался (и иначе проверять было бы нечего),
+        # а уборка сняла его в store.deleted — даже сквозь отмену.
+        assert store.deleted[bx.DBCHECK_CNF].count('sup3r-secret') == 1
 
     def test_secret_file_is_0600_before_password(self):
         # Права ставятся в том же вызове, что и создание файла: до того, как
@@ -1346,7 +1424,7 @@ class TestDbSecretSurvivesCancel:
         prep = c.find('umask 077')
         assert prep is not None and 'chmod 600' in prep
         assert prep.index('umask 077') < prep.index(': >') < prep.index('chmod 600')
-        assert store.store[bx.DBCHECK_CNF].count('sup3r-secret') == 1
+        assert store.deleted[bx.DBCHECK_CNF].count('sup3r-secret') == 1
 
     def test_wipe_failure_is_visible_in_report(self):
         # rm -f молчит и когда не смог (read-only /tmp, права): факт проверяем

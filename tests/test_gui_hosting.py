@@ -159,7 +159,10 @@ class TestMailAuthEntry:
         subs = [e for e in HOSTING_MENU if e and isinstance(e[1], list)]
         assert len(subs) == 1 and subs[0][0] == "Почтовые ящики ▸"
         top = [e for e in HOSTING_MENU if e and not isinstance(e[1], list)]
-        assert len(top) == 7
+        # 6 сводных отчётов до разделителя + 4 точечных действия после
+        # (досье, установка SSL, два теста скорости) — подменю по-прежнему
+        # одно.
+        assert len(top) == 10
 
 
 class TestMenuIntegrity:
@@ -170,11 +173,14 @@ class TestMenuIntegrity:
 
     def test_separator_isolates_operator_input(self):
         # После разделителя — только то, чему нужен ввод оператора: «Досье
-        # домена» и подменю ящиков (menu_handlers разворачивает его вложенные
-        # пункты, поэтому они видны гарду).
+        # домена», установка SSL (диалог секций), тесты скорости (цена: 128 МБ
+        # на диск и до 50 МБ трафика — спрашиваются) и подменю ящиков
+        # (menu_handlers разворачивает его вложенные пункты, они видны гарду).
         sep = HOSTING_MENU.index(None)
         after = menu_handlers(HOSTING_MENU[sep + 1:])
-        assert after == ["run_host_domain", "run_host_mb_create",
+        assert after == ["run_host_domain", "run_host_ssl_install",
+                         "run_host_speed_disk", "run_host_speed_net",
+                         "run_host_mb_create",
                          "run_host_mb_passwd", "run_host_mb_delete"]
 
     def test_mailbox_ops_are_grouped_into_submenu(self):
@@ -378,3 +384,82 @@ class TestMenuVisibility:
         host._set_hosting_menu_visible(False)
         assert host.hosting_frame.forgotten == 1
         assert host.host_menu_btn.configs[-1]['state'] == 'disabled'
+
+
+class TestSslInstallEntry:
+    """«Установить SSL (nginx/apache)»: диалог fullchain/key → подтверждение.
+
+    Контракт обработчика (живое окно — SslInstallMixin, CI под Xvfb): отмена
+    диалога — ни подтверждения, ни бэкенда; отказ от подтверждения — ни
+    бэкенда; подтверждённый пуск везёт домен + две секции в правильном
+    порядке и БЕЗ cache_key (действие, кеш состояния солгал бы).
+    """
+
+    MATERIAL = {'domain': 'site.ru',
+                'sections': {'fullchain': 'FC-PEM', 'key': 'KEY-PEM'}}
+
+    def _host(self, monkeypatch, material, askyesno_ret=True):
+        host = _Host(FakeSSH())
+        modes = []
+
+        def dialog(mode):
+            modes.append(mode)
+            return dict(self.MATERIAL) if material else None
+        host._open_ssl_install_dialog = dialog
+        host.modes = modes
+        monkeypatch.setattr(gh, "messagebox",
+                            _Dialogs(askyesno_ret=askyesno_ret))
+        return host
+
+    def test_cancelled_dialog_runs_nothing(self, monkeypatch):
+        host = self._host(monkeypatch, material=None)
+        host.run_host_ssl_install()
+        assert host.modes == ['plain']
+        assert host.calls == []
+
+    def test_declined_confirmation_runs_nothing(self, monkeypatch):
+        host = self._host(monkeypatch, material=True, askyesno_ret=False)
+        host.run_host_ssl_install()
+        assert host.calls == []
+
+    def test_confirmed_passes_domain_and_two_sections(self, monkeypatch):
+        host = self._host(monkeypatch, material=True)
+        host.run_host_ssl_install()
+        assert len(host.calls) == 1
+        fn, btn, args, kwargs = host.calls[0]
+        assert fn is gh.ssl_install_plain
+        assert btn is host.host_menu_btn
+        assert args == (host.checker, 'site.ru', 'FC-PEM', 'KEY-PEM')
+        assert kwargs == {}
+
+
+class TestSpeedTestEntries:
+    """Тесты скорости — плоские пункты после разделителя: цена названа,
+    подтверждение спрашивается, бэкенд без кеша (замер нельзя кешировать)."""
+
+    @pytest.mark.parametrize("handler,backend", [
+        ("run_host_speed_disk", "disk_speed_test"),
+        ("run_host_speed_net", "network_speed_test"),
+    ])
+    def test_declined_does_not_run(self, monkeypatch, handler, backend):
+        host = _Host(FakeSSH())
+        monkeypatch.setattr(gh, "messagebox", _Dialogs(askyesno_ret=False))
+        getattr(host, handler)()
+        assert host.calls == []
+
+    @pytest.mark.parametrize("handler,backend", [
+        ("run_host_speed_disk", "disk_speed_test"),
+        ("run_host_speed_net", "network_speed_test"),
+    ])
+    def test_confirmed_runs_backend_uncached(self, monkeypatch, handler,
+                                             backend):
+        host = _Host(FakeSSH())
+        dialogs = _Dialogs(askyesno_ret=True)
+        monkeypatch.setattr(gh, "messagebox", dialogs)
+        getattr(host, handler)()
+        assert len(host.calls) == 1
+        fn, btn, args, kwargs = host.calls[0]
+        assert fn is getattr(gh, backend), handler
+        assert args == (host.checker,)
+        assert kwargs == {}                       # cache_key запрещён
+        assert dialogs.asked

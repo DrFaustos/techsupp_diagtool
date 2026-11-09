@@ -422,19 +422,41 @@ DEHYDRATED_CRON_DIRS = ('/etc/cron.d', '/etc/cron.hourly', '/etc/cron.daily',
 
 
 def find_dehydrated_cron(checker):
-    """Где прописан перевыпуск dehydrated: (строки_root_cron, [файлы_cron.d]).
+    """Где прописан перевыпуск: (строки_root_cron, [файлы_cron.d], note).
 
-    root crontab читаем отдельно (spool), остальные места — одним grep -rlF по
-    каталогам: ищет по СОДЕРЖИМОМУ, поэтому находит и файл cron.d/dehydrated,
-    и скрипт в cron.hourly, который дергает dehydrated.
+    Прежняя форма `crontab -l 2>/dev/null | grep -F dehydrated` схлопывала
+    нечитаемый root crontab и «заданий нет» в одну пустоту, а отчёт на пустом
+    cron.d утверждал «задания нет — перевыпускать вручную» там, где crontab
+    просто не прочитан (1.32.30, ревью). Носитель — crontab_read_info, та же,
+    что у правки crontab в этом файле; note непустой, когда корневой crontab
+    не прочитан ИЛИ обход cron-каталогов не дошёл до конца (grep rc>=2), —
+    это «не проверено», и отчёт обязан это сказать.
+
+    Остальные места — одним grep -rlF по каталогам: ищет по СОДЕРЖИМОМУ,
+    поэтому находит и файл cron.d/dehydrated, и скрипт в cron.hourly, который
+    дергает dehydrated.
     """
-    out, _, _ = checker.run('crontab -l 2>/dev/null | grep -F dehydrated')
-    root = out.strip()
+    read = crontab_read_info(checker)
+    if read['state'] == 'failed':
+        root, note = '', read['note']
+    else:
+        root = '\n'.join(ln for ln in (read['text'] or '').splitlines()
+                         if 'dehydrated' in ln)
+        note = ''
     targets = ' '.join(q(p) for p in DEHYDRATED_CRON_DIRS)
-    out, _, _ = checker.run(
-        f'grep -rlF {q("dehydrated")} {targets} 2>/dev/null')
+    # grep говорит кодами: 0 — совпадения есть, 1 — обошёл и не нашёл (это
+    # ответ), 2 — обошёл НЕ всё (нечитаемые файлы/каталоги), 126/127 — grep
+    # не спросить. Прежний 2>/dev/null глушил именно мир rc=2: отчёт печатал
+    # «задания нет» там, где каталоги cron не прочитаны.
+    out, err, grc = checker.run(f'grep -rlF {q("dehydrated")} {targets}')
     files = sorted({ln.strip() for ln in out.splitlines() if ln.strip()})
-    return root, files
+    if grc not in (0, 1):
+        why = next((l.strip() for l in (err or '').splitlines() if l.strip()),
+                   'grep вернул rc=%s' % grc)[:160]
+        extra = ('каталоги cron (' + ', '.join(DEHYDRATED_CRON_DIRS) +
+                 ') проверены не полностью: ' + why)
+        note = (note + '; ' + extra) if note else extra
+    return root, files, note
 
 
 def bitrix_ssl_report(checker):
@@ -467,7 +489,7 @@ def bitrix_ssl_report(checker):
         tail = f', осталось {days} дн.' if days is not None else ''
         lines.append(f'{mark} {dom}: {raw}{tail}')
 
-    root_cron, cron_files = find_dehydrated_cron(checker)
+    root_cron, cron_files, cron_note = find_dehydrated_cron(checker)
     if root_cron:
         lines.append('✅ Перевыпуск настроен в crontab root:')
         lines.extend('   ' + ln for ln in root_cron.splitlines())
@@ -476,6 +498,14 @@ def bitrix_ssl_report(checker):
         # НЕ ошибка, ругаться «придётся вручную» на исправном сервере нельзя.
         lines.append('✅ Перевыпуск настроен вне root crontab: '
                      + ', '.join(cron_files))
+    elif cron_note:
+        # Пусто не потому, что задания нет, а потому, что root crontab не
+        # прочитан или обход cron-каталогов прошёл не целиком: «перевыпускать
+        # придётся вручную» было бы утверждением без права на него
+        # (1.32.30/1.32.31, ревью). note держит названную причину.
+        lines.append('⚠️ Есть ли задание dehydrated — не проверено: '
+                     + cron_note + '. Прогоните под root — это «не проверено», '
+                     'а не «задания нет»')
     else:
         lines.append('⚠️ Задания dehydrated нет ни в crontab root, ни в '
                      + ', '.join(DEHYDRATED_CRON_DIRS)
@@ -526,8 +556,11 @@ def bitrix_ssl_renew(checker):
 
     lines.append('⚠️ Запуск dehydrated -c: до 1-2 минут; возможны отказы из-за '
                  'DNS (нет A/www), нехватки места и лимита LE 5 ошибок/час.')
-    out, err, rc = checker.run(
-        f'cd {q(DEHYDRATED)} && {q(DEHYDRATED_BIN)} -c 2>&1 | tail -25')
+    # rc снимается БЕЗ пайпа в tail: прежняя форма `dehydrated -c | tail -25`
+    # печатала «Код завершения: 0» при провале выпуска, потому что rc
+    # конвейера принадлежит tail (1.32.30, ревью).
+    out, err, rc = _rc_and_tail(
+        checker, f'cd {q(DEHYDRATED)} && {q(DEHYDRATED_BIN)} -c', keep=25)
     lines.append(f'Код завершения: {rc}')
     lines.append(out.strip() or err.strip() or '(без вывода)')
     lines.append(f'Лог: {DEHYDRATED_LOG}')
@@ -535,6 +568,26 @@ def bitrix_ssl_renew(checker):
 
 
 # ==================== MYSQL ====================
+def _rc_and_tail(checker, command, keep=25):
+    """Запуск команды с СОХРАНЕНИЕМ её rc и хвостом вывода на сервере.
+
+    Прежняя форма `command 2>&1 | tail -N` отдавала код возврата tail'а
+    (всегда 0 при состоявшемся пайпе): провал chown -R и dehydrated читался
+    как успех — тот же закон, который модуль сам себе записал для конвейеров
+    (rc принадлежит последней команде). Хвост нужен был, чтобы не тащить
+    мегабайты ошибок; сервер делает его и сам, но rc обязан доехать.
+
+    Временный файл берётся у mktemp, а не по фиксированному пути в /tmp:
+    путь-ловушка (symlink, чужой файл) — тот же мотив, что у
+    prepare_secret_file. mktemp не смог — rc=99 и причина в выводе, это
+    «не спросили», а не «не удалось».
+    """
+    script = ('t=$(mktemp) || {{ echo "mktemp: временный файл не создан"; '
+              'exit 99; }}; {{ {cmd}; }} > "$t" 2>&1; rc=$?; tail -n {n} '
+              '"$t"; rm -f "$t"; exit $rc').format(cmd=command, n=keep)
+    return checker.run(script)
+
+
 def total_mem_mb(checker):
     """Всего RAM в МБ по `free -m` (парсинг в Python, без awk)."""
     out, _, _ = checker.run('free -m')
@@ -628,7 +681,17 @@ def bitrix_mysql_tune(checker):
     if not ok:
         lines.append(f'❌ Не удалось записать {TUNE_FILE}: {err}')
         return '\n'.join(lines)
-    checker.run(f'chmod 600 {q(TUNE_FILE)} 2>/dev/null')
+    # Права: 644, а не прежние вслепую выставленные 600 (1.32.30, ревью).
+    # Во-первых, rc прежнего chmod был выброшен и причина заглушена;
+    # во-вторых, mysqld работает от пользователя mysql и файла 0600 root
+    # не прочитает — тюнинг молча перестал бы применяться после restart, то
+    # есть прежняя форма «✅ Записан» врала дважды. Содержимое конфига не
+    # секретно, world-readable здесь — требование работоспособности.
+    _, cerr, crc = checker.run(f'chmod 644 {q(TUNE_FILE)} 2>&1')
+    if crc != 0:
+        lines.append(f'⚠️ Права 644 не выставлены (rc={crc}): '
+                     f'{cerr.strip() or "нет вывода"} — проверьте права на '
+                     f'{TUNE_FILE} руками, иначе mysqld может его не прочесть')
 
     pool = recommend_innodb_buffer(mem)
     lines.append(f'✅ Записан {TUNE_FILE} (RAM {mem} МБ, buffer pool {pool}M)')
@@ -1048,27 +1111,39 @@ def bitrix_perms_fix(checker):
         return '\n'.join(lines)
 
     lines.append('⚠️ Идём по всему документ-корню: на больших сайтах 1-5 минут.')
-    out, err, rc = checker.run(
-        f'chown -R {SITE_OWNER}:{SITE_GROUP} {q(BITRIX_DOCROOT)} 2>&1 | tail -5')
+    # Каждая правка идёт через _rc_and_tail: прежние `... | tail -N` отдавали
+    # вердикту rc хвостовика, и провал chown (не-root, ошибки в дереве)
+    # печатался «✅ восстановлен» (1.32.30, ревью).
+    out, err, rc = _rc_and_tail(
+        checker, f'chown -R {SITE_OWNER}:{SITE_GROUP} {q(BITRIX_DOCROOT)}',
+        keep=5)
     lines.append(f'❌ chown (rc={rc}): {(out or err).strip() or "нет вывода"}'
                  if rc != 0 else f'✅ Владелец {SITE_OWNER}:{SITE_GROUP} восстановлен')
 
-    out, err, rc = checker.run(
-        f'find {q(BITRIX_DOCROOT)} -type d -exec chmod 755 {{}} + 2>&1 | tail -3')
+    out, err, rc = _rc_and_tail(
+        checker, f'find {q(BITRIX_DOCROOT)} -type d -exec chmod 755 {{}} +',
+        keep=3)
     lines.append('✅ Каталогам выставлены 755' if rc == 0
                  else f'❌ chmod каталогов (rc={rc}): {(out or err).strip()}')
 
-    out, err, rc = checker.run(
-        f'find {q(BITRIX_DOCROOT)} -type f -exec chmod 644 {{}} + 2>&1 | tail -3')
+    out, err, rc = _rc_and_tail(
+        checker, f'find {q(BITRIX_DOCROOT)} -type f -exec chmod 644 {{}} +',
+        keep=3)
     lines.append('✅ Файлам выставлены 644' if rc == 0
                  else f'❌ chmod файлов (rc={rc}): {(out or err).strip()}')
 
     # upload пишет веб-процесс от www — ему нужна запись GROUP'ой
     # (владельцем upload остаётся bitrix, 664 + группа bitrix достаточно).
-    out, err, rc = checker.run(
-        f'find {q(BITRIX_DOCROOT)}/upload -exec chmod g+w {{}} + 2>&1 | tail -3')
+    # `! -type l` обязателен (1.32.30, ревью): find выдаёт symlink'и как есть,
+    # а chmod идёт ПО ССЫЛКЕ на цель — ссылка, посаженная в writeable upload
+    # (куда пишет веб-процесс), получала бы g+w в произвольной точке ФС от
+    # имени root: кнопка «починить права» становилась вектором эскалации.
+    out, err, rc = _rc_and_tail(
+        checker, f'find {q(BITRIX_DOCROOT)}/upload ! -type l '
+                 f'-exec chmod g+w {{}} +', keep=3)
     lines.append('✅ upload: добавлена запись группой (www в группе bitrix)'
-                 if rc == 0 else '⚠️ upload: chmod g+w не прошёл')
+                 if rc == 0 else f'⚠️ upload: chmod g+w не прошёл (rc={rc}): '
+                 f'{(out or err).strip()}')
     lines.append('💡 Если php-FPM работает от bitrix (FastPanel/ISPmanager '
                  'иногда ставят www) — сверьте владельца процессов: '
                  'ps -o user,cmd -C php-fpm')

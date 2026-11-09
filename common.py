@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Единственный источник правды о версии. От неё зависят заголовок окна,
 # CHANGELOG.md и тег релиза (тэг всегда v<__version__>).
-__version__ = "1.32.29"
+__version__ = "1.33.0"
 
 # ==================== КОНФИГУРАЦИИ ====================
 BACKUP_DIR = "/root/tech_support"
@@ -13,7 +13,11 @@ BACKUP_SUBDIRS = {
     'configs': f"{BACKUP_DIR}/configs",
     'dns': f"{BACKUP_DIR}/dns",
     'crontab': f"{BACKUP_DIR}/crontab",
-    'swap': f"{BACKUP_DIR}/swap"
+    'swap': f"{BACKUP_DIR}/swap",
+    # Сертификаты — отдельная категория: ssl_install передаёт backup_type='certs',
+    # без ключа .get() молча складывал резервы в configs/ и поиск откатов
+    # по «certs» ничего не давал.
+    'certs': f"{BACKUP_DIR}/certs",
 }
 
 LOG_PATHS = {
@@ -83,6 +87,19 @@ DOMAIN_PATHS = {
 def q(value):
     """Безопасное экранирование значения для вставки в shell-команду."""
     return shlex.quote(str(value))
+
+
+def backup_stamp():
+    """Метка имени резервной копии с микросекундами.
+
+    Прежняя секундная метка позволяла двум правкам одного пути в пределах
+    секунды попасть в ОДНО имя: `cp` молча затирал первый резерв, и
+    правило «бэкап не имеет права перезаписывать бэкап» нарушалось само
+    собой (1.32.30, ревью). Микросекундное окно снимает штатное повторное
+    нажатие кнопки в ту же секунду. Правило одно на весь модуль: любой
+    бэкап-путь (файл, crontab) собирается ТОЛЬКО отсюда.
+    """
+    return datetime.now().strftime('%Y%m%d_%H%M%S_%f')
 
 
 BACKUP_PROBE = '.wprobe'
@@ -212,7 +229,7 @@ def create_backup_info(checker, filepath, backup_type='configs'):
     dinfo = ensure_backup_dir_info(checker)
 
     filename = os.path.basename(filepath)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = backup_stamp()
     backup_filename = f"{filename}.{timestamp}.bak"
     backup_path = f"{BACKUP_SUBDIRS.get(backup_type, BACKUP_SUBDIRS['configs'])}/{backup_filename}"
 
@@ -356,7 +373,10 @@ def save_crontab_backup_info(checker):
     существующие задания, а оператор прочитал rc=0 и «✅»).
     """
     dinfo = ensure_backup_dir_info(checker)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    # Та же метка, что у create_backup_info: секундное окно здесь значило бы
+    # два crontab-бэкапа в ОДНО имя (правка crontab в ту же секунду — штатный
+    # повтор кнопки), а редирект `>` молча стёр бы первый резерв.
+    timestamp = backup_stamp()
     backup_path = "%s/crontab.%s.bak" % (BACKUP_SUBDIRS['crontab'], timestamp)
     if not dinfo['ok']:
         # Каталог не принимает запись — нечего и соваться: прежний код писал
@@ -487,36 +507,71 @@ def service_run(checker, command):
     return checker.run(command)
 
 
-def prepare_secret_file(checker, filepath, content):
-    """Создаёт файл с паролем сразу безопасным: (True, None) либо (False, причина).
+def prepare_secret_file(checker, filepath, content, mode='600'):
+    """Создаёт файл сразу безопасным: (True, None) либо (False, причина).
+
+    mode='600' — приватный ключ/пароль; mode='644' — публичный сертификат,
+    которому тоже угрожает symlink: прежний write_remote_file (SFTP open 'w')
+    шёл по symlink как по обычному файлу, и локальный пользователь, посадивший
+    ссылку в writable-каталог dehydrated, получал перезапись чужого файла
+    рутом. Симлинк-гарды (rm по symlink отказан, noclobber, пост-проверка)
+    здесь одинаковы для обоих режимов; отличается только chmod.
 
     Порядок принципиален и в нём весь смысл:
 
     1. `rm -f` — по фиксированному пути мог лежать чужой файл или symlink
        (атака на /tmp/.techsupp_*.cnf): SFTP-запись пошла бы по symlink и
        затёрла бы его цель.
-    2. создание при `umask 077` + `chmod 600` — файл получает 0600 ДО того,
-       как в нём появится пароль. Прежний порядок «записали, потом chmod»
-       давал окно world-readable файла, а отмена между этими шагами оставляла
-       его навсегда (chmod шёл через cancel-гейт).
+    2. создание при `umask 077` и с `set -C` (noclobber) + `chmod 600` — файл
+       получает 0600 ДО того, как в нём появится пароль. Прежний порядок
+       «записали, потом chmod» давал окно world-readable файла, а отмена между
+       этими шагами оставляла его навсегда (chmod шёл через cancel-гейт).
     3. SFTP пишет в УЖЕ созданный файл: truncate прав не меняет (проверено:
        umask 022 -> 644, umask 077 -> 600, после перезаписи снова 600).
+
+    Почему noclobber, а не только `rm -f`: между снятием пути и его созданием
+    лежит целая SSH-команда, и локальный атакующий успевает посадить туда
+    symlink. `: >` по symlink проходит молча, `>: ` под `set -C` — отказывается
+    и даёт нам честный маркер NOCREATE. Post-check `[ -L ] || [ ! -f ]` ловит
+    вторую половину гонки (symlink после нашего создания). Это та же защита,
+    которую ssl_install.py закрыл непредсказуемым именем: здесь её получает
+    СРАЗУ каждый пользователь хелпера, а не тот, кто догадался.
 
     Все команды идут через service_run — уборка и права не должны зависеть от
     того, нажал ли оператор «Стоп».
     """
     target = q(filepath)
-    cmd = (f'rm -f {target} 2>/dev/null; umask 077; : > {target} 2>/dev/null; '
-           f'chmod 600 {target} 2>/dev/null; '
-           f'if [ ! -w {target} ]; then echo NOWRITE; fi')
+    cmd = (f'if [ -L {target} ]; then echo SYMLINK; exit 0; fi; '
+           f'rm -f {target} 2>/dev/null; umask 077; set -C; '
+           f': > {target} 2>/dev/null || echo NOCREATE; set +C; '
+           f'if [ -e {target} ]; then '
+           f'chmod {mode} {target} 2>/dev/null || echo CHMODFAIL; '
+           f'if [ -L {target} ] || [ ! -f {target} ]; then echo SYMLINK; fi; '
+           f'if [ ! -w {target} ]; then echo NOWRITE; fi; fi')
     try:
         out, err, _rc = service_run(checker, cmd)
     except Exception as e:
         return False, f'не удалось создать файл {filepath}: {e}'
+    detail = (err or '').strip()
+    if 'SYMLINK' in (out or ''):
+        # Отказ, а не «перезапишем по-своему»: цель symlink нам неизвестна, а
+        # запись по нему — порча чужого файла рутом.
+        return False, (f'по пути {filepath} лежит symlink — запись отменена '
+                       '(файл не создан, цель не тронута)')
+    if 'NOCREATE' in (out or ''):
+        return False, (f'{filepath} не создан (путь занят или каталог только '
+                       f'для чтения)' + (f': {detail}' if detail else ''))
     if 'NOWRITE' in (out or ''):
-        detail = (err or '').strip()
         return False, (f'в {filepath} нельзя писать (файл чужой или /tmp только '
                        f'для чтения)' + (f': {detail}' if detail else ''))
+    if 'CHMODFAIL' in (out or ''):
+        # Права не выставлены — файл остаётся с режимом создания (umask 077
+        # = 0600): для ключа это даже безопасно, но для сертификата mode='644'
+        # — часть контракта, а молчать об отказе серия не разрешает. Файл
+        # снимается, запись отменяется.
+        remove_remote_path(checker, filepath, recursive=False)
+        return False, (f'не удалось выставить права {mode} на {filepath} — '
+                       'файл снят, запись отменена')
     ok, why = write_remote_file(checker, filepath, content)
     if not ok:
         remove_remote_path(checker, filepath, recursive=False)

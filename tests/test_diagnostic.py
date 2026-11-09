@@ -130,8 +130,10 @@ class TestReplaceIp:
         files_mod.replace_ipv4(c, '123.123.123.123', '10.20.30.40')
         cmd = c._find_cmd('find /etc')
         assert cmd is not None
-        assert r'123\.123\.123\.123' in cmd
-        assert r'10\.20\.30\.40' in cmd
+        # 1.32.30: паттерн ограничен границами слова и экранирован; замена —
+        # адрес из допустимого алфавита БЕЗ лишних экранирований (в правой
+        # части sed точка не метасимвол, а \. — мусор в тексте конфига).
+        assert r's#\<123\.123\.123\.123\>#10.20.30.40#g' in cmd
         assert "-name \"*.conf\"" in cmd
 
     def test_ipv4_rejects_invalid(self):
@@ -281,9 +283,28 @@ class FakeSFTP:
 
     def open(self, path, mode='r'):
         self.ops.append(('open', path, mode))
-        if 'w' in mode:
+        if 'x' in mode:
+            # paramiko: 'x' — исключительное создание, существующее отвергается
+            # (SSH_FX_FILE_ALREADY_EXISTS=4 как первый аргумент, как бросает
+            # paramiko — fmanager различает миры по коду).
+            if path in self.files:
+                raise IOError(4, f'exists: {path}')
+            self.files.add(path)
+        elif 'w' in mode:
             self.files.add(path)
         return _FakeFile(self.written, path, mode)
+
+    def stat(self, path):
+        # Контракт paramiko: IOError, когда пути нет; fmanager проверяет
+        # существование цели create/rename именно stat'ом (ревью 1.32.30).
+        # SSH_FX_NO_SUCH_FILE=2 первым аргументом — единственный код, дающий
+        # право сказать «нет»; прочий отказ для fmanager — «не проверено».
+        # force_stat_error — тестовый мир «прочего отказа» (EACCES и т.п.).
+        if getattr(self, 'force_stat_error', None):
+            raise IOError(self.force_stat_error, 'forced stat failure')
+        if path in self.files or path in self.dirs:
+            return _Attr(self._base(path), stat.S_IFREG | 0o644, 12)
+        raise IOError(2, f'no such file: {path}')
 
     def remove(self, path):
         self.ops.append(('remove', path))
@@ -345,6 +366,30 @@ class TestFManager:
         fm.create_file(_sftp_checker(sftp), '/etc/new.conf')
         assert sftp.written['/etc/new.conf'] == ''
         assert sftp.closed == 1
+
+    def test_create_file_uses_exclusive_mode(self):
+        # 'x' без WRITE-бита сервер не открывает (SSH_FX_BAD_FLAG) — режим
+        # обязан нести запись И исключительность (1.32.31, ревью).
+        sftp = FakeSFTP(dirs=['/'])
+        fm.create_file(_sftp_checker(sftp), '/etc/new.conf')
+        assert ('open', '/etc/new.conf', 'wx') in sftp.ops
+
+    def test_create_file_aborts_on_unverifiable_existence(self):
+        # stat вернул не NO_SUCH_FILE, а прочую ошибку: это «не проверено»,
+        # а не «файла нет» — создавать по такому признаку нельзя.
+        sftp = FakeSFTP(dirs=['/'])
+        sftp.force_stat_error = 3          # PERMISSION_DENIED
+        out = fm.create_file(_sftp_checker(sftp), '/etc/new.conf')
+        assert '❌' in out and 'не проверено' in out
+        assert ('open', '/etc/new.conf', 'wx') not in sftp.ops
+
+    def test_rename_aborts_on_unverifiable_target(self):
+        # Цель не увиденна (не ENOENT) — rename по «цели нет» стёр бы её.
+        sftp = FakeSFTP(files=['/etc/a.conf'])
+        sftp.force_stat_error = 14         # CONNECTION_LOST
+        out = fm.rename_path(_sftp_checker(sftp), '/etc/a.conf', '/etc/b.conf')
+        assert '❌' in out and 'не проверена' in out
+        assert sftp.files == {'/etc/a.conf'}
 
     def test_delete_file(self):
         sftp = FakeSFTP(files=['/etc/x.conf'])

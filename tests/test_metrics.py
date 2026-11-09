@@ -5,6 +5,8 @@
 import os
 import sys
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -148,9 +150,11 @@ class TestNetworkReport:
     IP_R = ('default via 10.0.0.1 dev eth0 proto dhcp metric 100\n'
             '10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.5\n')
     # 'route get' раньше 'ip r': игла 'ip r' иначе проглотила бы и её.
-    # Возврат — уже пост-обработанный конвейером (`| cut -f2`) адрес без 'src '.
+    # Фикстура — СЫРОЙ вывод `ip route get` (разбор src/dev переехал из
+    # shell-конвейера grep|cut в Python: конвейер глушил причину через
+    # 2>/dev/null, зависел от GNU grep -P и решал по коду cut, а не ip).
     ROUTES = [
-        ('route get', '10.0.0.5\n'),
+        ('route get', '1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 0\n'),
         ('ip r', IP_R),
         ('ip a', IP_A),
         ('ifconfig.me', '203.0.113.9\n'),
@@ -170,8 +174,13 @@ class TestNetworkReport:
                   ('ifconfig.me', '')]
         out = metrics_mod.network_report(FakeSSH(routes=routes))
         assert 'Интерфейс по умолчанию' not in out
-        assert 'IP-адрес источника' not in out
         assert 'Внешний IP не удалось определить' in out
+        # Прежний тест проверял «строки про источник нет» — но молчаливая
+        # потеря строки неотличима от «так и надо». Теперь отсутствие
+        # источника обязано быть сказано С ПРИЧИНОЙ (закон серии), поэтому
+        # находка строки здесь и есть проверяемое поведение.
+        assert 'IP-адрес источника для исходящего трафика' not in out
+        assert 'IP-адрес источника не определён' in out
 
 
 class TestWebConfig:
@@ -237,19 +246,20 @@ class TestExternalIpIsAnAddressNotAChainOutput:
 
     def base(self):
         # 'route get' обязан стоять перед 'ip r': игла 'ip r' иначе проглотила
-        # бы и её — контракт, уже закреплённый TestNetworkReport.
-        return [('route get', '10.0.0.5\n'), ('ip r', self.IP_R),
-                ('ip a', self.IP_A)]
+        # бы и её — контракт, уже закреплённый TestNetworkReport. Вывод —
+        # сырая строка `ip route get`, разбор в Python.
+        return [('route get', '1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5\n'),
+                ('ip r', self.IP_R), ('ip a', self.IP_A)]
 
     def test_html_from_wget_is_not_reported_as_an_address(self):
         # Мир замера 1c: PATH без curl -> боевая цепочка уходит в wget и
-        # возвращается rc=0 с HTML-ом страницы.
+        # возвращается rc=0 с HTML-ом страницы. Иглы — по именам бинарников:
+        # команды обёрнуты в `timeout` и снабжены флагами таймаутов, точная
+        # подстрока прежней формы ('-sS ifconfig.me') больше не встречается.
         c = FakeSSH(routes=self.base() + [
-            ('-qO- ifconfig.me', (self.HTML, '', 0)),
-            ('-sS ifconfig.me', ('', '/bin/bash: line 1: curl: ' + self.ABSENT,
-                                 127)),
-            ('myip.opendns.com', ('', '/bin/bash: line 1: dig: ' + self.ABSENT,
-                                  127)),
+            ('wget', (self.HTML, '', 0)),
+            ('curl', ('', '/bin/bash: line 1: curl: ' + self.ABSENT, 127)),
+            ('dig', ('', '/bin/bash: line 1: dig: ' + self.ABSENT, 127)),
         ])
         out = metrics_mod.network_report(c)
         assert '<!DOCTYPE' not in out, out[-260:]
@@ -259,11 +269,9 @@ class TestExternalIpIsAnAddressNotAChainOutput:
         # dig пишет диагностику отказа в STDOUT (rc=9): для решалки по
         # непустоте это «ответ есть», а по существу — отказ резолвера.
         c = FakeSSH(routes=self.base() + [
-            ('myip.opendns.com', (self.DIG_FAIL, '', 9)),
-            ('-qO- ifconfig.me', ('', '/bin/bash: line 1: wget: ' + self.ABSENT,
-                                  127)),
-            ('-sS ifconfig.me', ('', '/bin/bash: line 1: curl: ' + self.ABSENT,
-                                 127)),
+            ('dig', (self.DIG_FAIL, '', 9)),
+            ('wget', ('', '/bin/bash: line 1: wget: ' + self.ABSENT, 127)),
+            ('curl', ('', '/bin/bash: line 1: curl: ' + self.ABSENT, 127)),
         ])
         out = metrics_mod.network_report(c)
         assert ';; communications error' not in out, out[-260:]
@@ -274,11 +282,10 @@ class TestExternalIpIsAnAddressNotAChainOutput:
         # rc=4, dig rc=9. Прежняя строка советует УСТАНОВИТЬ уже
         # установленное, и оператор едет ставить пакеты вместо диагностики.
         c = FakeSSH(routes=self.base() + [
-            ('-qO- ifconfig.me', ('', 'wget: unable to resolve host address',
-                                  4)),
-            ('-sS ifconfig.me', ('', 'curl: (6) Could not resolve host: '
-                                 'ifconfig.me', 6)),
-            ('myip.opendns.com', (self.DIG_FAIL, '', 9)),
+            ('wget', ('', 'wget: unable to resolve host address', 4)),
+            ('curl', ('', 'curl: (6) Could not resolve host: '
+                       'ifconfig.me', 6)),
+            ('dig', (self.DIG_FAIL, '', 9)),
         ])
         out = metrics_mod.network_report(c)
         assert 'установите' not in out, out[-260:]
@@ -382,24 +389,35 @@ class TestExternalIpNoteAndOrder:
         assert 'Could not resolve host' in note
 
     def test_probe_stops_at_the_first_valid_address(self):
+        # Иглы и проверка — по боевым командам из EXTERNAL_IP_SOURCES, а не по
+        # прежней голой форме 'curl -sS ifconfig.me': команды обёрнуты в
+        # `timeout` и несут флаги таймаутов (риск зависания потока GUI), и
+        # тест обязан переживать следующую смену формы, проверяя ПОРЯДОК, а не
+        # букву строки.
+        curl_cmd = metrics_mod.EXTERNAL_IP_SOURCES[0][1]
+        wget_cmd = metrics_mod.EXTERNAL_IP_SOURCES[1][1]
+        dig_cmd = metrics_mod.EXTERNAL_IP_SOURCES[2][1]
         c = FakeSSH(routes=[
-            ('curl -sS ifconfig.me', ('203.0.113.9\n', '', 0)),
-            ('wget -qO- ifconfig.me', ('<html>', '', 0)),
-            ('dig +short', ('', '', 0)),
+            (curl_cmd, ('203.0.113.9\n', '', 0)),
+            (wget_cmd, ('<html>', '', 0)),
+            (dig_cmd, ('', '', 0)),
         ])
         probe = metrics_mod.probe_external_ip(c)
         assert probe['address'] == '203.0.113.9'
         asked = [x for x in c.commands if 'ifconfig' in x or 'dig' in x]
-        assert asked == ['curl -sS ifconfig.me'], asked
+        assert asked == [curl_cmd], asked
 
     def test_probe_keps_asking_after_a_non_address(self):
         # Мир 1c: curl нет, wget отдаёт HTML. Обход обязан дойти до dig, а
         # находкой HTML не стать.
+        curl_cmd = metrics_mod.EXTERNAL_IP_SOURCES[0][1]
+        wget_cmd = metrics_mod.EXTERNAL_IP_SOURCES[1][1]
+        dig_cmd = metrics_mod.EXTERNAL_IP_SOURCES[2][1]
         c = FakeSSH(routes=[
-            ('curl -sS ifconfig.me', ('', '/bin/bash: line 1: curl: command '
-                                      'not found', 127)),
-            ('wget -qO- ifconfig.me', ('<!DOCTYPE html>\n<html>', '', 0)),
-            ('dig +short', (';; communications error\n', '', 9)),
+            (curl_cmd, ('', '/bin/bash: line 1: curl: command '
+                        'not found', 127)),
+            (wget_cmd, ('<!DOCTYPE html>\n<html>', '', 0)),
+            (dig_cmd, (';; communications error\n', '', 9)),
         ])
         probe = metrics_mod.probe_external_ip(c)
         assert probe['address'] == ''
@@ -409,10 +427,13 @@ class TestExternalIpNoteAndOrder:
         assert '<!DOCTYPE' not in metrics_mod.external_ip_note(probe)
 
     def test_probe_reports_all_absent_without_inventing_an_answer(self):
+        curl_cmd = metrics_mod.EXTERNAL_IP_SOURCES[0][1]
+        wget_cmd = metrics_mod.EXTERNAL_IP_SOURCES[1][1]
+        dig_cmd = metrics_mod.EXTERNAL_IP_SOURCES[2][1]
         c = FakeSSH(routes=[
-            ('curl -sS ifconfig.me', ('', 'bash: curl: command not found', 127)),
-            ('wget -qO- ifconfig.me', ('', 'bash: wget: command not found', 127)),
-            ('dig +short', ('', 'bash: dig: command not found', 127)),
+            (curl_cmd, ('', 'bash: curl: command not found', 127)),
+            (wget_cmd, ('', 'bash: wget: command not found', 127)),
+            (dig_cmd, ('', 'bash: dig: command not found', 127)),
         ])
         probe = metrics_mod.probe_external_ip(c)
         assert probe['address'] == ''
@@ -1108,3 +1129,679 @@ class TestServiceStateIsDecidedByExitCode:
         assert 'не проверено' in block, block
         assert 'unknown' not in block, block
         assert 'nginx: None' not in block, block
+
+
+# ==================== ПРИВЯЗКА ПЛАВАЮЩЕГО IP (1.32.30) ====================
+class TestInterfaceAddressesParse:
+    def test_map_from_realistic_output(self):
+        out = ('1: lo    inet 127.0.0.1/8 scope host lo \\       valid_lft '
+               'forever preferred_lft forever' + chr(10) +
+               '2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0'
+               ' \\       valid_lft forever' + chr(10) +
+               '3: eth0    inet 203.0.113.9/32 scope global secondary eth0'
+               ' \\       valid_lft forever')
+        m = metrics_mod.parse_interface_addresses(out)
+        assert m['10.0.0.5'] == [('eth0', 'global')]
+        assert m['203.0.113.9'] == [('eth0', 'global')]
+        assert m['127.0.0.1'] == [('lo', 'host')]
+
+    def test_ipv6_zone_id_stripped(self):
+        out = ('2: eth0    inet6 fe80::abcd%eth0/64 scope link '
+               '\\       valid_lft forever')
+        m = metrics_mod.parse_interface_addresses(out)
+        assert m['fe80::abcd'] == [('eth0', 'link')]
+
+    def test_garbage_lines_skipped_not_crash(self):
+        # Вывод чужой машины может быть чем угодно — разбор не должен падать.
+        out = ('Мусор\n'
+               '2: eth0    inet не-адрес/24 scope global eth0\n'
+               'короткая\n'
+               '2: eth0    inet 10.0.0.5/24 scope global eth0\n')
+        m = metrics_mod.parse_interface_addresses(out)
+        assert m == {'10.0.0.5': [('eth0', 'global')]}
+
+    def test_same_addr_two_interfaces(self):
+        out = ('2: eth0    inet 203.0.113.9/32 scope global eth0\n'
+               '3: bond0    inet 203.0.113.9/32 scope global bond0\n')
+        m = metrics_mod.parse_interface_addresses(out)
+        assert m['203.0.113.9'] == [('eth0', 'global'), ('bond0', 'global')]
+
+
+class TestInterfaceBindReport:
+    def test_bound_to_interface(self):
+        c = FakeSSH(routes=[('ip -o addr',
+                             '2: eth0    inet 203.0.113.9/32 scope global '
+                             'eth0\n')])
+        note = metrics_mod.interface_bind_note(c, '203.0.113.9', 'eth0')
+        assert 'назначен интерфейсу: eth0 (scope global)' in note
+        assert 'NAT' not in note
+
+    def test_not_bound_means_provider_nat(self):
+        c = FakeSSH(routes=[('ip -o addr',
+                             '2: eth0    inet 10.0.0.5/24 scope global eth0'
+                             '\n')])
+        note = metrics_mod.interface_bind_note(c, '203.0.113.9', 'eth0')
+        assert 'не назначен ни одному интерфейсу' in note
+        assert 'provider NAT / DNAT / балансировщик' in note
+        assert 'через eth0' in note
+
+    def test_command_failure_is_unchecked_not_nat(self):
+        # rc!=0 — «мы не спросили». Это не право говорить про «адреса нет на
+        # интерфейсах»: миры лечатся противоположно.
+        c = FakeSSH(routes=[('ip -o addr',
+                             ('', 'RTNETLINK answers: Operation not '
+                              'permitted', 2))])
+        note = metrics_mod.interface_bind_note(c, '203.0.113.9')
+        assert 'не проверена' in note
+        assert 'не проверено' in note
+        assert 'provider NAT' not in note
+
+    def test_rc0_without_addresses_is_unchecked(self):
+        # Реальная система никогда не вернёт rc=0 и ноль записей; пустой
+        # вывод — молчание, а не «ни на чём не висит».
+        c = FakeSSH(routes=[('ip -o addr', '')])
+        note = metrics_mod.interface_bind_note(c, '203.0.113.9')
+        assert 'не проверена' in note
+        assert 'provider NAT' not in note
+
+
+class TestNetworkReportBinding:
+    # Вывод 'route get' — сырая строка ip route get (разбор в Python).
+    BASE = [('route get', '1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5\n'),
+            ('ip r', 'default via 10.0.0.1 dev eth0\n'),
+            ('ip a', '2: eth0: <B>\n    inet 10.0.0.5/24 scope global eth0\n'),
+            ('ifconfig.me', '203.0.113.9\n')]
+
+    def test_nat_case_adds_unbound_note(self):
+        routes = self.BASE + [('ip -o addr',
+                               '2: eth0    inet 10.0.0.5/24 scope global '
+                               'eth0\n')]
+        out = metrics_mod.network_report(FakeSSH(routes=routes))
+        assert 'трафик идёт через NAT' in out
+        assert 'не назначен ни одному интерфейсу' in out
+
+    def test_direct_public_ip_no_nat_claim(self):
+        # Источник совпал с внешним ответом: адрес машины и есть внешний.
+        # Прежний код печатал «трафик идёт через NAT» при ЛЮБОМ src_ip.
+        routes = [('route get', '1.1.1.1 via 203.0.113.1 dev eth0 '
+                                'src 203.0.113.9\n'),
+                  ('ip r', 'default via 203.0.113.1 dev eth0\n'),
+                  ('ip a', '2: eth0: <B>\n    inet 203.0.113.9/24 scope '
+                           'global eth0\n'),
+                  ('ifconfig.me', '203.0.113.9\n'),
+                  ('ip -o addr', '2: eth0    inet 203.0.113.9/24 scope '
+                                 'global eth0\n')]
+        out = metrics_mod.network_report(FakeSSH(routes=routes))
+        assert 'трафик идёт через NAT' not in out
+        assert 'NAT в пути нет' in out
+        assert 'назначен интерфейсу: eth0' in out
+
+    def test_unreadable_addr_list_says_unchecked(self):
+        routes = self.BASE + [('ip -o addr',
+                               ('', 'bash: ip: command not found', 127))]
+        out = metrics_mod.network_report(FakeSSH(routes=routes))
+        assert 'Привязка 203.0.113.9 к интерфейсу не проверена' in out
+
+
+# ==================== ТЕСТ СКОРОСТИ (1.32.31) ====================
+class TestParseDdSpeed:
+    def test_si_and_iec_units_normalize_to_megabytes(self):
+        # хвост GNU dd: '... copied, 1.05 s, 256 MB/s' (SI) и тот же замер в
+        # MiB/s: разные единицы обязаны приехать одним MB/s-числом.
+        mb, note = metrics_mod.parse_dd_speed(
+            '134217728 bytes (134 MB, 128 MiB) copied, 0.5 s, 268 MB/s',
+            '', 0)
+        assert mb is not None and abs(mb - 268) < 1 and note is None
+        mb2, _ = metrics_mod.parse_dd_speed(
+            '134217728 bytes (128 MiB) copied, 0.25 s, 512 MiB/s', '', 0)
+        assert mb2 is not None and mb2 > 512  # MiB шире MB — пересчёт обязателен
+
+    def test_nonzero_rc_is_not_zero_speed(self):
+        mb, note = metrics_mod.parse_dd_speed(
+            'dd: failed to truncate: File too large', '', 1)
+        assert mb is None and 'rc=1' in note
+
+    def test_rc_zero_without_speed_line_is_not_measured(self):
+        # rc=0, но строки скорости нет (обрыв, чужой dd): ноль выдумывать
+        # нельзя — это «не измерено».
+        mb, note = metrics_mod.parse_dd_speed('128+0 records out', '', 0)
+        assert mb is None and note
+
+    def test_cancel_mid_write_maps_to_negative_rc(self):
+        mb, note = metrics_mod.parse_dd_speed('', '', -1)
+        assert mb is None and 'rc=-1' in note
+
+
+class TestDiskSpeedTest:
+    DD_OK = ('134217728 bytes (134 MB, 128 MiB) copied, 0.4 s, 335 MB/s')
+
+    def test_happy_path_writes_measures_and_wipes(self):
+        store = {}
+        c = FakeSSH(routes=[('conv=fsync', (self.DD_OK, '', 0)),
+                            ('iflag=direct', (self.DD_OK, '', 0))])
+        out = metrics_mod.disk_speed_test(c)
+        assert '335' in out and 'Скорость записи' in out
+        # файл убран каналом rm с проверкой факта (rm шёл, [ -e ] чист)
+        assert c.count('rm -f ' + metrics_mod.SPEED_TMP_BASE) >= 2
+
+    def test_leftover_from_previous_run_blocks_write(self):
+        # съём остатков оставил файлы — запускать dd по чужому пути нельзя:
+        # замер отменён ДО записи.
+        c = FakeSSH(routes=[('ls -1 ' + metrics_mod.SPEED_TMP_BASE,
+                             '/tmp/.techsupp_speed.deadbeefcafe.bin')])
+        out = metrics_mod.disk_speed_test(c)
+        assert 'тест отменён' in out
+        assert c.find('dd if=') is None
+
+    def test_scratch_path_is_not_predictable_between_runs(self):
+        # Фиксированное имя — гонка с широким окном: между съёмом остатка и dd
+        # лежит отдельный SSH-запрос, а dd рутом льёт 128 МБ нулей; symlink,
+        # посаженный в это окно, обнулил бы любой файл системы.
+        first = metrics_mod.speed_tmp_path()
+        second = metrics_mod.speed_tmp_path()
+        assert first != second
+        assert first.startswith(metrics_mod.SPEED_TMP_BASE)
+        assert metrics_mod.dd_write_cmd(first).startswith('timeout ')
+        assert metrics_mod.dd_read_cmd(first).startswith('timeout ')
+
+    def test_absent_dd_is_not_zero(self):
+        c = FakeSSH(routes=[('dd ', ('', 'bash: dd: command not found', 127))])
+        out = metrics_mod.disk_speed_test(c)
+        assert 'не измерена' in out and 'rc=127' in out
+        assert 'MB/s' not in out
+
+    def test_unreadable_speed_line_is_reported_not_fabricated(self):
+        c = FakeSSH(routes=[('conv=fsync', ('no stats here', '', 0)),
+                            ('iflag=direct', ('no stats here', '', 0))])
+        out = metrics_mod.disk_speed_test(c)
+        assert 'не измерена' in out and 'MB/s' not in out
+
+
+class TestParsePingLatency:
+    IPUTILS = ('4 packets transmitted, 4 received, 0% packet loss\n'
+               'rtt min/avg/max/mdev = 9.1/12.5/18.2/3.3 ms')
+
+    def test_avg_parsed_from_utils_line(self):
+        ms, note = metrics_mod.parse_ping_latency(self.IPUTILS, '', 0)
+        assert ms == 12.5 and note is None
+
+    def test_roundtrip_prefix_variant(self):
+        # старые ping пишут 'round-trip min/avg/max' — разбор по '=', не по слову
+        ms, _ = metrics_mod.parse_ping_latency(
+            'round-trip min/avg/max = 1/2.5/9 ms', '', 0)
+        assert ms == 2.5
+
+    def test_total_loss_is_not_latency(self):
+        ms, note = metrics_mod.parse_ping_latency(
+            '4 packets transmitted, 0 received, 100% packet loss', '', 1)
+        assert ms is None and '100' in note
+
+    def test_absent_ping_is_unchecked(self):
+        ms, note = metrics_mod.parse_ping_latency('', 'bash: ping: not found',
+                                                  127)
+        assert ms is None and 'не найден' in note
+
+
+class TestParseDownloadSpeed:
+    def test_curl_number_is_bytes_per_second(self):
+        mb, note = metrics_mod.parse_download_speed('12500000.0', '', 0, 'curl')
+        assert mb is not None and abs(mb - 12.5) < 0.01 and note is None
+
+    def test_curl_garbage_is_not_measured(self):
+        mb, note = metrics_mod.parse_download_speed('', '', 0, 'curl')
+        assert mb is None and note
+
+    def test_timeout_rc_is_failure_with_reason(self):
+        mb, note = metrics_mod.parse_download_speed(
+            '', 'curl: (28) Operation timed out', 28, 'curl')
+        assert mb is None and 'rc=28' in note
+
+    def test_wget_progress_units(self):
+        mb, note = metrics_mod.parse_download_speed(
+            '2026-10-11 12:00:00 (10.5 MB/s) - saved [50000000]', '', 0,
+            'wget')
+        assert mb is not None and abs(mb - 10.5) < 0.01
+
+
+class TestNetworkSpeedTest:
+    PING_OK = ('4 packets transmitted, 4 received, 0% packet loss\n'
+               'rtt min/avg/max/mdev = 9.1/12.5/18.2/3.3 ms')
+
+    def test_happy_reports_latency_and_mbit(self):
+        c = FakeSSH(routes=[('ping -c 4', (self.PING_OK, '', 0)),
+                            ('curl ', ('25000000.0', '', 0))])
+        out = metrics_mod.network_speed_test(c)
+        assert '12.5 мс' in out
+        # 25 MB/s = 200 Мбит/с — человек мыслит битами
+        assert '200' in out and 'Мбит/с' in out
+
+    def test_curl_absent_falls_back_to_wget(self):
+        c = FakeSSH(routes=[
+            ('ping -c 4', (self.PING_OK, '', 0)),
+            ('LC_ALL=C curl', ('', 'bash: curl: command not found', 127)),
+            ('wget ', ('downloaded in 4s (10.0 MB/s)', '', 0)),
+        ])
+        out = metrics_mod.network_speed_test(c)
+        assert '10.0 MB/s' in out
+
+    def test_both_absent_is_honestly_unmeasured(self):
+        c = FakeSSH(routes=[
+            ('ping -c 4', ('', 'bash: ping: command not found', 127)),
+            ('LC_ALL=C curl', ('', 'bash: curl: command not found', 127)),
+            ('wget ', ('', 'bash: wget: command not found', 127)),
+        ])
+        out = metrics_mod.network_speed_test(c)
+        assert 'не измерен' in out and 'Задержка' in out
+        assert 'Мбит' not in out and 'мс' not in out
+
+    def test_ping_block_does_not_gag_bandwidth(self):
+        # ICMP могут фильтровать: задержка «не измерена», канал — измеряется.
+        c = FakeSSH(routes=[
+            ('ping -c 4', ('2 packets transmitted, 0 received, 100% packet '
+                           'loss', '', 1)),
+            ('curl ', ('8000000.0', '', 0)),
+        ])
+        out = metrics_mod.network_speed_test(c)
+        assert '⚠️ Задержка' in out
+        assert '64' in out and 'Мбит/с' in out
+
+
+# ============ аудит незакоммиченного среза 1.32.30/1.32.31: таймауты, честность ============
+# Каждый класс ниже закрывает конкретный дефект ревю; формулировки
+# «не проверено/не измерено» здесь — не стилистика, а грани, на которых
+# отчёт прежде врал.
+
+
+@pytest.mark.parametrize('name,cmd', metrics_mod.EXTERNAL_IP_SOURCES)
+class TestExternalIpSourcesAreBounded:
+    """Каждая проба внешнего IP ограничена ДВУМЯ слоями таймаута.
+
+    ServerChecker._exec читает канал до EOF (stream.read без дедлайна),
+    поэтому зависший ifconfig.me вешал рабочий поток GUI до «Стоп»; конвенция
+    проекта — обёртка `timeout N` (discovery.py, webcheck.py). Родной флаг
+    утилиты обязан быть рядом: убитый `timeout` процесс причину не печатает,
+    а собственной таймаут утилиты печатает (curl rc=28 и т. п.).
+    """
+
+    def test_wrapper_timeout_present(self, name, cmd):
+        assert cmd.startswith('timeout '), cmd
+
+    def test_native_timeout_flag_present(self, name, cmd):
+        if name == 'curl':
+            assert '--max-time' in cmd, cmd
+        elif name == 'wget':
+            # Короткие флаги: длинных --timeout/--tries в BusyBox wget нет, а
+            # мир «curl нет» — это минимальные образы именно с BusyBox.
+            assert ' -T ' in cmd and ' -t 1 ' in cmd, cmd
+            assert '--timeout' not in cmd and '--tries' not in cmd, cmd
+        elif name == 'dig':
+            assert '+time=' in cmd and '+tries=' in cmd, cmd
+
+
+class TestSpeedProbesAreBounded:
+    def test_ping_and_dd_wrapped_and_locale_pinned(self):
+        # dd сам себя ограничить не умеет; ping без LC_ALL=C в локализованной
+        # системе печатает «packet loss» переведённым и дроби с запятой —
+        # разбор бы молчал, а отчёт назвал бы это «RTT-строки не было».
+        assert metrics_mod.dd_write_cmd('/tmp/x.bin').startswith('timeout ')
+        assert metrics_mod.dd_read_cmd('/tmp/x.bin').startswith('timeout ')
+        assert metrics_mod.PING_CMD.startswith('timeout ')
+        assert 'LC_ALL=C ping' in metrics_mod.PING_CMD
+        assert '-c 4' in metrics_mod.PING_CMD
+
+    def test_download_commands_fail_fast_and_honest(self):
+        curl_cmd = metrics_mod.NET_DOWNLOAD_SOURCES[0][1]
+        wget_cmd = metrics_mod.NET_DOWNLOAD_SOURCES[1][1]
+        for cmd in (curl_cmd, wget_cmd):
+            assert cmd.startswith('timeout '), cmd
+        assert '--max-time 30' in curl_cmd
+        # -f: 403/5xx обязан стать rc!=0, иначе скорость бан-страницы
+        # выезжает в отчёт как скорость канала; -L: редирект — тоже канал.
+        assert '-sSfL' in curl_cmd, curl_cmd
+        assert ' -T ' in wget_cmd and ' -t 1' in wget_cmd, wget_cmd
+
+
+class TestTimeoutRcReadsAsTimeoutNotAsNoise:
+    def test_external_ip_probe(self):
+        state, addr, why = metrics_mod.parse_external_ip_probe(
+            '', '', 124)
+        assert state == 'failed'
+        assert 'таймаут' in why and 'rc=124' in why
+
+    def test_wrapper_absence_is_not_blamed_on_the_tool(self):
+        # rc=127 принадлежит отсутствующему `timeout`, а curl на месте:
+        # solitary «curl не найдена» отправил бы оператора ставить curl.
+        curl_cmd = metrics_mod.EXTERNAL_IP_SOURCES[0][1]
+        c = FakeSSH(routes=[(curl_cmd, ('', 'bash: timeout: command not found',
+                                        127))])
+        probe = metrics_mod.probe_external_ip(c)
+        assert any('curl не найдена' in n and 'timeout: command not found' in n
+                   for n in probe['notes']), probe['notes']
+
+    def test_dd_timeout(self):
+        mb, note = metrics_mod.parse_dd_speed('', '', 124)
+        assert mb is None and 'таймаут' in note.lower() and '124' in note
+
+    def test_ping_timeout(self):
+        ms, note = metrics_mod.parse_ping_latency('', '', 124)
+        assert ms is None and 'таймаут' in note.lower()
+
+    def test_download_timeout(self):
+        mb, note = metrics_mod.parse_download_speed('', '', 124, 'curl')
+        assert mb is None and 'таймаут' in note.lower()
+
+
+class TestParseRouteGet:
+    def test_src_and_dev_from_raw_line(self):
+        src, dev = metrics_mod.parse_route_get(
+            '1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 0\n')
+        assert src == '10.0.0.5' and dev == 'eth0'
+
+    def test_token_after_src_must_be_an_address(self):
+        # Вывод чужой машины — данные: «src» может вести что угодно, и в
+        # конвейере grep|cut эта проверка терялась вместе с причиной
+        # (2>/dev/null глушил stderr, а grep -P — GNU-расширение).
+        src, dev = metrics_mod.parse_route_get('weird output src not-an-ip')
+        assert src == '' and dev == ''
+
+    def test_empty_output(self):
+        assert metrics_mod.parse_route_get('') == ('', '')
+
+
+class TestNetworkReportRouteSourceHonesty:
+    BASE_TAIL = [('ip r', 'default via 10.0.0.1 dev eth0\n'),
+                 ('ip a', '2: eth0: <B>\n'),
+                 ('ifconfig.me', '203.0.113.9\n')]
+
+    def test_failure_reason_reaches_the_report(self):
+        # Прежний 2>/dev/null глушил RTNETLINK целиком, и отчёт просто молча
+        # терял строку источника.
+        routes = [('route get', ('', 'RTNETLINK answers: Network is '
+                                 'unreachable', 2))] + self.BASE_TAIL
+        out = metrics_mod.network_report(FakeSSH(routes=routes))
+        assert 'IP-адрес источника не определён' in out
+        assert 'Network is unreachable' in out
+
+    def test_no_gateway_route_does_not_print_none(self):
+        # «default dev eth0 scope link» шлюза не имеет; прежний разбор печатал
+        # «(интерфейс None)», а dev есть в самом выводе ip route get.
+        routes = [('route get', '1.1.1.1 dev eth0 src 10.0.0.5 uid 0\n'),
+                  ('ip r', 'default dev eth0 scope link\n'),
+                  ('ip a', '2: eth0: <B>\n'),
+                  ('ifconfig.me', '203.0.113.9\n')]
+        out = metrics_mod.network_report(FakeSSH(routes=routes))
+        assert ('IP-адрес источника для исходящего трафика: 10.0.0.5 '
+                '(интерфейс eth0)') in out
+        assert 'None' not in out
+
+    def test_v6_src_used_when_v4_route_missing(self):
+        routes = [('route get', [
+            ('', 'RTNETLINK answers: Network is unreachable', 2),
+            ('2001:4860:4860::8888 from :: dev eth0 '
+             'src 2001:db8::5 metric 1024\n', '', 0)])] + self.BASE_TAIL
+        out = metrics_mod.network_report(FakeSSH(routes=routes))
+        assert 'IP-адрес источника для исходящего трафика: 2001:db8::5' in out
+        assert 'не определён' not in out
+
+    def test_public_src_differs_no_private_lie(self):
+        # Публичный источник, не совпавший с ответом сервиса: прежний текст
+        # называл ЛЮБОЙ src «приватным IP» и утверждал NAT.
+        routes = [('route get', '1.1.1.1 via 198.51.100.1 dev eth0 '
+                                'src 198.51.100.7\n')] + self.BASE_TAIL
+        out = metrics_mod.network_report(FakeSSH(routes=routes))
+        assert 'приватный IP 198.51.100.7' not in out
+        assert 'публичный, но отличается' in out
+
+    def test_private_answer_is_flagged_as_not_public(self):
+        # ifconfig.me, отвечающий 10.x: split-horizon DNS или прозрачный
+        # прокси. Печатать это как «плавающий IP» без предупреждения —
+        # обещать адрес, которого в публичном интернете нет.
+        routes = [('route get', '1.1.1.1 dev eth0 src 10.0.0.5\n'),
+                  ('ip r', 'default dev eth0 scope link\n'),
+                  ('ip a', '2: eth0: <B>\n'),
+                  ('curl', ('10.0.0.5\n', '', 0)),
+                  ('ip -o addr', '2: eth0    inet 10.0.0.5/24 scope '
+                                 'global eth0\n')]
+        out = metrics_mod.network_report(FakeSSH(routes=routes))
+        assert 'приватный адрес, а не публичный' in out
+
+
+class TestIfconfigFallback:
+    MODERN = ('eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\n'
+              '        inet 203.0.113.9  netmask 255.255.255.255  '
+              'broadcast 0.0.0.0\n'
+              '        inet6 fe80::216:3eff:fe11:2233  prefixlen 64  '
+              'scopeid 0x20<link>\n'
+              'eth0:0  flags=4163<UP,BROADCAST>  mtu 1500\n'
+              '        inet 198.51.100.7  netmask 255.255.255.255\n')
+    OLD = ('eth0      Link encap:Ethernet  HWaddr 52:54:00:11:22:33\n'
+           '          inet addr:10.0.0.5  Bcast:10.0.0.255  '
+           'Mask:255.255.255.0\n'
+           '          inet6 addr: fe80::216:3eff:fe11:2233/64 Scope:Link\n'
+           'lo        Link encap:Local Loopback\n'
+           '          inet addr:127.0.0.1  Mask:255.0.0.0\n')
+
+    def test_modern_net_tools_format(self):
+        m = metrics_mod.parse_ifconfig_addresses(self.MODERN)
+        assert m['203.0.113.9'] == [('eth0', '')]
+        assert m['fe80::216:3eff:fe11:2233'] == [('eth0', '')]
+        # Алиас eth0:0 записан на родительский интерфейс — так же делает
+        # разбор `ip -o addr`, где алиас есть secondary-запись того же eth0.
+        assert m['198.51.100.7'] == [('eth0', '')]
+
+    def test_old_net_tools_format(self):
+        m = metrics_mod.parse_ifconfig_addresses(self.OLD)
+        assert m['10.0.0.5'] == [('eth0', '')]
+        assert m['127.0.0.1'] == [('lo', '')]
+        assert m['fe80::216:3eff:fe11:2233'] == [('eth0', '')]
+
+    def test_absent_ip_falls_back_to_ifconfig(self):
+        # На старых и минимальных машинах `ip` нет, а ifconfig есть — и там
+        # честный ответ доступен, а не «не проверено».
+        c = FakeSSH(routes=[('ip -o addr', ('', 'bash: ip: command not found',
+                                            127)),
+                            ('ifconfig -a', self.MODERN)])
+        note = metrics_mod.interface_bind_note(c, '203.0.113.9')
+        assert 'назначен интерфейсу: eth0' in note
+
+    def test_both_tools_absent_is_still_unchecked(self):
+        c = FakeSSH(routes=[('ip -o addr', ('', 'bash: ip: command not found',
+                                            127)),
+                            ('ifconfig -a', ('', 'bash: ifconfig: command '
+                                             'not found', 127))])
+        note = metrics_mod.interface_bind_note(c, '203.0.113.9')
+        assert 'не проверена' in note
+        assert 'ifconfig' in note
+        assert 'provider NAT' not in note
+
+
+class TestDfFreeParse:
+    OK = ('Filesystem 1024-blocks    Used Available Capacity Mounted on\n'
+          '/dev/vda1     41922560 20123456  19684352  51% /\n')
+
+    def test_free_mb_from_posix_columns(self):
+        mb = metrics_mod.parse_df_free_mb(self.OK, 0)
+        assert mb == 19684352 // 1024
+
+    def test_garbage_and_failure_are_none(self):
+        assert metrics_mod.parse_df_free_mb('', 0) is None
+        assert metrics_mod.parse_df_free_mb(self.OK, 1) is None
+        assert metrics_mod.parse_df_free_mb('Filesystem Inodes\n', 0) is None
+
+
+class TestDiskSpeedRespectsFreeSpace:
+    DD_OK = ('134217728 bytes (134 MB, 128 MiB) copied, 0.4 s, 335 MB/s')
+    RM_ROUTES = [('ls -1 ' + metrics_mod.SPEED_TMP_BASE, '')]
+
+    def test_full_tmp_aborts_before_write(self):
+        # «забитый диск» прежний код встречал минутой гонки dd до ENOSPC;
+        # честный ответ — отменить ДО записи и назвать числа.
+        routes = self.RM_ROUTES + [
+            ('df -k', ('Filesystem 1024-blocks Used Available Capacity '
+                       'Mounted on\ntmpfs 1048576 921600 126976 88% '
+                       '/tmp\n'))]
+        c = FakeSSH(routes=routes)
+        out = metrics_mod.disk_speed_test(c)
+        assert 'тест отменён ДО записи' in out
+        assert '124 МБ' in out
+        assert c.find('dd if=') is None
+
+    def test_enough_space_runs_the_test(self):
+        routes = self.RM_ROUTES + [
+            ('df -k', 'Filesystem 1024-blocks Used Available Capacity '
+                     'Mounted on\ntmpfs 10485760 1024 10484736 1% '
+                     '/tmp\n'),
+            ('conv=fsync', (self.DD_OK, '', 0))]
+        out = metrics_mod.disk_speed_test(FakeSSH(routes=routes))
+        assert '335' in out
+
+    def test_silent_df_does_not_forbid_the_test(self):
+        # Отказ препроверки не даёт права отменять: пусть честно падает dd.
+        c = FakeSSH(routes=self.RM_ROUTES + [('conv=fsync',
+                                              (self.DD_OK, '', 0))])
+        out = metrics_mod.disk_speed_test(c)
+        assert '335' in out and c.count('df -k') == 1
+
+
+class TestZeroSpeedIsNotAResult:
+    def test_dd_zero(self):
+        mb, note = metrics_mod.parse_dd_speed(
+            '0 bytes copied, 0.0 s, 0.0 B/s', '', 0)
+        assert mb is None and 'нулев' in note
+
+    def test_curl_zero(self):
+        mb, note = metrics_mod.parse_download_speed('0.000000', '', 0, 'curl')
+        assert mb is None and 'нулев' in note
+
+    def test_network_speed_never_prints_zero(self):
+        c = FakeSSH(routes=[
+            ('ping -c 4', (TestNetworkSpeedTest.PING_OK, '', 0)),
+            ('curl ', ('0.000000', '', 0)),
+            ('wget ', ('', 'bash: wget: command not found', 127))])
+        out = metrics_mod.network_speed_test(c)
+        assert 'Входящий канал не измерен' in out
+        assert '0.0 MB/s' not in out
+
+
+class TestCurlCutAtMaxTimeIsALowerBound:
+    def test_parse(self):
+        mb, note = metrics_mod.parse_download_speed(
+            '7500000', 'curl: (28) Operation timed out after 30000 '
+            'milliseconds', 28, 'curl')
+        assert mb is not None and abs(mb - 7.5) < 0.01
+        assert 'нижняя граница' in note
+
+    def test_report_marks_it(self):
+        c = FakeSSH(routes=[
+            ('ping -c 4', (TestNetworkSpeedTest.PING_OK, '', 0)),
+            ('curl ', ('7500000', 'curl: (28) Operation timed out', 28))])
+        out = metrics_mod.network_speed_test(c)
+        assert '7.5 MB/s' in out and 'нижняя граница' in out
+
+
+class TestPingHonestLossAndLocale:
+    def test_total_loss_reason_has_single_percent(self):
+        # Прежний литерал 'потеряно 100%% пакетов' не проходил через
+        # оператор % и печатал двойной процент прямо в отчёт.
+        ms, note = metrics_mod.parse_ping_latency(
+            'PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.\n'
+            '4 packets transmitted, 0 received, 100% packet loss', '', 1)
+        assert ms is None
+        assert '100% пакетов' in note and '%%' not in note
+        # Причина — строка потерь, а не безобидная шапка «PING ... bytes».
+        assert 'bytes of data' not in note
+
+    def test_total_loss_at_zero_rc_is_loss_not_missing_rtt(self):
+        ms, note = metrics_mod.parse_ping_latency(
+            '4 packets transmitted, 0 received, 100% packet loss', '', 0)
+        assert ms is None and '100%' in note
+
+    def test_wget_uppercase_kb_unit(self):
+        mb, _ = metrics_mod.parse_download_speed('64 KB/s', '', 0, 'wget')
+        assert mb is not None and abs(mb - 0.064) < 1e-9
+
+
+class TestSpeedCommandsAreExecutable:
+    """P0 1.33.x: `timeout N LC_ALL=C <cmd>` НЕИСПОЛНЯЕМА: shell разбирает
+    присваивание только перед командным словом, а первое слово здесь timeout
+    — он берёт «LC_ALL=C» как argv[0] и выходит rc=126/127 (живьём, coreutils
+    9.11). FakeSSH матчит подстроки и shell не исполняет — поэтому контрактом
+    служит форма, но форма ИСПОЛНЯЕМОЙ команды (фиксится одной строкой —
+    тест не даёт форме уехать обратно)."""
+
+    def test_env_prefix_before_every_speed_probe(self):
+        import re as _re
+        for cmd in (metrics_mod.dd_write_cmd('/tmp/x.bin'),
+                    metrics_mod.dd_read_cmd('/tmp/x.bin'),
+                    metrics_mod.PING_CMD,
+                    metrics_mod.NET_DOWNLOAD_SOURCES[0][1],
+                    metrics_mod.NET_DOWNLOAD_SOURCES[1][1]):
+            assert _re.match(r'timeout \d+ env LC_ALL=C ', cmd), cmd
+
+    def test_df_free_uses_posix_single_line(self):
+        # Без -P длинное имя LVM-устройства переносит поля на вторую строку,
+        # парсер читает шапку и препровервка места молча мертва.
+        assert 'df -k -P' in metrics_mod.DF_FREE_CMD
+
+
+class TestParseFstype:
+    def test_stat_answer_wins(self):
+        assert metrics_mod.parse_fstype('ext4\n', 0, '', 0) == 'ext4'
+
+    def test_df_fallback_skips_header(self):
+        out = ('Filesystem     Type 1K-blocks    Used Available Use% '
+               'Mounted on\n/dev/mapper/vg--verylong-lv ext4 10485760 '
+               '1048576 9000000 11% /tmp\n')
+        assert metrics_mod.parse_fstype('', 127, out, 0) == 'ext4'
+
+    def test_silence_is_unknown_not_a_guess(self):
+        assert metrics_mod.parse_fstype('', 0, '', 0) == ''
+        assert metrics_mod.parse_fstype('', 127, '', 1) == ''
+
+
+class TestDiskSpeedTmpfs:
+    DD_OK = ('134217728 bytes (134 MB, 128 MiB) copied, 0.4 s, 335 MB/s')
+
+    def test_tmpfs_warns_and_disk_verdict_not_printed(self):
+        # /tmp на systemd — RAM: dd+fsync мерит память, а вердикт «NVMe —
+        # отлично» врал бы в десятки раз.
+        c = FakeSSH(routes=[('conv=fsync', (self.DD_OK, '', 0)),
+                            ('stat -f -c %T', 'tmpfs\n')])
+        out = metrics_mod.disk_speed_test(c)
+        assert 'оперативной памяти' in out
+        assert 'NVMe' not in out and 'не интерпретируется' in out
+
+    def test_real_disk_keeps_verdict(self):
+        c = FakeSSH(routes=[('conv=fsync', (self.DD_OK, '', 0)),
+                            ('stat -f -c %T', 'ext4\n')])
+        out = metrics_mod.disk_speed_test(c)
+        assert 'NVMe/SSD — отлично' in out
+        assert 'оперативной памяти' not in out
+
+
+class TestExternalIpHonesty:
+    ROUTES_IP = ('1: lo: <LOOPBACK>\n    inet 127.0.0.1/8 scope host lo\n'
+                 '2: eth0: <BROADCAST>\n    inet 10.0.0.5/24 scope global eth0\n')
+    ROUTES_R = ('default via 10.0.0.1 dev eth0 proto dhcp metric 100\n')
+
+    def _base(self, extra):
+        return [('route get', '1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5\n'),
+                ('ip r', self.ROUTES_R), ('ip a', self.ROUTES_IP)] + extra
+
+    def test_all_absent_prints_wrapper_reason(self):
+        # Без coreutils timeout все три rc=127 принадлежат ОБОЛОЧКЕ: голое
+        # «установите curl/wget/dig» отправило бы ставить установленное.
+        out = metrics_mod.network_report(FakeSSH(routes=self._base([
+            ('curl', ('', 'sh: timeout: command not found', 127)),
+            ('wget', ('', 'sh: timeout: command not found', 127)),
+            ('dig', ('', 'sh: timeout: command not found', 127))])))
+        assert 'timeout: command not found' in out
+
+    def test_cross_family_pair_is_not_a_nat_arrow(self):
+        # Dual-stack: NAT по v4 + публичный v6 — curl ушёл в v6, src остался
+        # v4; стрелка «приватный 10.x -> плавающий 2001:...» фабриковала бы
+        # NAT, которого в этом стеке нет.
+        out = metrics_mod.network_report(FakeSSH(routes=self._base([
+            ('ifconfig.me', '2001:db8::42\n')])))
+        assert 'разные адресные семьи' in out
+        assert 'трафик идёт через NAT' not in out

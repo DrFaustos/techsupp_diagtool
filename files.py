@@ -1,9 +1,10 @@
 """Работа с файлами/конфигами, замена IP, перезапуск служб."""
 import ipaddress
+import re
 from datetime import datetime
 
 from common import (BACKUP_SUBDIRS, q, ensure_backup_dir, create_backup,
-                    create_backup_info,
+                    create_backup_info, backup_stamp,
                     write_remote_file, RF_TEXT, read_file_info,
                     find_files_info, FF_DIR_TEXT,
                     # Состояние юнита спрашивает ОДНА функция (1.32.6):
@@ -181,10 +182,23 @@ def get_config_files_info(checker, panel_type):
                 notes.append(note)
 
     for path in PANEL_CONFIG_PATHS.get(panel_type, []):
+        # LC_ALL=C: классификатор ниже читает текст errno, а на сервере с
+        # ru_RU find пишет «Отказано в доступе» — ветка «нет прав» молчала бы
+        # и закрытый каталог подавался бы как «прочитан, файлов нет» (тот же
+        # закон 1.32.12, из-за которого текстовые признаки вытесняются rc;
+        # здесь rc не различает миры — find даёт 0 и с предупреждениями).
         out, err = checker.exec_command(
-            f'find {q(path)} -type f | head -{CONFIG_LIMIT}')
-        files.extend(line.strip() for line in (out or '').splitlines()
-                     if line.strip())
+            f'LC_ALL=C find {q(path)} -type f | head -{CONFIG_LIMIT}')
+        # Из строки убираем ТОЛЬКО перевод строки. strip() резал бы и пробелы
+        # на краях имени: «/etc/nginx/vhosts/мой сайт .conf» превращалось бы в
+        # путь без пробела на конце, редактор открывал бы его, а «Сохранить»
+        # писал бы по СОСРЕДОТОЧЕННОМУ пути — то есть заводил бы второй файл
+        # рядом с настоящим (тот же закон, что у read_file: возвращаемое
+        # значение редактор вернёт на сервер байт в байт).
+        for line in (out or '').split('\n'):
+            found = line.rstrip('\r')
+            if found.strip():
+                files.append(found)
         low = (err or '').lower()
         why = next((l.strip() for l in (err or '').splitlines() if l.strip()),
                    '')[:160]
@@ -192,8 +206,14 @@ def get_config_files_info(checker, panel_type):
             note = FF_DIR_TEXT['noperm'].format(path=path, why=why)
         elif 'no such file' in low:
             note = FF_DIR_TEXT['missing'].format(path=path, why=why)
+        elif why:
+            # Любой нераспознанный stderr — «не проверено», а не «файлов
+            # нет»: I/O error, 'find: command not found', прочий errno (rc
+            # пайпа принадлежит head и нам не принадлежит). Молчать здесь
+            # значило бы подать сломанный спрос как честный пустой ответ.
+            note = FF_DIR_TEXT['blocked'].format(path=path, why=why)
         else:
-            # Пустой вывод без ошибки: каталог прочитан, файлов нет — честный
+            # Пустой вывод БЕЗ ошибки: каталог прочитан, файлов нет — честный
             # ответ. Жалоба на него обесценила бы настоящие предупреждения
             # (то же решение, что в 1.24.0–1.26.0).
             note = None
@@ -215,6 +235,36 @@ def get_config_files(checker, panel_type):
 
 
 # ==================== ЗАМЕНА IP ====================
+# Адрес уходит в sed-паттерн, поэтому права на подстановку даёт НЕ «валиден ли
+# IP», а алфавит строки. Замер живьём на интерпретаторе проекта (Python 3.15):
+# IPv6Address("fe80::1%'; touch PWN ; '") — ВАЛИДЕН (scope ID после '%' принимает
+# произвольный ASCII), а апостроф разрывает кавычение 's/.../.../g' — то есть
+# «проверили IP» раньше не значило «в команде только адрес» (1.32.30).
+_IP_TEXT_RE = re.compile(r'[0-9a-fA-F:.]+\Z')
+
+# Заглушка для re.search, когда маркера прав в выводе нет: «прав не снято»,
+# а не «прав 000» — пустая строка в отчёте честнее выдуманного значения.
+_NO_MODE = type('_NoMode', (), {'group': staticmethod(lambda n: '')})
+
+
+def _ip_in_sed(value):
+    """True, если строка — адрес из допустимого алфавита, иначе False.
+
+    Только [0-9a-fA-F:.]: без '/', '%', пробелов и кавычек. Кавычки и перевод
+    строки исключаются самим классом, поэтому метасимволы в sed невозможны.
+
+    Право на подстановку имеет ТОЛЬКО str. Не-строку (int) принимал
+    ipaddress.IPv4Address(1) — валидатор пропускал, `_sed_ip_pattern` падал на
+    value[0] (замер на venv 3.15: TypeError 'int' object is not subscriptable),
+    а прошла бы такая строка через `str()` — sed выжигал бы одиночную цифру во
+    всём /etc. Короткие формы («1», «01.2.3.4», «1.2») отбраковывает сам
+    ipaddress — замер на venv 3.15: AddressValueError, поэтому алфавита и
+    проверки типа хватает; ослаблять их нельзя (пункт 5 закона серии:
+    не-строка — это не адрес).
+    """
+    return isinstance(value, str) and bool(_IP_TEXT_RE.match(value))
+
+
 def _valid_ipv4(value):
     try:
         ipaddress.IPv4Address(value)
@@ -231,23 +281,120 @@ def _valid_ipv6(value):
         return False
 
 
+def _sed_ip_pattern(value):
+    r"""BRE-паттерн sed для адреса: точки экранированы, границы слова по месту.
+
+    Неэкранированная точка матчит любой символ (замер паттерна: 1.2.3.4
+    попадал в 211x2x3x4x5). Границы \</\> защищают от подстрочных попаданий
+    (1.2.3.4 внутри 211.2.3.45 — замер до правки: портило чужие конфиги).
+    Границы ставятся только там, где они вообще способны сработать: в GNU sed
+    ':' — не-word символ, и \</ перед паттерном, начинающимся с ':' ( '::1' ),
+    не матчится никогда — замена молча не происходит (замер sed 4.10:
+    'b=::1' c \</::1\>/ не изменился, без границ — изменился).
+    """
+    body = str(value).replace('.', '\\.')
+    if body[0].isalnum() or body[0] == '_':
+        body = '\\<' + body
+    if body[-1].isalnum() or body[-1] == '_':
+        body = body + '\\>'
+    return body
+
+
+def _etc_backup_or_veto(checker, lines):
+    """Резерв /etc перед массовой заменой; путь к резерву или None (операция снята).
+
+    Прежняя ipv6-ветка печатала «не удалось создать резерв (продолжаем)» и
+    шла переписывать /etc без средства отката, а ipv4-ветка вообще не делала
+    резерва (закон серии: право на destructive-операцию даёт записанный
+    откат, а не обещание).
+    """
+    ensure_backup_dir(checker)
+    ts = backup_stamp()
+    etc_backup = f"{BACKUP_SUBDIRS['configs']}/etc_{ts}.tar.gz"
+    # Архив /etc — это тень /etc/shadow, ключей и панельных паролей. Без umask
+    # он создаётся по umask вызывающего (замер на venv-машине, GNU tar 1.35:
+    # без umask файл 0644 — читать может любой локальный пользователь сервера),
+    # то есть «мы сделали откат» оборачивалась бы выгрузкой секретов в общее
+    # место. umask 077 ставится ДО создания файла (права должны быть у файла с
+    # первой секунды, а не «записали, потом починили» — тот же порядок, что у
+    # prepare_secret_file), chmod 600 — страховка для случая, когда файл уже
+    # занимали. Код возврата отдаём ТАРОВСКИЙ (__tar): chmod не имеет права ни
+    # отменить успех резерва, ни объявить его провалом.
+    # -P убирает служебную строку «Removing leading /»: иначе при провале её
+    # печатают ПЕРВОЙ и оператор читает её как причину (замер tar 1.35 на
+    # битом пути: без -P первая строка — именно это уведомление, а не ошибка).
+    q_backup = q(etc_backup)
+    out, err, brc = checker.run(
+        f'umask 077; tar czf {q_backup} -P /etc 2>&1; __tar=$?; '
+        f'chmod 600 {q_backup} 2>/dev/null; '
+        f'printf "\\nARCHMODE=%s\\n" "$(stat -c %a {q_backup} 2>/dev/null)"; '
+        f'exit $__tar')
+    body = '\n'.join([(out or ''), (err or '')])
+    why = next((l.strip() for l in (out or err or '').splitlines()
+                if l.strip() and not l.startswith('ARCHMODE=')), '')[:160]
+    if brc == 1:
+        # Замер (GNU tar 1.35): rc=1 — это НЕ «архива нет», а «файл изменился
+        # во время чтения»: архив на диске и в нём есть почти всё, но один
+        # файл внутри может быть рассогласован. «Резерв не создан» соврал бы
+        # про факт (файл создан), а «резерв готов» врал бы про смысл (откат,
+        # который не ручается за весь /etc, откатом не считается). Операцию
+        # это по-прежнему снимает.
+        lines.append('⚠️ Резерв /etc неполный (tar rc=1'
+                     + (f': {why}' if why else '') + f'): архив {etc_backup} '
+                     'создан, но часть файлов могла измениться при считывании.')
+        lines.append('❌ Правка снята: рассогласованный откат откатом не '
+                     'считаем; повторите замену, когда /etc затихнет.')
+        return None
+    if brc != 0:
+        lines.append(f'❌ Правка снята: резерв /etc не создан (rc={brc}'
+                     + (f': {why}' if why else '') + '). Без отката массовую '
+                     'замену не отправляем.')
+        return None
+    # Права названы СНИМКОМ, а не намерением: «сделали 0600» без stat — то же
+    # обещание без замера, из-за которого вся серия воюет с кодами «на веру».
+    mode = (re.search(r'ARCHMODE=(\S+)', body) or _NO_MODE).group(1)
+    if mode != '600':
+        lines.append(f"⚠️ Резерв /etc НЕ защищён от чтения другими "
+                     f"пользователями (права {mode or 'не сняты'}): архив "
+                     f"содержит /etc/shadow и ключи. Правку делаем, но "
+                     f"файл {etc_backup} надо снять или закрыть вручную.")
+    lines.append(f'✅ Резервная копия /etc: {etc_backup} '
+                 f'(откат: tar xzf {q(etc_backup)} -C /)')
+    return etc_backup
+
+
 def replace_ipv4(checker, old_ip, new_ip):
-    """Замена старого IPv4 на новый во всех *.conf в /etc (как в ручной команде)."""
+    """Замена старого IPv4 на новый во всех *.conf в /etc (как в ручной команде).
+
+    Право на подстановку даёт алфавит строки (_ip_in_sed), а не только факт
+    валидности адреса; sed-паттерн экранирован и ограничен границами слова.
+    """
     lines = [f"=== ЗАМЕНА IPv4: {old_ip} -> {new_ip} ==="]
-    if not (_valid_ipv4(old_ip) and _valid_ipv4(new_ip)):
+    if not (_valid_ipv4(old_ip) and _valid_ipv4(new_ip)
+            and _ip_in_sed(old_ip) and _ip_in_sed(new_ip)):
         lines.append("❌ Некорректный IPv4-адрес — операция отменена.")
         return "\n".join(lines)
-    # Экранируем точки, как в исходной команде: s#123\.123\.123\.123#...#g
-    old_escaped = old_ip.replace('.', '\\.')
-    new_escaped = new_ip.replace('.', '\\.')
+    etc_backup = _etc_backup_or_veto(checker, lines)
+    if etc_backup is None:
+        return "\n".join(lines)
+    # Экранируем точки и границы: s#\<1\.2\.3\.4\>#...#g
     cmd = (
         f"find /etc -type f -name \"*.conf\" "
-        f"-exec sed -i -e 's#{old_escaped}#{new_escaped}#g' '{{}}' \\;"
+        f"-exec sed -i -e 's#{_sed_ip_pattern(old_ip)}#{new_ip}#g' '{{}}' \\;"
     )
     out, err, rc = checker.run(cmd)
-    if rc != 0:
-        lines.append(f"⚠️ Возможны ошибки (rc={rc}): {err.strip() or out.strip()}")
-    lines.append("✅ IPv4 заменён во всех .conf-файлах в /etc.")
+    if rc == 0:
+        lines.append("✅ IPv4 заменён во всех .conf-файлах в /etc (rc=0).")
+    else:
+        # Прежняя форма печатала «✅ заменён» и здесь тоже: частичный провал
+        # (часть файлов не переписана — права, read-only) читался как полный
+        # успех. Полноту по этому rc утверждать нельзя, но и «ничего не
+        # сделано» — нельзя: какие файлы переписались, не измеряно.
+        why = next((l.strip() for l in (err or out or '').splitlines()
+                    if l.strip()), '')[:160]
+        lines.append(f"⚠️ Замена НЕ подтверждена целиком (rc={rc}"
+                     + (f': {why}' if why else '') + f'). Часть файлов может '
+                     f'быть не переписана; резерв: {etc_backup}')
     lines.append("")
     lines.append("=== ПРОВЕРКА КОНФИГУРАЦИИ NGINX ===")
     out_nginx, _ = checker.exec_command('nginx -t 2>&1')
@@ -263,30 +410,34 @@ def replace_ipv4(checker, old_ip, new_ip):
 def replace_ipv6(checker, old_ip, new_ip):
     """Замена старого IPv6 на новый во всех файлах в /etc (как в ручной команде).
 
-    old_ip/new_ip строго валидируются как IPv6 — это исключает инъекцию команд,
-    поскольку в shell подставляются только проверенные [0-9a-fA-F:].
+    Раньше комментарий утверждал: «strictly валидируются → инъекция
+    исключена». Это было ложью: IPv6Address принимает scope ID после '%'
+    (замер на venv проекта: "fe80::1%'; touch PWN ; '" — VALID), а scope —
+    произвольный ASCII. Теперь право на подстановку даёт алфавит
+    (_ip_in_sed: только [0-9a-fA-F:.]), а не факт валидности.
     """
     lines = [f"=== ЗАМЕНА IPv6: {old_ip} -> {new_ip} ==="]
-    if not (_valid_ipv6(old_ip) and _valid_ipv6(new_ip)):
+    if not (_valid_ipv6(old_ip) and _valid_ipv6(new_ip)
+            and _ip_in_sed(old_ip) and _ip_in_sed(new_ip)):
         lines.append("❌ Некорректный IPv6-адрес — операция отменена.")
         return "\n".join(lines)
 
-    # Автобэкап /etc перед массовой заменой (сама команда замены не меняется)
-    ensure_backup_dir(checker)
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    etc_backup = f"{BACKUP_SUBDIRS['configs']}/etc_{ts}.tar.gz"
-    _, _, brc = checker.run(f"tar czf {q(etc_backup)} /etc 2>/dev/null")
-    if brc == 0:
-        lines.append(f"✅ Резервная копия /etc создана: {etc_backup}")
-    else:
-        lines.append("⚠️ Не удалось создать резервную копию /etc (продолжаем)")
+    # Автобэкап /etc перед массовой заменой — и вето, если резерв не записан.
+    etc_backup = _etc_backup_or_veto(checker, lines)
+    if etc_backup is None:
+        return "\n".join(lines)
 
-    # old_ip/new_ip прошли строгую проверку IPv6Address -> метасимволы невозможны.
-    cmd = f"find /etc -type f -exec sed -i 's/{old_ip}/{new_ip}/g' {{}} +"
+    cmd = (f"find /etc -type f -exec sed -i "
+           f"'s/{_sed_ip_pattern(old_ip)}/{new_ip}/g' {{}} +")
     out, err, rc = checker.run(cmd)
-    if rc != 0:
-        lines.append(f"⚠️ Возможны ошибки (rc={rc}): {err.strip() or out.strip()}")
-    lines.append("✅ IPv6 заменён во всех файлах в /etc.")
+    if rc == 0:
+        lines.append("✅ IPv6 заменён во всех файлах в /etc (rc=0).")
+    else:
+        why = next((l.strip() for l in (err or out or '').splitlines()
+                    if l.strip()), '')[:160]
+        lines.append(f"⚠️ Замена НЕ подтверждена целиком (rc={rc}"
+                     + (f': {why}' if why else '') + f'). Часть файлов может '
+                     f'быть не переписана; резерв: {etc_backup}')
     lines.append("")
     lines.append("=== ПРОВЕРКА КОНФИГУРАЦИИ NGINX ===")
     out_nginx, _ = checker.exec_command('nginx -t 2>&1')

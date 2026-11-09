@@ -23,6 +23,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import shlex
+import shutil
 import subprocess
 
 import pytest
@@ -191,7 +192,8 @@ class TestSiteStatus:
     def test_parse(self):
         assert dc.parse_site_status(
             'HTTP=200\nHTTPS=301\nSSL=ok\nCERT=87') == \
-            {'http': '200', 'https': '301', 'ssl': 'ok', 'cert_days': 87}
+            {'state': 'checked', 'http': '200', 'https': '301',
+             'ssl': 'ok', 'cert_days': 87}
 
     def test_parse_expired_certificate_is_negative(self):
         # Истёкший сертификат — отрицательное число дней: «истёк 3 дня назад»
@@ -205,10 +207,22 @@ class TestSiteStatus:
         assert dc.parse_site_status('SSL=none\nCERT=none')['cert_days'] is None
 
     def test_empty_codes_become_000(self):
-        assert dc.parse_site_status('') == {'http': '000', 'https': '000',
+        assert dc.parse_site_status('') == {'state': 'checked',
+                                            'http': '000', 'https': '000',
                                             'ssl': '', 'cert_days': None}
         assert dc.parse_site_status('HTTP=\nHTTPS=') == \
-            {'http': '000', 'https': '000', 'ssl': '', 'cert_days': None}
+            {'state': 'checked', 'http': '000', 'https': '000',
+             'ssl': '', 'cert_days': None}
+
+    def test_missing_curl_is_no_tool_not_silence(self):
+        # 1.32.30: без curl подстановки пусты, коды «000» — и отсутствие
+        # инструмента распадалось бы как «сайт молчит». Маркер самопроверки
+        # команды обязан дать отдельное состояние; пустой stdout без маркера —
+        # по-прежнему 'checked' (обрыв канала молчит про пробу, а не про
+        # инструмент).
+        no_tool = dc.parse_site_status('TOOL=curl-missing\n')
+        assert no_tool['state'] == 'no_tool'
+        assert dc.parse_site_status('')['state'] == 'checked'
 
     def test_generated_command_is_valid_shell(self):
         # Команды уходят на сервер как есть — разбор shlex обязан сходиться
@@ -2830,12 +2844,16 @@ class TestMailboxCommands:
         cmd = dc.isp_mailbox_delete_command('info@example.com')
         assert 'email.delete' in cmd and 'elid=info@example.com' in cmd
 
-    def test_fp_create_matches_kb(self):
-        # KB FASTPANEL: mogwai emails boxes create --domain --login --password
-        cmd = dc.fp_mailbox_create_command('info', 'example.com', 'pw 12345')
-        assert 'mogwai emails boxes create' in cmd
-        assert '--domain=example.com' in cmd and '--login=info' in cmd
-        assert "--password='pw 12345'" in cmd
+    def test_fp_argv_password_builder_is_gone(self):
+        # Сборщик `mogwai emails boxes create --password=<секрет>` удалён
+        # вместе с операцией: единственный канал пароля у mogwai — argv,
+        # честного env/файлового/stdin-носителя нет, а оставленная функция —
+        # взведённый пистолет: любой будущий вызов уведёт секрет в ps и
+        # историю shell. Удаление держится тестом, чтобы «восстановить
+        # сборщик по памяти» было нельзя без осознанной правки этого теста.
+        assert not hasattr(dc, 'fp_mailbox_create_command')
+        # Удаление ящика — без секрета, оно живое:
+        assert callable(dc.fp_mailbox_delete_command)
 
     def test_fp_delete_takes_numeric_id_only(self):
         assert dc.fp_mailbox_delete_command(7) == \
@@ -2872,14 +2890,16 @@ class TestMailboxCommands:
         Проверяем другое: каждый токен, куда попало значение, начинается с имени
         параметра. Кривая кавычка распала бы '$(rm -rf /)' на отдельные
         аргументы (rm, -rf) — вот это и есть настоящая инъекция.
+
+        fp_mailbox_create_command здесь больше нет: её удалён держит отдельный
+        тест, а проверять инъекцию в команду, которую инструмент не собирает,
+        бессмысленно. fp-delete защищён int() и стоит своим тестом.
         """
-        evil = "x'$(rm -rf /)`tick`\"dq\""
         prefixes = ('--password=', 'elid=', 'name=', 'domainname=', 'plid=')
         for cmd in (dc.isp_mailbox_delete_command('a@ex.com; rm -rf /'),
                     dc.isp_mailbox_env_command(
                         dc.isp_mailbox_create_args('a; rm -rf /',
-                                                   'ex.com; rm -rf /')),
-                    dc.fp_mailbox_create_command('a', 'ex.com', evil)):
+                                                   'ex.com; rm -rf /'))):
             parts = shlex.split(cmd)
             tainted = [p for p in parts if 'rm -rf' in p]
             assert tainted, cmd                       # значение дошло, а не исчезло
@@ -3153,8 +3173,11 @@ class TestRedactSecrets:
         assert dc.redact_secrets(cmd) == cmd
 
     def test_plain_values_masked(self):
-        out = dc.redact_secrets(dc.fp_mailbox_create_command('a', 'ex.com',
-                                                            'pw12345678'))
+        # Формат argv-строки mogwai (тот, ради которого удалён сборщик):
+        # панель может эхом вернуть её в тексте ошибки — и тогда маска обязана
+        # сработать на чужом тексте, не только на нашей команде.
+        out = dc.redact_secrets("mogwai emails boxes create "
+                                "--password='pw12345678'")
         assert 'pw12345678' not in out and '--password=***' in out
 
     def test_multiline_output_masked_by_regex(self):
@@ -3545,13 +3568,24 @@ class TestMailboxActionsFastpanel:
         ('mogwai emails boxes list', 'ID\tADDRESS\n5\tinfo@example.com\n'),
     ]
 
-    def test_create_uses_kb_command(self):
+    def test_create_is_refused_before_any_panel_contact(self):
+        # Единственный канал пароля у mogwai — argv (--password=аргумент),
+        # env/файл/stdin документированы не были, а трюк mgrctl
+        # «-e passwd=$ENV» к mogwai не переносится. Значит ящик здесь нельзя
+        # завести, не показав секрет в ps: операция отказана ЦЕЛИКОМ, и отказ
+        # обязан случиться до guard'а, который читает mogwai-списки.
         c = FakeSSH(routes=self.FP_ENV)
         out = dc.mailbox_create(c, 'new@example.com', 'Sup3rSecret!',
                                 'fastpanel')
-        assert 'mogwai emails boxes create' in out
-        # ящика new@ в списке mogwai нет (заглушка отдаёт info@) — честное ⚠️
-        assert 'не появился в списке панели' in out
+        # Ни одной команды mogwai, включая читающие guard списки:
+        assert c.find('mogwai') is None
+        assert c.commands == []
+        # Отрицание с причиной и без diagnosis сайту/панели:
+        assert 'НЕ выполнена' in out and 'НЕ создан' in out
+        assert 'не отправлялась' in out
+        assert '--password=' in out and 'ps' in out
+        assert 'Безопасная альтернатива' in out
+        # Секрет не имеет права появиться в отчёте даже как «что не ушло»:
         assert 'Sup3rSecret!' not in out
 
     def test_delete_by_numeric_id(self):
@@ -3631,3 +3665,593 @@ class TestMailServiceStateIsNotSilence:
         block = self._block(out)
         assert 'postfix' in block, block
         assert 'не проверено' in block, block
+
+
+# ==================== 1.32.30: ложь пустого stdout по rc ====================
+# Правки ревью одной темой: «мы не спросили / не получили» и «записей нет»
+# обязаны печататься РАЗНЫМИ словами. Заперты шесть случаев: ложный SPF при
+# rc=9 dig, молчаливая панель с ERROR=, счётчик ящиков при нечитаемом
+# источнике, проба сайта без curl, состояния DNS-блока досье и «не найден» при
+# закрытом каталоге vhost'ов.
+
+COMMS_ERR = ';; communications error to 127.0.0.1#53: connection refused\n'
+DIG_MISSING = ('', 'bash: dig: command not found', 127)
+
+
+class TestLocalDigCarrier:
+    """Локальные спросы SPF/DKIM/DMARC/PTR идут через носителя dig (rc решает)."""
+
+    def _auth_routes(self, **over):
+        base = {
+            'mgrctl -m ispmgr maildomain': 'name=lie.ru elid=1\n',
+            'cat /etc/resolv.conf': 'nameserver 127.0.0.53\n',
+            'mgrctl -m ispmgr dnszone': '',
+            'dig +short A lie.ru': '93.184.216.34\n',
+            'dig +short TXT lie.ru': '',
+            'dig +short TXT _dmarc.lie.ru': '',
+            'for __dk in': '',
+            'dig +short -x': '',
+        }
+        base.update(over)
+        return list(base.items())
+
+    def test_rc9_error_line_is_not_spf_diagnosis(self):
+        # Главный случай: dig при недоступном резолвере печатает «;;
+        # communications error» в STDOUT при rc=9. Прежний parse_dns_txt
+        # принимал это за TXT, а пустота при том же rc подписывалась «SPF нет»
+        # с СОВЕТОМ добавить TXT — второй TXT на живой зоне это PermError.
+        c = FakeSSH(routes=self._auth_routes(**{
+            'dig +short TXT lie.ru': (COMMS_ERR, '', 9),
+            'dig +short TXT _dmarc.lie.ru': (COMMS_ERR, '', 9),
+            'for __dk in': ('dkim._domainkey.lie.ru|;; communications error\n'
+                            ';; no servers could be reached\n', 'refused', 9),
+            'dig +short -x': (COMMS_ERR, '', 9),
+        }))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'TXT-записей у домена нет вообще' not in out   # ложный диагноз
+        assert not _fix_lines(out, 'SPF')                     # ложный совет
+        assert not _fix_lines(out, 'DKIM')
+        assert 'не получены' in out
+        assert 'нельзя назвать' in out or 'назвать это «записи нет» нельзя' in out
+        assert 'Провалено: 0, с замечаниями: 1' in out
+
+    def test_rc127_is_not_checked_not_missing(self):
+        # Нет бинарника dig — «не проверено», а не «записей нет ни у чего».
+        c = FakeSSH(routes=self._auth_routes(**{
+            'dig +short A lie.ru': DIG_MISSING,
+            'dig +short TXT lie.ru': DIG_MISSING,
+            'dig +short TXT _dmarc.lie.ru': DIG_MISSING,
+            'for __dk in': DIG_MISSING,
+        }))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'не проверено' in out
+        assert 'TXT-записей у домена нет вообще' not in out
+        assert not _fix_lines(out, 'SPF')
+        assert 'PTR не проверен: A-запись не получена' in out
+
+    def test_rc0_empty_zone_still_gets_honest_diagnosis_and_hint(self):
+        # Тупик проверки: фикс НЕ должен заглушить честный случай. Сервер
+        # ответил (rc=0) и молчит — «записей нет» правда, совет нужен.
+        c = FakeSSH(routes=self._auth_routes(**{
+            'dig +short TXT lie.ru': '',
+        }))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert 'TXT-записей у домена нет вообще' in out
+        assert _fix_lines(out, 'SPF')
+
+    def test_dkim_fail_does_not_claim_no_key(self):
+        c = FakeSSH(routes=self._auth_routes(**{
+            'dig +short TXT lie.ru': '"v=spf1 ip4:93.184.216.34 -all"\n',
+            'dig +short TXT _dmarc.lie.ru':
+                '"v=DMARC1; p=reject; rua=mailto:p@lie.ru"\n',
+            'dig +short -x': 'mail.lie.ru.\n',
+            'for __dk in': ('dkim._domainkey.lie.ru|;; communications error\n',
+                            'refused', 9),
+        }))
+        out = dc.mail_auth_report(c, 'ispmanager')
+        assert not _fix_lines(out, 'DKIM')
+        assert 'DKIM  не получены' in out
+        assert 'Провалено: 0, с замечаниями: 1' in out
+
+    def test_local_carrier_costs_the_same_queries(self):
+        # Переезд на носителя не имеет права удорожать прогон: 5 команд с
+        # известным IPv4, 4 без него (тот же замер, что держал старый путь).
+        c = FakeSSH(routes=self._auth_routes(**{'dig +short A lie.ru': ''}))
+        dc.mail_auth_lines(c, 'lie.ru')
+        assert c.count('dig +short ') == 4    # A, SPF, DMARC, цикл DKIM; -x нет
+        c2 = FakeSSH(routes=self._auth_routes(**{'dig +short -x': 'mail.lie.ru.'}))
+        dc.mail_auth_lines(c2, 'lie.ru')
+        assert c2.count('dig +short ') == 5
+
+
+class TestPanelMustAnswer:
+    """ERROR= и rc панели — не «элементов нет»."""
+
+    def test_error_line_is_not_no_sites(self):
+        # rc=0, но «ERROR=...» в stdout: панель ответила ОТКАЗОМ, и молчание
+        # отчёта про сайты было бы ложью про пустой сервер.
+        c = FakeSSH(routes=[('mgrctl -m ispmgr webdomain',
+                             ('ERROR=permission denied\n', '', 0))])
+        out = dc.site_health_report(c, 'ispmanager')
+        assert 'Панель не ответила' in out
+        assert 'mgrctl webdomain' in out
+        assert 'Сайты по панельному списку не проверены' in out
+
+    def test_rc_nonzero_blocks_the_guard_with_the_real_reason(self):
+        # Инвентарь стоит шлюзом к операции: по молчаливой панели guard
+        # отправлял оператора «добавьте домен в панель» — совет менять
+        # конфигурацию по признаку «мы не получили ответ».
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             ('', 'Failed to connect to ispmgr', 255))])
+        domains, notes, blocked = dc.discover_mail_domains_info(c, 'ispmanager')
+        assert domains == {} and notes
+        # Молчание файла тоже пробел (sources не ответили), но ПЕРВЫМ стоит
+        # источник панели: guard берёт blocked[0] и обязан получить именно
+        # панельную причину.
+        assert blocked[0] == 'mgrctl maildomain'
+        refusal = dc.mailbox_guard(c, 'x@nope.ru', 'ispmanager', 'create')
+        assert 'не подтверждён как почтовый домен' in refusal
+        assert 'Панель не ответила' in refusal
+        assert 'Сначала добавьте домен в панель' not in refusal
+
+    def test_zone_error_is_not_not_ns_elsewhere(self):
+        # «сервер не является NS для этих доменов» — утверждение про чужую
+        # инфраструктуру; по не ответившей панели его печатать нельзя.
+        c = FakeSSH(routes=[('mgrctl -m ispmgr dnszone',
+                             ('ERROR=Access denied', '', 0))])
+        out = dc.dns_zones_report(c, 'ispmanager')
+        assert 'Панель не ответила' in out
+        assert 'не является NS' not in out
+
+
+class TestBoxCountCarriesTheReason:
+    """Число ящиков при нечитаемом источнике обязано ссылаться на причину."""
+
+    def test_overview_count_points_at_the_reason(self):
+        c = FakeSSH(routes=[('mailq', 'Mail queue is empty')]
+                    + _mail_routes(closed='/etc/postfix/virtual'))
+        out = dc.mail_overview_report(c, 'none')
+        assert 'Почтовых доменов: 2' in out
+        assert 'ящиков: 1, но см. причину ниже' in out
+
+    def test_dossier_count_prints_the_reason_inline(self):
+        # В досье нет общего блока пробелов — ссылка «ниже» вела бы в пустоту,
+        # поэтому причина печатается сразу за числом.
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain', ISP_WEBDOMAIN),
+            ("/printf 'HTTP=", OK_SITE),
+            ('/etc/postfix/virtual', ('RFSTATE unreadable',
+                                      'cat: Permission denied', 1)),
+            ('/etc/dovecot/users', 'RFSTATE readable\nbox@site1.ru:{SHA}x:y\n'),
+        ])
+        out = dc.domain_detail_report(c, 'site1.ru', 'ispmanager')
+        assert 'ящиков: 1' in out
+        assert 'число ящиков может быть неполным' in out.lower()
+        assert 'прав' in out
+
+
+class TestNoToolIsNotSilence:
+    """Без curl проба не исполнена: «не проверено», а не «❌ молчит»."""
+
+    def test_health_line_and_summary_name_the_tool(self):
+        c = FakeSSH(routes=_site_routes(['gone.ru'],
+                                        {'gone.ru': 'TOOL=curl-missing\n'}))
+        out = dc.site_health_report(c, 'ispmanager')
+        assert 'curl на сервере нет — состояние сайта не проверено' in out
+        assert 'молчит — 1' not in out
+        assert 'не проверено (curl на сервере нет) — 1' in out
+        assert 'Проверено доступности: 0 из 1' in out   # в знаменатель не вошёл
+
+    def test_ssl_report_has_its_own_bucket(self):
+        c = FakeSSH(routes=_site_routes(['gone.ru'],
+                                        {'gone.ru': 'TOOL=curl-missing\n'}))
+        out = dc.ssl_expiry_report(c, 'ispmanager')
+        assert 'СЕРТИФИКАТ НЕ ПРОВЕРЕН' in out
+        assert 'СЕРТИФИКАТ НЕ ПОЛУЧЕН' not in out
+
+    def test_dossier_says_not_checked(self):
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain', ISP_WEBDOMAIN),
+            ("printf 'HTTP=", 'TOOL=curl-missing\n'),
+        ])
+        out = dc.domain_detail_report(c, 'site1.ru', 'ispmanager')
+        assert 'curl на сервере нет' in out
+        assert 'Доступность: http=000' not in out
+
+    def test_summary_counts_no_tool_apart(self):
+        row = ('g.ru', 'no_tool', None, {'state': 'no_tool', 'http': '000',
+                                         'https': '000', 'ssl': '',
+                                         'cert_days': None})
+        out = '\n'.join(dc.site_health_summary(**dc.site_health_counts([row]),
+                                               total=1))
+        assert 'не проверено (curl на сервере нет) — 1' in out
+        assert 'молчит' not in out and 'Не распознано' not in out
+
+
+class TestNoOpensslIsNotBrokenTls:
+    """Нет openssl на сервере: «не чем спросить» ≠ «TLS не работает».
+
+    Слайс 1.32.30 вылечил ту же ложь для curl (отсутствие утилиты печаталось
+    как «сайт молчит»), но openssl-ветка осталась живой: без openssl подстановка
+    TLS пуста, ответ 'SSL=none CERT=none', и отчёт утверждал «https не отвечает»
+    / «отвечает без рабочего TLS» про сайт с живым TLS. Отсутствие инструмента
+    снова становилось диагнозом сайту — здесь тот же класс лжи закрывается для
+    сертификата.
+    """
+
+    # Ответ пробы, где curl коды снял, а сертификат спросить было не чем.
+    NO_SSL = ('TOOL=openssl-missing\nHTTP=200\nHTTPS=200\n'
+              'SSL=none\nCERT=none')
+
+    # ---------- разбор: носитель решения — маркер, не текст ----------
+    def test_openssl_marker_is_a_separate_state(self):
+        st = dc.parse_site_status(self.NO_SSL)
+        assert st['state'] == 'no_cert_tool'
+        # Коды получены — доступность терять нельзя: состояние не 'no_tool'.
+        assert st['http'] == '200' and st['https'] == '200'
+        assert st['cert_days'] is None
+
+    def test_curl_marker_dominates_in_any_marker_order(self):
+        # При двух отсутствующих инструментах команда печатает оба маркера.
+        # 'no_tool' (проба не исполнена) сильнее 'no_cert_tool', и разбор не
+        # имеет права решать «какой маркер последний»: иначе порядок печати в
+        # команде стал бы носителем решения, а им перестал быть намеренно.
+        assert dc.parse_site_status(
+            'TOOL=openssl-missing\nTOOL=curl-missing\n')['state'] == 'no_tool'
+        assert dc.parse_site_status(
+            'TOOL=curl-missing\nTOOL=openssl-missing\n')['state'] == 'no_tool'
+
+    def test_markerless_answer_stays_checked(self):
+        # Регрессия нормального пути разбора: без маркеров состояние прежнее,
+        # новый ключ в состояние не подмешан.
+        assert dc.parse_site_status('HTTP=200\nHTTPS=200\nSSL=ok\nCERT=200'
+                                    )['state'] == 'checked'
+
+    # ---------- самопроверка в той же команде, без второго раунда ----------
+    def test_self_check_adds_no_second_handshake(self):
+        # Самопроверка обоими инструментами обязана жить в ОДНОЙ команде с
+        # пробой: второй SSH-раунд «а есть ли openssl» на домен стоил бы как
+        # сама проба. Значит, кроме одной пары curl (http + https) и одного
+        # s_client, в команде появиться нового сетевого вызова не могло.
+        joined = ' '.join(shlex.split(dc.site_status_command('ex.com')))
+        assert joined.count('command -v openssl') == 1
+        assert joined.count('TOOL=openssl-missing') == 1
+        assert joined.count('TOOL=curl-missing') == 1
+        assert joined.count('openssl s_client') == 1
+        assert joined.count('curl -') == 2   # http- и https-подстановка
+
+    def test_command_without_tools_marks_and_returns_zero(self, tmp_path):
+        # Живой прогон сгенерированной команды (без SSH) в PATH без бинарников:
+        # оба маркера напечатаны, rc=0, проба не исполнена. Носитель решения —
+        # маркеры и код возврата; текст stderr решением быть не может.
+        proc = subprocess.run([shutil.which('sh'),
+                               '-c', dc.site_status_command('ex.invalid')],
+                              capture_output=True, text=True, timeout=60,
+                              env={'PATH': str(tmp_path)})
+        assert proc.returncode == 0
+        assert 'TOOL=curl-missing' in proc.stdout
+        assert 'TOOL=openssl-missing' in proc.stdout
+        assert 'HTTP=' not in proc.stdout   # без curl проба гасится целиком
+
+    def test_command_with_curl_but_without_openssl(self, tmp_path):
+        # Фальшивый curl (печатает 200, сети не трогает) и PATH без openssl:
+        # та же единственная команда и коды сняла, и про отсутствие TLS-
+        # инструмента доложила — самопроверка не остановила пробу, как
+        # остановила бы её curl-ветка. Разбор stdout обязан дать no_cert_tool.
+        fake = tmp_path / 'curl'
+        fake.write_text('#!/bin/sh\necho 200\n')
+        fake.chmod(0o755)
+        proc = subprocess.run([shutil.which('sh'),
+                               '-c', dc.site_status_command('ex.invalid')],
+                              capture_output=True, text=True, timeout=60,
+                              env={'PATH': str(tmp_path)})
+        assert proc.returncode == 0
+        st = dc.parse_site_status(proc.stdout)
+        assert st['state'] == 'no_cert_tool'
+        assert st['https'] == '200'
+        assert 'TLS=' not in proc.stdout   # внутренний мусор в разбор не едет
+
+    # ---------- пометка: отрицание с причиной, не диагноз сайту ----------
+    def test_note_denies_with_reason_and_invents_nothing(self):
+        note = dc.ssl_note(dc.parse_site_status(self.NO_SSL))
+        assert '❓' in note                      # не красное: это «не проверено»
+        assert dc.SSL_TOOL_MISSING_NOTE in note
+        assert 'TLS не проверено: openssl на сервере не найден (rc=127)' in note
+        assert 'установите openssl' in note
+        # Запрещённые вердикты по отсутствующему инструменту:
+        assert 'не работает' not in note
+        assert 'не отвечает' not in note
+        assert 'не получен' not in note   # не спрашивали — «не получен» врать
+        assert 'None' not in note
+
+    def test_tool_note_outranks_silent_https(self):
+        # Молчащий https И отсутствующий openssl: первой обязана быть правда
+        # «спрашивать было не чем» — про несостоявшийся хендшейк код ответа
+        # ничего не знает, и no_cert_reason наврал бы о причине.
+        st = dc.parse_site_status('TOOL=openssl-missing\nHTTP=000\n'
+                                  'HTTPS=000\nSSL=none\nCERT=none')
+        assert dc.cert_note_state(st) == 'no_tool'
+        assert 'openssl' in dc.ssl_note(st)
+
+    def test_icon_dict_has_the_new_state(self):
+        # KeyError в печатающем коде — тот же класс лжи, что «None» в отчёте:
+        # каждый состояние-литерал обязан иметь иконку.
+        assert dc.CERT_STATE_ICON['no_tool'] == '❓'
+
+    # ---------- сводка доступности ----------
+    def test_health_report_separates_tool_from_site(self):
+        c = FakeSSH(routes=_site_routes(['live.ru'], {'live.ru': self.NO_SSL}))
+        out = dc.site_health_report(c, 'ispmanager')
+        # Доступность проверена по-настоящему: curl коды принёс.
+        assert 'HTTPS 2xx/3xx — 1' in out
+        assert 'Проверено доступности: 1 из 1' in out
+        # Сертификат — «не проверено», а не «не получен» и не красное:
+        assert 'SSL: TLS не проверено (openssl на сервере нет) — 1' in out
+        assert 'сертификат не получен' not in out
+        assert 'без рабочего TLS' not in out
+        assert 'None' not in out
+
+    def test_counts_and_summary_survive_new_key(self):
+        # Обратный путь counts → summary(**counts): новый ключ не должен ни
+        # уронить сборку TypeError'ом, ни исчезнуть из вывода.
+        row = ('g.ru', 'ok', 'no_tool', {'state': 'no_cert_tool',
+                                         'http': '200', 'https': '200',
+                                         'ssl': 'none', 'cert_days': None})
+        out = '\n'.join(dc.site_health_summary(**dc.site_health_counts([row]),
+                                               total=1))
+        assert 'TLS не проверено (openssl на сервере нет) — 1' in out
+        assert 'истёк' not in out and 'None' not in out
+
+    # ---------- SSL-отчёт ----------
+    def test_ssl_report_has_its_own_bucket_for_openssl(self):
+        c = FakeSSH(routes=_site_routes(['live.ru'], {'live.ru': self.NO_SSL}))
+        out = dc.ssl_expiry_report(c, 'ispmanager')
+        assert 'СЕРТИФИКАТ НЕ ПРОВЕРЕН (проба без openssl)' in out
+        assert dc.SSL_TOOL_MISSING_NOTE in out
+        # Запрет: вердикт no_cert_reason про несостоявшееся рукопожатие и
+        # сливание с curl-ным блоком («состояние сайта не проверено» про сайт,
+        # чьи коды лежат в той же пробе):
+        assert 'СЕРТИФИКАТ НЕ ПОЛУЧЕН' not in out
+        assert 'не отвечает' not in out
+        assert 'curl на сервере нет' not in out
+        # Шапка обязана назвать категорию сразу, а не прятать под списком:
+        assert 'TLS не проверено — 1' in out
+
+    def test_head_lines_carry_both_categories(self):
+        out = '\n'.join(dc.ssl_expiry_head_lines(not_received=2, not_checked=3))
+        assert 'Сертификат не получен — 2' in out   # прежняя категория цела
+        assert 'TLS не проверено — 3' in out
+        # Прежняя шапка не поехала: при одном only not_received те же две
+        # строки, что и до правки (проверено конкретикой, а не равенством
+        # вызова самому себе).
+        old_head = dc.ssl_expiry_head_lines(not_received=2)
+        assert len(old_head) == 2 and 'Сертификат не получен — 2' in old_head[0]
+        assert dc.ssl_expiry_head_lines() == []
+
+    # ---------- досье ----------
+    def test_dossier_shares_the_formulation(self):
+        # Тот же ответ пробы обязан называться теми же словами, что в сводке:
+        # две формулировки однажды разъехались бы, и оператор не узнал бы свою
+        # беду в другом отчёте.
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain', ISP_WEBDOMAIN),
+            ("printf 'HTTP=", self.NO_SSL),
+        ])
+        out = dc.domain_detail_report(c, 'site1.ru', 'ispmanager')
+        assert dc.SSL_TOOL_MISSING_NOTE in out
+        assert 'http=200' in out                 # доступность проверена
+        assert 'без рабочего TLS' not in out
+        assert 'curl на сервере нет' not in out  # curl на сервере был
+
+
+class TestDossierDigStates:
+    """DNS-блок досье решается состоянием носителя, а не пустотой stdout."""
+
+    def _dossier(self, answers):
+        return dc.domain_detail_report(FakeSSH(routes=[
+            ('mgrctl -m ispmgr webdomain', ISP_WEBDOMAIN),
+            ("printf 'HTTP=", OK_SITE),
+        ] + list(answers.items())), 'site1.ru', 'ispmanager')
+
+    def test_fail_and_none_and_records_are_different_lines(self):
+        out = self._dossier({
+            'dig +short AAAA site1.ru': '',
+            'dig +short A site1.ru': (COMMS_ERR, '', 9),
+            'dig +short MX site1.ru': '10 mail.site1.ru.\n',
+        })
+        assert 'A: ❌ не получены' in out
+        assert 'AAAA: — нет записей' in out
+        assert 'MX: 10 mail.site1.ru.' in out
+
+    def test_unchecked_is_admitted(self):
+        out = self._dossier({'dig +short A site1.ru': DIG_MISSING})
+        assert 'A: ⚠️ не проверено' in out
+
+
+class TestDossierNotFoundIsQualified:
+    def test_closed_vhost_dir_softens_not_found(self):
+        # Закрытый каталог vhost'ов + молчаливое «домен не найден ни в панели,
+        # ни в vhost'ах» = досье, враньём закрывающее тикет живого сайта.
+        c = FakeSSH(routes=[
+            ('ls -1 /etc/nginx/sites-enabled',
+             ('FFDIR noperm /etc/nginx/sites-enabled\n',
+              "ls: cannot open directory: Permission denied", 2)),
+        ])
+        out = dc.domain_detail_report(c, 'ghost.tld', 'none')
+        assert 'не найден' in out
+        assert '«не найден» здесь не значит «нет»' in out
+        assert 'прав' in out
+
+
+class TestDkimJunkIsNotAbsence:
+    """DKIM-цикл печатает «имя|» ДО dig, и сервисная строка dig («;; Warning»
+    при rc=0 — замер dns.py) приезжает за префиксом: носитель parse_dig_records
+    видит строку содержательной, parse_dkim выбрасывает её по отсутствию
+    v=DKIM1 — и вердикт «DKIM-подписи нет» печатался по предупреждению
+    резолвера (1.32.31, ревью)."""
+
+    def test_unusable_helper_sees_junk_behind_prefix(self):
+        assert dc._dkim_recs_unusable(
+            ['dkim._domainkey.lie.ru|;; Warning: query failure: SERVFAIL'])
+        assert not dc._dkim_recs_unusable(
+            ['dkim._domainkey.lie.ru|v=DKIM1 k=rsa p=AAAA'])
+        # продолжение ротированного ключа (без «имя|») — содержательно само.
+        assert not dc._dkim_recs_unusable(
+            ['dkim._domainkey.lie.ru|', '"p=BBBB"'])
+
+    def test_report_says_unreceived_not_absent(self):
+        c = FakeSSH(routes=[
+            ('for __dk in', 'dkim._domainkey.lie.ru|;; Warning: query '
+                            'failure: SERVFAIL\n'),
+            ('dig +short A', '10.0.0.5\n'),
+            ('dig +short TXT', ''),
+        ])
+        _verdict, lines, _ip = dc.mail_auth_lines(c, 'lie.ru')[:3]
+        out = '\n'.join(lines)
+        assert 'не получены' in out
+        # честная строка обязана ОТРЕКАТЬСЯ от ложного диагноза дословно…
+        assert 'Это НЕ «DKIM-подписи нет»' in out
+        # …и не иметь лечивающей подсказки по нему (DNS-совет по «DKIM нет»).
+        assert not any(ln.strip().startswith('→ DKIM') for ln in lines)
+
+
+class TestDkimUnusableHelperUnit:
+    def test_empty_batch_is_unusable(self):
+        # пустую пачку носитель в 'records' не приведёт, но и здесь функция
+        # не должна врать про пригодность.
+        assert dc._dkim_recs_unusable([])
+
+
+# ==================== 1.32.31 (ревью): пустой ответ цикла — не отказ ====================
+class TestDkimHonestEmptyAnswer:
+    """Цикл DKIM при rc=0 печатает «селектор|» НА КАЖДЫЙ селектор, даже когда
+    отвечать нечем. Замер живьём (BIND 9.18.50, реальная сеть, домен без DKIM):
+    rc=0, stderr пустой, stdout = девять строк «имя|» без хвоста. Прежний
+    _dkim_recs_unusable читал «нет ни одной содержательной строки» как
+    «пачка — мусор» и переворачивал честное «записей нет» в «не получены:
+    сервисные строки dig», то есть советовал чинить резолвер вместо настройки
+    DKIM. Двойник из support.py возвращал на цикл пустую строку — мира, в котором
+    дефект виден, в тестах не было (закон файла: двойник обязан говорить то,
+    что говорит система)."""
+
+    NO_RECORDS = ''.join(f'{s}._domainkey.lie.ru|\n'
+                         for s in dc.MAIL_AUTH_SELECTORS)
+
+    def _auth(self, dkim_out, rc=0, err=''):
+        c = FakeSSH(routes=[
+            ('for __dk in', (dkim_out, err, rc)),
+            ('dig +short A', '10.0.0.5\n'),
+            ('dig +short TXT', ''),
+        ])
+        return '\n'.join(dc.mail_auth_lines(c, 'lie.ru')[1])
+
+    def test_all_selectors_answered_empty_is_absence_not_failure(self):
+        out = self._auth(self.NO_RECORDS)
+        assert 'записи нет ни по одному из' in out      # честный диагноз
+        assert 'не получены' not in out                 # и не выдуманный отказ
+        assert 'Это НЕ «DKIM-подписи нет»' not in out
+
+    def test_honest_absence_keeps_its_hint(self):
+        # Честное «записей нет» обязано остаться с подсказкой: иначе фикс
+        # заглушил бы единственную ветку, где совет нужен.
+        lines = dc.mail_auth_lines(FakeSSH(routes=[
+            ('for __dk in', self.NO_RECORDS),
+            ('dig +short A', '10.0.0.5\n'),
+            ('dig +short TXT', ''),
+        ]), 'lie.ru')[1]
+        assert any(ln.strip().startswith('→ DKIM') for ln in lines), lines
+
+    def test_service_line_behind_prefix_is_still_failure(self):
+        # Обратная сторона: одна «;;» за префиксом — это предупреждение
+        # резолвера, и прежний замок цел.
+        out = self._auth('dkim._domainkey.lie.ru|;; Warning: query failure: '
+                         'SERVFAIL\n')
+        assert 'не получены' in out
+        assert 'Это НЕ «DKIM-подписи нет»' in out
+
+    def test_mixed_empty_and_warning_is_failure(self):
+        mixed = ('dkim._domainkey.lie.ru|\n'
+                 'default._domainkey.lie.ru|;; Warning: query failure\n')
+        assert 'не получены' in self._auth(mixed)
+
+    def test_queried_batch_is_usable(self):
+        # Юнит того же решения: пачка «спрошено, ответов нет» пригодна, а
+        # пустой список — нет (решать не по чему).
+        assert not dc._dkim_recs_unusable(['dkim._domainkey.lie.ru|'])
+        assert not dc._dkim_recs_unusable(
+            [f'{s}._domainkey.lie.ru|' for s in dc.MAIL_AUTH_SELECTORS])
+        assert dc._dkim_recs_unusable(
+            ['dkim._domainkey.lie.ru|;; Warning: query failure'])
+
+    def test_local_loop_carries_the_dig_timeout_ceiling(self):
+        # Внешние спросы потолок таймаута уже имели; локальный цикл — нет: на
+        # мёртвом резолвере dig по умолчанию (5 с × 3 попытки) вешал домен на
+        # 9 × 15 с. Потолок задаёт сам dig: `timeout 8` дал бы rc=127 и на
+        # отсутствующий в системе `timeout`, то есть «инструмента нет» там, где
+        # инструмент есть.
+        cmd = dc.dkim_query_command('ex.com')
+        assert dc.DNS_TIMEOUT_ARGS in cmd
+        assert 'timeout 8' not in cmd and '| timeout' not in cmd
+        # dig в цикле один (тело цикла исполняется 9 раз, текст — один).
+        assert cmd.count(dc.DNS_TIMEOUT_ARGS) == 1
+
+
+class TestPanelSilenceOnStderr:
+    """2>/dev/null с mgrctl снят, и stderr теперь доезжает до разбора.
+    Пустой список при непустом stderr — «панель не ответила», а не «элементов
+    нет»; но ЕСТЬ список — предупреждение не имеет права его отменять."""
+
+    def test_empty_list_with_stderr_is_not_no_domains(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr maildomain',
+                             ('', 'Failed to connect to ispgateway: Connection '
+                              'refused', 0))])
+        domains, notes, blocked = dc.discover_mail_domains_info(c, 'ispmanager')
+        assert domains == {}
+        assert any('Панель не ответила' in n and 'Connection refused' in n
+                   for n in notes), notes
+        assert 'mgrctl maildomain' in blocked
+
+    def test_rows_with_a_warning_are_still_trusted(self):
+        # Перестраховка в другую сторону: список получен — молчать про него
+        # из-за строчки в stderr нельзя (иначе фикс породил бы новый вид лжи).
+        c = FakeSSH(routes=[('mgrctl -m ispmgr webdomain',
+                             (ISP_WEBDOMAIN, 'warning: slow gateway', 0))])
+        info = dc.isp_list_info(c, 'webdomain')
+        assert info['reason'] is None
+        assert [r.get('name') for r in info['rows']] == ['site1.ru']
+
+    def test_clean_empty_panel_stays_an_honest_empty_list(self):
+        c = FakeSSH(routes=[('mgrctl -m ispmgr dnszone', ('', '', 0))])
+        info = dc.isp_list_info(c, 'dnszone')
+        assert info == {'rows': [], 'reason': None}
+
+
+class TestSiteProbeHungIsNotSilent:
+    """P1 1.33.x: пробы переведены с exec_command на run(), потому что
+    exec_command выбрасывал rc: дедлайн канала (rc=124) терялся, пустота
+    разбиралась в 000/000 и зависшая проба печаталась как «❌ сайт молчит»
+    про живой сайт."""
+
+    STATUS = {'http': '000', 'https': '000', 'ssl': '', 'cert_days': None,
+              'state': 'hung'}
+
+    def test_parse_rc124_is_hung(self):
+        assert dc.parse_site_status('', rc=124)['state'] == 'hung'
+        # rc=0 при том же пустом выводе — по-прежнему 'checked' (пустота
+        # команды с маркерами — молчание пробы, а не дедлайн).
+        assert dc.parse_site_status('', rc=0)['state'] == 'checked'
+
+    def test_probe_marks_hung_not_silent(self):
+        c = FakeSSH(routes=[('command -v openssl',
+                             ('', 'deadline exceeded after 600s', 124))])
+        probed = dc.site_health_probe(c, [{'domain': 'site.ru'}])
+        assert probed[0][1] == 'hung'
+        out = '\n'.join(dc.site_health_render(probed))
+        assert 'зависла' in out and '❌' not in out
+
+    def test_counts_and_summary_hung_is_unverified_not_silent(self):
+        row = ('site.ru', 'hung', None, self.STATUS)
+        counts = dc.site_health_counts([row])
+        assert counts['hung'] == 1 and counts['unknown'] == 0
+        out = '\n'.join(dc.site_health_summary(**counts, total=1))
+        assert 'проба зависла' in out and 'молчит' not in out

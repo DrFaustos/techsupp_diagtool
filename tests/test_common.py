@@ -10,6 +10,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import shlex
+import re
 
 import pytest
 
@@ -1249,12 +1250,61 @@ class TestPrepareSecretFile:
         prep = c.commands[0]
         assert prep.index('rm -f') < prep.index(': >')
 
+    def test_creation_is_noclobber_and_symlink_is_refused(self):
+        # `rm -f` закрывает «уже лежит», но между ним и созданием лежит целая
+        # SSH-команда: в это окно symlink можно посадить. `: >` по symlink
+        # проходит молча, `>: ` под `set -C` отказывает — поэтому noclobber
+        # обязан стоять ДО создания, а проверка `-L` — и до, и после.
+        # Замер живьём (bash): путь свободен → файл 0600; symlink лежит →
+        # SYMLINK и цель цела; symlink посажен в окно → NOCREATE и цель цела.
+        store = FakeSftpClient()
+        c = FakeSSH(client=store)
+        common.prepare_secret_file(c, '/tmp/.x.cnf', self.SECRET)
+        prep = c.commands[0]
+        assert 'set -C' in prep and prep.index('set -C') < prep.index(': >')
+        assert prep.count('-L ') >= 2, prep            # до создания и после
+        refused_stores = []
+        for marker in ('SYMLINK', 'NOCREATE'):
+            refused = FakeSftpClient()
+            refused_stores.append(refused)
+            cc = FakeSSH(routes=[('set -C', ('%s\n' % marker, '', 0))],
+                         client=refused)
+            ok, why = common.prepare_secret_file(cc, '/tmp/.x.cnf', self.SECRET)
+            assert ok is False, marker
+            assert 'не удалось записать' not in (why or ''), marker
+        # отказ обязан был случиться ДО записи: ни в одну заглушку секрет не
+        # прилетел (иначе «отказ» прикрывал бы запись по чужому пути)
+        assert [s.store for s in refused_stores] == [{}, {}]
+
     def test_nowrite_is_reported_and_nothing_is_written(self):
         store = FakeSftpClient()
         c = FakeSSH(routes=[(': >', ('NOWRITE\n', 'Read-only file system', 0))],
                     client=store)
         ok, why = common.prepare_secret_file(c, '/tmp/.x.cnf', self.SECRET)
         assert ok is False and 'нельзя писать' in why and 'Read-only' in why
+
+    def test_public_mode_creates_644_in_same_call(self):
+        # Сертификату нужен 0644, но гарды те же: mode меняет только chmod.
+        store = FakeSftpClient()
+        c = FakeSSH(client=store)
+        ok, why = common.prepare_secret_file(c, '/tmp/cert.pem', 'PEM',
+                                             mode='644')
+        assert ok is True and why is None
+        prep = c.commands[0]
+        assert 'chmod 644' in prep and 'chmod 600' not in prep
+        assert prep.index('umask 077') < prep.index(': >') < \
+            prep.index('chmod 644')
+
+    def test_chmod_failure_refuses_and_is_named(self):
+        # Отказ chmod под 2>/dev/null иначе тонул бы молча: файл остался бы с
+        # режимом создания, а отчёт про mode='644' солгал бы о правах.
+        store = FakeSftpClient()
+        c = FakeSSH(routes=[('chmod 644', ('CHMODFAIL\n', '', 1))],
+                    client=store)
+        ok, why = common.prepare_secret_file(c, '/tmp/cert.pem', 'PEM',
+                                             mode='644')
+        assert ok is False and 'выставить права 644' in why
+        assert store.store == {}
         assert store.store == {}                     # секрет не записан
 
     def test_write_failure_wipes_the_empty_file(self):
@@ -1928,6 +1978,25 @@ class TestSaveCrontabBackupInfo:
                             ('crontab -l >', CR_DONE)])
         info = common.save_crontab_backup_info(c)
         assert c.find('crontab -l > ' + info['path']) is not None
+
+    def test_crontab_backup_stamp_is_microsized_like_file_backup(self):
+        # ВТОРАЯ копия секундного правила (1.32.30, ревью): backup_stamp()
+        # появился для create_backup_info, а crontab-бэкап остался на
+        # '%H%M%S' — две правки crontab в одну секунду (штатный повтор
+        # кнопки) давали ОДНО имя, и редирект `>` молча стирал первый
+        # резерв. Метка обязана совпадать с файтовым бэкапом: правило одно.
+        c = FakeSSH(routes=[('mkdir -p', ('', '', 0)),
+                            ('crontab -l >', CR_DONE)])
+        info = common.save_crontab_backup_info(c)
+        assert re.search(r'crontab\.\d{8}_\d{6}_\d{6}\.bak$', info['path']), \
+            'секундная метка вернулась: %s' % info['path']
+        # Тот же хвост метки, что у create_backup_info: имена строятся от
+        # backup_stamp(), а не от двух похожих форматов.
+        c2 = FakeSSH(routes=[('mkdir -p', ('created', '', 0)),
+                             ('test -f', ('', '', 0)),
+                             ('cp ', ('', '', 0))])
+        path = common.create_backup_info(c2, '/etc/x.conf')['path']
+        assert re.search(r'x\.conf\.\d{8}_\d{6}_\d{6}\.bak$', path), path
 
     def test_unwritable_catalog_is_failed_and_is_not_written_to(self):
         # Прайс 1.32.16: каталог обязан выдержать пробную запись. Здесь она

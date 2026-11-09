@@ -138,7 +138,8 @@ class TestMenuIntegrity:
         # После разделителя — только действия, меняющие сервер.
         sep = BITRIX_MENU.index(None)
         after = menu_handlers(BITRIX_MENU[sep + 1:])
-        assert after == ["run_bx_ssl_renew", "run_bx_mysql_tune",
+        assert after == ["run_bx_ssl_renew", "run_bx_ssl_install",
+                         "run_bx_mysql_tune",
                          "run_bx_db_grants_fix", "run_bx_mail_test",
                          "run_bx_cron_install", "run_bx_perms_fix"]
 
@@ -300,3 +301,54 @@ class TestDetectBitrix:
         host._detect_bitrix()
         assert host.bitrix_frame.packed == 0
         assert host.bitrix_frame.forgotten == 1
+
+
+class TestSslInstall:
+    """«Установить сертификат (crt/chain/key)»: диалог → подтверждение → бэкенд.
+
+    Живое окно собирает SslInstallMixin (CI под Xvfb), здесь — контракт
+    обработчика: отмена диалога не имеет права ни спросить подтверждение, ни
+    дёрнуть бэкенд; подтверждённый пуск обязан донести до бэкенда домен и
+    ровно ТРИ секции в порядке crt/chain/key.
+    """
+
+    MATERIAL = {'domain': 'site.ru',
+                'sections': {'crt': 'CRT-PEM', 'chain': 'CHAIN-PEM',
+                             'key': 'KEY-PEM'}}
+
+    def _host_with_dialog(self, monkeypatch, material, askyesno_ret=True):
+        host = _Host(FakeSSH())
+        host._open_ssl_install_dialog = lambda mode: \
+            dict(self.MATERIAL) if material else None
+        self.mode_seen = []
+        real = host._open_ssl_install_dialog
+
+        def spy(mode):
+            self.mode_seen.append(mode)
+            return real(mode)
+        host._open_ssl_install_dialog = spy
+        dialogs = _Dialogs(askyesno_ret=askyesno_ret)
+        monkeypatch.setattr(gb, "messagebox", dialogs)
+        return host
+
+    def test_cancelled_dialog_runs_nothing(self, monkeypatch):
+        host = self._host_with_dialog(monkeypatch, material=None)
+        host.run_bx_ssl_install()
+        assert self.mode_seen == ['bitrix']
+        assert host.calls == []
+
+    def test_declined_confirmation_runs_nothing(self, monkeypatch):
+        host = self._host_with_dialog(monkeypatch, material=True,
+                                      askyesno_ret=False)
+        host.run_bx_ssl_install()
+        assert host.calls == []
+
+    def test_confirmed_passes_domain_and_three_sections(self, monkeypatch):
+        host = self._host_with_dialog(monkeypatch, material=True)
+        host.run_bx_ssl_install()
+        assert len(host.calls) == 1
+        fn, btn, args, kwargs = host.calls[0]
+        assert fn is gb.ssl_install_bitrix
+        assert btn is host.bx_menu_btn
+        assert args == (host.checker, 'site.ru', 'CRT-PEM', 'CHAIN-PEM',
+                        'KEY-PEM')

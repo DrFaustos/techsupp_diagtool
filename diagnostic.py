@@ -30,6 +30,7 @@ from metrics import (  # noqa: F401
     disk_memory_report, network_report,
     check_web_config,
     metrics_report, firewall_report, web_config_report,
+    disk_speed_test, network_speed_test,
 )
 
 # --- logs ---
@@ -101,6 +102,11 @@ from fmanager import (  # noqa: F401
     download_file, upload_file, is_text_file,
 )
 
+# --- ssl_install ---
+from ssl_install import (  # noqa: F401
+    ssl_install_bitrix, ssl_install_plain,
+)
+
 
 __all__ = [
     'BACKUP_DIR', 'BACKUP_SUBDIRS', 'LOG_PATHS', 'DOMAIN_PATHS',
@@ -112,6 +118,7 @@ __all__ = [
     'detect_panel', 'get_metrics', 'panel_label',
     'disk_memory_report', 'network_report', 'check_web_config',
     'metrics_report', 'firewall_report', 'web_config_report',
+    'disk_speed_test', 'network_speed_test',
     'find_logs', 'find_logs_info', 'parse_access_log_line', 'filter_by_date',
     'analyze_access_log', 'get_domains', 'get_domains_info', 'check_site_logs',
     'check_site_logs_info', 'site_logs_report', 'search_oom_logs',
@@ -147,4 +154,5 @@ __all__ = [
     'grep_logs_report', 'list_common_reports',
     'list_dir', 'make_dir', 'create_file', 'delete_path', 'rename_path',
     'download_file', 'upload_file', 'is_text_file',
+    'ssl_install_bitrix', 'ssl_install_plain',
 ]

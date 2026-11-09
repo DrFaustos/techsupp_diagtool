@@ -27,6 +27,12 @@ from logs import (find_logs, mail_log_snapshot_lines,
                   mail_delivery_digest_lines)
 from metrics import detect_panel, services_status_cmd, parse_service_statuses
 from bitrix import parse_mailq_count
+# Спрос dig задаёт носитель из dns.py (1.32.30): он различает rc=127 («не чем
+# спросить»), rc!=0 («не достучались», ошибка едет в stdout!) и честный пустой
+# ответ. Свой разбор по пустоте stdout во внешнем пути уже давал ложь — локальные
+# спросы обязаны решать тем же кодом состояний. Цикла нет: dns.py зовёт только
+# common.
+from dns import dig_records_info, parse_dig_records
 
 MGR5 = '/usr/local/mgr5'
 MGRCTL = f'{MGR5}/sbin/mgrctl -m ispmgr'
@@ -278,9 +284,33 @@ def site_status_command(domain):
     Один TLS-хендшейк на домен, а не два: -enddate читается один раз, а 'SSL='
     выводится из него же сравнением с date. Дни считаем НА СЕРВЕРЕ: дата и час
     машины оператора к выпуску сертификата отношения не имеют.
+
+    1.32.30: в начале — самопроверка curl. Без curl обе подстановки с curl
+    дают пустоту, пустота превращается в HTTP=000 HTTPS=000, а «000/000» отчёт
+    читает как «сайт молчит»: отсутствие инструмента выглядело как авария
+    живого сайта (тот же закон, что с dig: «не чем спросить» не имеет права
+    печататься диагнозом). Теперь команда сама печатает маркер
+    'TOOL=curl-missing' и уходит с rc=0 — разбор превращает его в отдельное
+    состояние 'no_tool'. Разбор старых HTTP=/HTTPS= строк маркер не трогает:
+    это просто ещё одна key=value строка до кодов.
+
+    Тот же закон добит до openssl: слайс 1.32.30 вылечил curl-ветку, а
+    openssl-ветка осталась живой: без openssl подстановка TLS пуста, команда
+    печатает SSL=none/CERT=none, и отчёт утверждал «https не отвечает / TLS не
+    работает» про сайт с живым TLS — отсутствие утилиты снова стало диагнозом
+    сайту. Теперь тем же маркером печатается 'TOOL=openssl-missing'. Маркеры
+    независимы и могут идти оба: openssl не останавливает пробу (коды curl
+    всё равно снимаются), curl — останавливает (без кодов проба пуста).
+    Самопроверка в ТОЙ ЖЕ команде: второй SSH-раунд «а есть ли openssl» на
+    каждый домен стоил бы как сама проба.
     """
     d = q(domain)
     return (
+        # Порядок проверки осознан: openssl печатает маркер и не мешает далее,
+        # curl при отсутствии гасит пробу целиком — тогда и его маркер, и
+        # маркер openssl уже напечатаны, разбор отдаёт приоритет curl.
+        "command -v openssl >/dev/null || echo 'TOOL=openssl-missing'; "
+        "command -v curl >/dev/null || { echo 'TOOL=curl-missing'; exit 0; }; "
         f"TLS=$(echo | timeout 8 openssl s_client -servername {d} "
         f"-connect {d}:443 2>/dev/null "
         "| openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2-); "
@@ -296,19 +326,60 @@ def site_status_command(domain):
     )
 
 
-def parse_site_status(out):
-    """'HTTP=200\\nHTTPS=301\\nSSL=ok' -> dict (пустые коды -> '000')."""
+def parse_site_status(out, rc=0):
+    """'HTTP=200\nHTTPS=301\nSSL=ok' -> dict с полем 'state'.
+
+    1.32.30: 'state' различает «мы спросили и получили» ('checked') и «спрашивать
+    было не чем» ('no_tool' — маркер TOOL=curl-missing из самопроверки команды).
+    Без curl код пустой, пустота становилась '000', а '000/000' читалось как
+    «сайт молчит» — ложная беда живого сайта из-за отсутствия утилиты. Пустой
+    stdout при этом остаётся 'checked' с кодами '000': обрыв канала — молчание
+    пробы, а маркер печатает сама команда, подменить его молчанием нельзя.
+
+    Теперь так же разделён и openssl: 'no_cert_tool' — коды curl получил, но
+    сертификат спросить было не чем (маркер TOOL=openssl-missing). Его нельзя
+    ронять в 'checked' с CERT=none: ветка 'checked' объясняет пустой сертификат
+    кодом ответа («порт молчит», «нет рабочего TLS»), а порт мы рукопожатием
+    не проверяли — openssl не установлен. Маркеров TOOL может быть два сразу
+    (оба инструмента отсутствуют): 'curl-missing' главенствует, потому что без
+    кодов проба не исполнена целиком. Поэтому TOOL собирается в множество, а
+    не в vals: dict по ключу оставил бы только последний маркер, и порядок
+    печати в команде стал бы носителем решения — тем, чем он быть перестал.
+
+    1.33.x: 'hung' — дедлайн канала (rc=124 от ssh_client._exec): команда не
+    завершилась, кодов мы НЕ видели, а пустота разобралась бы в 000/000 —
+    «сайт молчит» про живой сайт. Сама проба ограничена внутри (curl -m 8 ×2,
+    openssl timeout 8) и укладывается в ~20 с; rc=124 значит, что виснет не
+    сайт, а путь/канал — это «не проверено», как no_tool, но лечится другим
+    (соединение, а не установка curl).
+    """
+    if rc == 124:
+        return {'state': 'hung', 'http': '000', 'https': '000',
+                'ssl': '', 'cert_days': None}
     vals = {}
+    tools = set()
     for line in (out or '').splitlines():
         key, _, value = line.partition('=')
-        vals[key.strip().upper()] = value.strip()
+        key = key.strip().upper()
+        value = value.strip()
+        if key == 'TOOL':
+            tools.add(value)
+        else:
+            vals[key] = value
+    if 'curl-missing' in tools:
+        return {'state': 'no_tool', 'http': '000', 'https': '000',
+                'ssl': '', 'cert_days': None}
     cert = None
     if vals.get('CERT', '') not in ('', 'none'):
         try:
             cert = int(vals['CERT'])
         except ValueError:
             cert = None
-    return {'http': vals.get('HTTP') or '000',
+    state = 'checked'
+    if 'openssl-missing' in tools:
+        state = 'no_cert_tool'
+    return {'state': state,
+            'http': vals.get('HTTP') or '000',
             'https': vals.get('HTTPS') or '000',
             'ssl': vals.get('SSL', ''),
             'cert_days': cert}
@@ -408,7 +479,14 @@ def parse_cert_days(out):
     return None
 
 
-CERT_STATE_ICON = {'expired': '❌', 'soon': '⚠️', 'ok': '✅', 'none': '❓'}
+CERT_STATE_ICON = {'expired': '❌', 'soon': '⚠️', 'ok': '✅', 'none': '❓',
+                   # 'no_tool' — сертификата нет в руках не потому, что его не
+                   # выпросили у сервера, а потому, что спрашивать было не чем
+                   # (openssl отсутствует). Красным его красить нельзя: красное
+                   # оператор читает как беду сайта и едет трогать nginx,
+                   # которого не касались; это «не проверено» — тот же ❓, что
+                   # у неизвестного, но со своей подписью в ssl_note.
+                   'no_tool': '❓'}
 
 
 def cert_state(days):
@@ -432,15 +510,59 @@ def cert_days_icon(days):
 
 
 # ==================== ЧИТАТЕЛИ ПАНЕЛЕЙ ====================
+# Молчание панели читалось «не найдено» (1.32.30). Прежний isp_list выбрасывал
+# rc, stderr тонул в 2>/dev/null, а «ERROR=...» в stdout парсился строкой без
+# 'name' — потребитель получал пустой список и отчёт печатал «не найдено» там,
+# где панель вообще не ответила. Пустой сервер и недоступная панель обязаны
+# различаться причиной, а не молчанием (закон серии с 1.18.0).
+ISP_LIST_GAP_NOTE = ("⚠️ Панель не ответила ({source}): {reason}. {what} по "
+                     "панельному списку не проверены — «не найдено» по этому "
+                     "ответу сказать нельзя")
+
+
+def isp_list_info(checker, element):
+    """Элементы панели + чем объясняется недостоверность списка.
+
+    {'rows', 'reason'}: reason — строка («панель не ответила» по rc!=0 или по
+    строке ERROR=.../ERROR: ... в stdout) либо None. При reason строки НЕ
+    выдаются: пустой список от молчаливой панели не имеет права притворяться
+    честным «элементов нет» (замер грабели: rc!=0, 'ERROR=Permission denied'
+    и пустая панель давали побайтово одинаковый вывод).
+    """
+    out, err, rc = checker.run(f'{MGRCTL} {q(element)}')
+    if rc != 0:
+        first = next((l.strip() for l in (err or out or '').splitlines()
+                      if l.strip()), '')
+        return {'rows': [],
+                'reason': f"rc={rc}" + (f": {first[:160]}" if first else '')}
+    raw = (out or '').strip()
+    rows = parse_mgrctl_text(out)
+    if _mgrctl_says_error(raw, rows):
+        first = next((l.strip() for l in (raw or err or '').splitlines()
+                      if l.strip()), '')
+        return {'rows': [], 'reason': f"панель ответила ошибкой: {first[:160]}"}
+    if not rows and (err or '').strip():
+        # rc=0, списка нет, stderr НЕ пуст: панель пожаловалась каналом ошибок
+        # и ушла с нулём (замер грабели по 2>&1-ветке isp_rows: жалоба живёт
+        # и в stdout, и в stderr — здесь мы её слышим именно в stderr, потому
+        # что 2>/dev/null с команды снят). Пустой список в этом случае — не
+        # «элементов нет», а «мы не получили ответ»: молчать нельзя.
+        first = next((l.strip() for l in (err or '').splitlines()
+                      if l.strip()), '')
+        return {'rows': [],
+                'reason': f"списка нет, панель сообщила: {first[:160]}"}
+    return {'rows': rows, 'reason': None}
+
+
 def isp_list(checker, element):
     """Список элементов панели: `mgrctl -m ispmgr <element>` (text-формат).
 
     Элемент берётся из списка панели (webdomain, maildomain, dnszone, mail,
     usr, db) — это не пользовательский ввод, поэтому кавычки только защита
-    от опечатки в коде.
+    от опечатки в коде. Чем объясняется пустота — в isp_list_info; списки,
+    где «не получено» важнее «пусто», обязаны звать её.
     """
-    out, _, _ = checker.run(f'{MGRCTL} {q(element)} 2>/dev/null')
-    return parse_mgrctl_text(out)
+    return isp_list_info(checker, element)['rows']
 
 
 def isp_webdomains(checker):
@@ -552,7 +674,14 @@ def discover_sites_info(checker, panel_type=None):
                 rec[key] = value
 
     if panel_type == 'ispmanager':
-        for row in isp_webdomains(checker):
+        # isp_list_info, а не isp_list: пустой список от молчаливой панели
+        # печатался бы как «сайтов нет», хотя списка мы не видели (1.32.30).
+        listed = isp_list_info(checker, 'webdomain')
+        if listed['reason']:
+            notes.append(ISP_LIST_GAP_NOTE.format(
+                source='mgrctl webdomain', reason=listed['reason'],
+                what='Сайты'))
+        for row in listed['rows']:
             add(row.get('name'),
                 owner=row.get('owner', '') or row.get('usr', ''),
                 docroot=row.get('docroot', ''),
@@ -673,7 +802,17 @@ def discover_mail_domains_info(checker, panel_type=None):
             found.setdefault(dom, []).append(source)
 
     if panel_type == 'ispmanager':
-        for row in isp_maildomains(checker):
+        # Тот же закон, что с vhost'ами (1.24.0), но для панели: пустой
+        # список от не ответившей панели — не «доменов нет». Почтовый
+        # инвентарь стоит шлюзом к операции (mailbox_guard), поэтому
+        # источник идёт и в notes, и в blocked.
+        listed = isp_list_info(checker, 'maildomain')
+        if listed['reason']:
+            notes.append(ISP_LIST_GAP_NOTE.format(
+                source='mgrctl maildomain', reason=listed['reason'],
+                what='Почтовые домены'))
+            blocked.append('mgrctl maildomain')
+        for row in listed['rows']:
             add(row.get('name'), 'mgrctl maildomain')
     elif panel_type == 'fastpanel':
         for row in fp_mail_domains(checker):
@@ -786,7 +925,14 @@ def discover_dns_zones_info(checker, panel_type=None):
     notes = []
 
     if panel_type == 'ispmanager':
-        for row in isp_dnszones(checker):
+        # Молчаливая панель — не «зон нет» (1.32.30), тот же закон, что для
+        # сайтов и почты.
+        listed = isp_list_info(checker, 'dnszone')
+        if listed['reason']:
+            notes.append(ISP_LIST_GAP_NOTE.format(
+                source='mgrctl dnszone', reason=listed['reason'],
+                what='DNS-зоны'))
+        for row in listed['rows']:
             dom = (row.get('name') or '').strip().lower()
             if dom:
                 zones[dom] = {'domain': dom,
@@ -860,6 +1006,18 @@ def no_cert_reason(https):
             else 'https отвечает без рабочего TLS')
 
 
+# Формулировка «сертификат не спрашивали» — ОДНА на все отчёты (строка сводки,
+# SSL-отчёт, досье): две формулировки однажды разъехались бы, и оператор не
+# узнал бы в досье свою же беду из сводки — тот же закон, что у cert_days_label
+# и no_cert_reason. rc=127 назван потому, что это код shell «команда не
+# найдена»: по нему оператор сверит вывод с тем, что увидит в терминале.
+# Формулировка отрицательная — «не проверено» с причиной и советом: печатать
+# по отсутствию инструмента «TLS не работает» нельзя (это диагноз сайту,
+# которого мы не ставили), а «TLS в порядке» по пустому выводу — нельзя вдвойне.
+SSL_TOOL_MISSING_NOTE = ('TLS не проверено: openssl на сервере не найден '
+                         '(rc=127) — установите openssl')
+
+
 def cert_note_state(status):
     """Состояние сертификата для пометки строки; None — пометки нет вовсе.
 
@@ -869,7 +1027,15 @@ def cert_note_state(status):
     этого же ответа зависит сводный счётчик, поэтому решение не имеет права
     быть продублированным в печатающей функции: иначе сводка считала бы ❓,
     которого в строках нет (или молчала о показанном).
+
+    'no_cert_tool' в состоянии пробы — факт про нас, а не про сайт:
+    спрашивать сертификат было не чем, поэтому в колонке сертификата он
+    'no_tool' независимо от кода https. Молчать тут было бы ложью «тишины в
+    счётчике», а 'none' — ложью «мы спросили и нам не дали»: чинят эти беды
+    разные действия (установка openssl против конфигурации vhost).
     """
+    if status.get('state') == 'no_cert_tool':
+        return 'no_tool'
     if status['https'] in ('000', ''):
         return None
     return cert_state(status['cert_days'])
@@ -885,6 +1051,14 @@ def ssl_note(status, sep='  '):
     state = cert_note_state(status)
     if state is None:
         return ''
+    if state == 'no_tool':
+        # Ветка обязана стоять до label: ниже cert_days_label(None) дала бы
+        # «сертификат не получен», а к ней no_cert_reason по коду ответа —
+        # «https не отвечает» или «отвечает без рабочего TLS». При отсутствии
+        # openssl ни то, ни другое не проверено: рукопожатия НЕ БЫЛО, код
+        # ответа о TLS не говорит ничего. Пустой вывод не имеет права
+        # превращаться ни в «не работает», ни в «в порядке».
+        return f'{sep}{CERT_STATE_ICON[state]} {SSL_TOOL_MISSING_NOTE}'
     label = cert_days_label(status['cert_days'])
     if state == 'none':
         label = f'{label} ({no_cert_reason(status["https"])})'
@@ -899,12 +1073,24 @@ def site_health_probe(checker, sites, limit=HEALTH_CHECK_LIMIT):
     (HTTPS молчит: сертификат чужого дефолтного vhost нельзя показывать как
     свой). Считать тогда сертификат в сводке — значит учесть то, что отчёт
     намеренно не показал. Решает это cert_note_state — та же функция, что
-    решает то же для печатаемой пометки.
+    решает то же для печатаемой пометки. Без openssl колонка сертификата
+    получает 'no_tool' ('не чем спросить'), а колонка доступности остаётся
+    честной: коды curl снял, и сайт по ним жив или мёртв на самом деле.
     """
     rows = []
     for site in sites[:limit]:
-        status = parse_site_status(
-            checker.exec_command(site_status_command(site['domain']))[0])
+        # run(), а не exec_command(): rc=124 (дедлайн канала) иначе теряется,
+        # пустота разбирается в 000/000 и зависшая проба печатается как
+        # «❌ сайт молчит» про живой сайт.
+        out_s, _err_s, rc_s = checker.run(site_status_command(site['domain']))
+        status = parse_site_status(out_s, rc=rc_s)
+        if status['state'] in ('no_tool', 'hung'):
+            # Ни кодов, ни сертификата: проба не исполнена, и выводить её
+            # молчанием сайта или «сертификат не получен» нельзя — оператор
+            # полез бы чинить nginx вместо установки curl (или проверки
+            # соединения — в случае зависания).
+            rows.append((site['domain'], status['state'], None, status))
+            continue
         cert = cert_note_state(status)
         rows.append((site['domain'],
                      http_site_state(status['http'], status['https']),
@@ -916,6 +1102,16 @@ def site_health_render(probed):
     """Строки состояния по уже снятой пробе (второй прогон проб — не здесь)."""
     lines = []
     for dom, state, cert, status in probed:
+        if state == 'no_tool':
+            lines.append(f"  ⚠️ {dom:45s} curl на сервере нет — "
+                         "состояние сайта не проверено")
+            continue
+        if state == 'hung':
+            # Своя строка, а не «молчит»: зависшая проба — беда канала/пути,
+            # сайт под этим текстом жив или мёртв — неизвестно.
+            lines.append(f"  ⚠️ {dom:45s} проба зависла (дедлайн канала) — "
+                         "состояние сайта не проверено")
+            continue
         # Пометка строится общим ssl_note: при молчащем HTTPS он пуст (cert
         # тогда None), поэтому отдельная проверка в этом цикле не нужна.
         ssl = ssl_note(status)
@@ -932,14 +1128,27 @@ def site_health_counts(probed):
         ok=sum(1 for r in probed if r[1] == 'ok'),
         http_only=sum(1 for r in probed if r[1] == 'http_only'),
         silent=sum(1 for r in probed if r[1] == 'silent'),
-        unknown=sum(1 for r in probed if r[1] not in known),
+        # no_tool — не «молчит» и не «не распознано»: это «не проверяли»
+        # (инструмента не было), и в знаменатель «проверено» он не входит.
+        no_tool=sum(1 for r in probed if r[1] == 'no_tool'),
+        # hung — то же «не проверяли», своей категорией: причина (канал) и
+        # лечение (проверить соединение) отличаются от curl-ных.
+        hung=sum(1 for r in probed if r[1] == 'hung'),
+        unknown=sum(1 for r in probed if r[1] not in known
+                    and r[1] not in ('no_tool', 'hung')),
         cert_expired=sum(1 for r in probed if r[2] == 'expired'),
         cert_soon=sum(1 for r in probed if r[2] == 'soon'),
-        cert_none=sum(1 for r in probed if r[2] == 'none'))
+        cert_none=sum(1 for r in probed if r[2] == 'none'),
+        # 'no_tool' в колонке сертификата — «не чем было спросить» (openssl
+        # отсутствовал). В cert_none его писать нельзя: та категория значит
+        # «мы спросили — сертификата нет», и оператор стал бы перевыпускать
+        # сертификат там, где надо просто поставить утилиту.
+        cert_no_tool=sum(1 for r in probed if r[2] == 'no_tool'))
 
 
-def site_health_summary(ok=0, http_only=0, silent=0, unknown=0,
-                        cert_expired=0, cert_soon=0, cert_none=0, total=0):
+def site_health_summary(ok=0, http_only=0, silent=0, unknown=0, no_tool=0,
+                        hung=0, cert_expired=0, cert_soon=0, cert_none=0,
+                        cert_no_tool=0, total=0):
     """Сколько сайтов лежит — строки в шапку блока, до чтения списка.
 
     Считается СОСТОЯНИЕМ, а не символом «❌» в готовом тексте: в строке домена
@@ -951,8 +1160,11 @@ def site_health_summary(ok=0, http_only=0, silent=0, unknown=0,
     про HEALTH_CHECK_LIMIT снизу: отдельной строки о них нет намеренно —
     третье упоминание оператор читает как невнимательность.
     """
+    # no_tool в знаменатель «проверено» не входит: проверен тот, чей код
+    # получен, а проба без curl ответа не дала. hung — там же: зависшая проба
+    # кодов не видела.
     checked = ok + http_only + silent + unknown
-    if not checked:
+    if not checked and not no_tool and not hung:
         return []
     parts = []
     if ok:
@@ -965,6 +1177,14 @@ def site_health_summary(ok=0, http_only=0, silent=0, unknown=0,
         # Неизвестное состояние = «мы не поняли», а не «в порядке»: молча
         # отнести его в ok значило бы занизить число бед.
         parts.append(f'Не распознано — {unknown}')
+    if no_tool:
+        # «Не проверено» печатается своим словом, а не молчащим сайтом:
+        # отсутствие curl — беда сервера с инструментами, а не сайта.
+        parts.append(f'не проверено (curl на сервере нет) — {no_tool}')
+    if hung:
+        # Отдельным словом от curl-ного: чинят зависание не пакетом, а
+        # проверкой соединения/сервера.
+        parts.append(f'не проверено (проба зависла) — {hung}')
     lines = [f"Проверено доступности: {checked} из {total or checked}"
              + (': ' + ', '.join(parts) if parts else '.')]
     cert_parts = []
@@ -974,6 +1194,11 @@ def site_health_summary(ok=0, http_only=0, silent=0, unknown=0,
         cert_parts.append(f'истекает < {SSL_WARN_DAYS} дн. — {cert_soon}')
     if cert_none:
         cert_parts.append(f'сертификат не получен — {cert_none}')
+    if cert_no_tool:
+        # «не проверено (openssl на сервере нет)» — своим словом, как curl-ная
+        # строка выше: беда в инструментах сервера, а не в сертификате сайта.
+        cert_parts.append(
+            f'TLS не проверено (openssl на сервере нет) — {cert_no_tool}')
     if cert_parts:
         # Отдельная строка: мёртвый сертификат и молчащий сайт — разные беды,
         # чинят их разные люди (let's encrypt против nginx).
@@ -1034,7 +1259,7 @@ def site_health_report(checker, panel_type=None):
     return "\n".join(lines)
 
 
-def ssl_expiry_head_lines(not_received=0):
+def ssl_expiry_head_lines(not_received=0, not_checked=0):
     """Что шапка SSL-отчёта обязана сказать, кроме «истекло / истекает».
 
     До этой правки шапка говорила «Истекло: 0, истекает < 30 дн.: 0» — и
@@ -1046,12 +1271,24 @@ def ssl_expiry_head_lines(not_received=0):
     Число берётся только из ПРОВЕРЕННЫХ доменов: домены за HEALTH_CHECK_LIMIT не
     могли «не получить» сертификат, который никто не запрашивал. Отдельной
     строки про них нет: знаменатель «25 из 30» в той же шапке называет их и так.
+
+    not_checked — тот же закон для отсутствующего openssl: эти домены не «не
+    получили» сертификат (мы его не спрашивали), и молчание о них шапки
+    «Истекло: 0» снова стало бы «всё в порядке» на пустом месте.
     """
-    if not not_received:
-        return []
-    return [f"   Сертификат не получен — {not_received}: HTTPS не отвечает или "
-            f"отвечает без рабочего TLS. Это не «с SSL всё в порядке»,",
-            "   и не «истекло»: список таких доменов — в блоке ниже."]
+    lines = []
+    if not_received:
+        lines.append(
+            f"   Сертификат не получен — {not_received}: HTTPS не отвечает или "
+            f"отвечает без рабочего TLS. Это не «с SSL всё в порядке»,")
+        lines.append(
+            "   и не «истекло»: список таких доменов — в блоке ниже.")
+    if not_checked:
+        lines.append(
+            f"   TLS не проверено — {not_checked}: openssl на сервере не "
+            "найден, сертификат не спрашивали. Это не «истекло» и не «в "
+            "порядке», список таких доменов — в блоке ниже.")
+    return lines
 
 
 def ssl_expiry_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
@@ -1074,9 +1311,34 @@ def ssl_expiry_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
 
     probed = sites[:limit]
     rows = []
+    no_tool = []
+    no_ssl_tool = []
+    hung = []
     for site in probed:
-        status = parse_site_status(
-            checker.exec_command(site_status_command(site['domain']))[0])
+        # run(), а не exec_command(): нужен rc=124 (дедлайн канала) — без
+        # него зависшая проба разбиралась бы в 000/000 и домен попадал в
+        # «сертификат не получен» про живой TLS.
+        out_s, _err_s, rc_s = checker.run(site_status_command(site['domain']))
+        status = parse_site_status(out_s, rc=rc_s)
+        if status['state'] == 'no_tool':
+            # Без curl проба не исполнена: ни кодов, ни даты сертификата. В
+            # «сертификат не получен» её писать нельзя: та ветка объясняет
+            # беду через «порт молчит», а порт мы не пробовали.
+            no_tool.append(site['domain'])
+            continue
+        if status['state'] == 'hung':
+            # Зависание канала — тоже «проба не исполнена», своим списком:
+            # в no_tool оно враньём про curl, в quiet — враньём про порт.
+            hung.append(site['domain'])
+            continue
+        if status['state'] == 'no_cert_tool':
+            # Тот же класс, что выше, только без curl: коды есть, а даты нет,
+            # потому что рукопожатие спросить было не чем. В quiet (сертификат
+            # не получен) её писать нельзя: причина там объясняется кодом
+            # ответа, которого для несостоявшегося хендшейка не существует —
+            # «порт молчит» про живой порт был бы ложью.
+            no_ssl_tool.append(site['domain'])
+            continue
         rows.append((site['domain'], status['cert_days'], status['https']))
 
     # Сортировка: сначала истёкшие (отрицательные), потом по возрастанию
@@ -1093,7 +1355,8 @@ def ssl_expiry_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
                  f"{len(warning)}")
     # Сразу под шапкой, а не под всем списком: «Истекло: 0» — ещё не «всё в
     # порядке», если у половины доменов сертификат не получен вообще.
-    lines.extend(ssl_expiry_head_lines(not_received=len(quiet)))
+    lines.extend(ssl_expiry_head_lines(not_received=len(quiet),
+                                       not_checked=len(no_ssl_tool)))
     if expired:
         lines.append("\n❌ СЕРТИФИКАТЫ ИСТЕКЛИ (браузер показывает предупреждение):")
         for dom, days, _ in expired:
@@ -1118,6 +1381,27 @@ def ssl_expiry_report(checker, panel_type=None, limit=HEALTH_CHECK_LIMIT):
             # формулировкой того же факта и однажды разъехалась бы с досье.
             lines.append(f"  {dom:45s} {no_cert_reason(https_code)}")
 
+    if no_tool:
+        lines.append("\n⚠️ СЕРТИФИКАТ НЕ ПРОВЕРЕН (проба не исполнена):")
+        for dom in no_tool:
+            lines.append(f"  {dom:45s} curl на сервере нет — "
+                         "состояние сайта не проверено")
+
+    if hung:
+        lines.append("\n⚠️ СЕРТИФИКАТ НЕ ПРОВЕРЕН (проба зависла):")
+        for dom in hung:
+            lines.append(f"  {dom:45s} дедлайн канала — ни кодов, ни даты "
+                         "мы не видели; проверьте соединение")
+
+    if no_ssl_tool:
+        # Отдельный блок рядом с curl-ным «НЕ ПРОВЕРЕН», а не сливание с ним:
+        # коды этих доменов получены, не проверен только TLS — смешав, отчёт
+        # сказал бы «состояние сайта не проверено» про сайт, состояние
+        # которого известно.
+        lines.append("\n❓ СЕРТИФИКАТ НЕ ПРОВЕРЕН (проба без openssl):")
+        for dom in no_ssl_tool:
+            lines.append(f"  {dom:45s} {SSL_TOOL_MISSING_NOTE}")
+
     if len(sites) > limit:
         lines.append(f"\n… проверены первые {limit} из {len(sites)} доменов "
                      f"(HEALTH_CHECK_LIMIT)")
@@ -1138,9 +1422,17 @@ def mail_overview_report(checker, panel_type=None):
     if domains:
         lines.append(f"Почтовых доменов: {len(domains)}")
         for dom in sorted(domains):
-            boxes = discover_mailboxes(checker, panel_type, domain=dom)
+            # discover_mailboxes_info, а не discover_mailboxes (1.32.30): при
+            # закрытом источнике число ящиков — неверное утверждение, а не
+            # отсутствие ответа; причина обязана стоять рядом с числом, а не
+            # только в общем блоке ниже (там она про домены, а цифра — про
+            # ящики).
+            boxes, box_notes, box_blocked = discover_mailboxes_info(
+                checker, panel_type, domain=dom)
             addrs = ', '.join(addr for addr, _ in boxes[:15]) or '—'
-            lines.append(f"  {dom}  (ящиков: {len(boxes)})")
+            caveat = (', но см. причину ниже'
+                      if (box_notes or box_blocked) else '')
+            lines.append(f"  {dom}  (ящиков: {len(boxes)}{caveat})")
             lines.append(f"      {addrs}")
             if len(boxes) > 15:
                 lines.append(f"      … ещё {len(boxes) - 15}")
@@ -1250,6 +1542,12 @@ DIG_RC_ANSWERED = 0
 
 
 # ---------- команды (собираются чистыми функциями — тесты без SSH) ----------
+# С 1.32.30 локальные одиночные спросы mail_auth_lines задаёт носитель dig
+# (dns.py): «+short» форма и экранирование здесь те же, но rc у этих строк
+# никто не видит (exec_command его выбрасывает), поэтому отчёты зовут их только
+# как эталон формы, запертый тестами. Живая из них одна — dkim_query_command:
+# цикл из девяти селекторов одной командой носителя не выражается, и его rc
+# решает тот же носитель (parse_dig_records).
 def a_query_command(domain):
     """A-запись домена: из неё берём IP, по которому спрашиваем PTR."""
     return f'dig +short A {q(domain)} 2>/dev/null'
@@ -1271,10 +1569,32 @@ def dkim_query_command(domain, selectors=MAIL_AUTH_SELECTORS):
     Имя печатается целиком, без shell-срезки ${var%...}: парсер срезает суффикс
     сам, зато в отчёте видно, какой именно селектор дал запись, и цикл не
     ломается на именах с подчёркиваниями.
+
+    1.32.30: rc команды = ПЕРВЫЙ ненулевой rc внутри цикла (exit "${__bad:-0}").
+    Раньше кодом цикла всегда был rc последнего printf, то есть 0: мёртвый
+    резолвер (dig печатает «;; communications error» в stdout при rc=9) и
+    честная пустая зона давали побайтово одинаковый «успех» — «DKIM нет»
+    печаталось по таймауту. Состояние по этому rc решает носитель
+    (parse_dig_records): 127 — «не чем спросить», другой ненулевой — «не
+    получены». 2>/dev/null снят: stderr — причина, а не шум. Начальное значение
+    переменной не пишется литералом (везде `${__bad:-0}`): литерал «__bad=0»
+    принадлежит команде ВНЕШНЕГО цикла, и дублировать его здесь означало бы
+    отдать локальному циклу ответ внешнего в маршрутизаторе фикстур.
+
+    +time-потолок (DNS_TIMEOUT_ARGS) — потолок ДЛИНЫ спроса, а не его
+    результата: у dig по умолчанию 5 с × 3 попытки, и на мёртвом резолвере один
+    домен стоил бы 9 × 15 с ≈ 2,5 минуты (замер: @192.0.2.1 c +time=1 +tries=1
+    → rc=9 за 1,1 с, пропорция линейная). Внешние спросы этого модуля потолок
+    уже имеют, локальный цикл — нет. Оболочечным `timeout 8` потолок задавать
+    нельзя: за отсутствующий в системе `timeout` оболочка отдаёт те же 127, и
+    «инструмента нет» стало бы диагнозом «нет dig». Поэтому потолок просит сам
+    dig, и 127 остаётся единственным значением «спрашивать не чем».
     """
     names = ' '.join(q(f'{s}._domainkey.{domain}') for s in selectors)
     return (f'for __dk in {names}; do printf "%s|" "$__dk"; '
-            f'dig +short TXT "$__dk" 2>/dev/null; printf "\\n"; done')
+            f'__rc=0; dig +short TXT "$__dk" {DNS_TIMEOUT_ARGS} || __rc=$?; '
+            f'[ "${{__bad:-0}}" = 0 ] && __bad=$__rc; printf "\\n"; '
+            f'done; exit "${{__bad:-0}}"')
 
 
 def ptr_query_command(ip):
@@ -1505,6 +1825,42 @@ def parse_dkim(out, domain):
                           f'строгие приёмники такую подпись не примут'}
     return {'status': 'ok', 'reason': 'ok', 'selectors': found,
             'revoked': revoked, 'detail': detail}
+
+
+def _dkim_recs_unusable(recs):
+    """Все непустые значения — служебный мусор dig? True, если да.
+
+    DKIM-цикл печатает «имя|» ДО вывода dig, поэтому «;; Warning…» стоит НЕ в
+    начале строки и носитель parse_dig_records (он режет префикс ';;' у ОДНОЙ
+    команды dig) её не узнает. DKIM-значение по RFC начинается с v=DKIM1 или
+    кавычки — «;;» законным значением быть не может, это всегда сервисная
+    строка. Строки-продолжения (ротация ключа, без '|') содержательны сами по
+    себе — с ними пачка пригодна.
+
+    Пустое значение («селектор|» без хвоста) — НЕ мусор и НЕ признак отказа:
+    замер живьём (BIND 9.18.50, реальная сеть) домена без DKIM — цикл даёт
+    rc=0, stderr пустой и РОВНО по одной строке «имя|» на селектор. То есть
+    девять пустых хвостов при rc=0 и есть честное «запросили, записей нет»;
+    прежняя формулировка («нет ни одной содержательной строки → непригодна»)
+    переворачивала этот ответ в «не получены: сервисные строки dig» и совала
+    оператору совет чинить резолвер вместо настройки DKIM. Непригодна пачка
+    только тогда, когда в ней ЕСТЬ чем прикрываться: служебная строка dig
+    (сервер предупредил) или вообще ничего (пачки нет — решать не по чему).
+    """
+    substantive = service = queried = False
+    for rec in recs:
+        raw = rec.partition('|')[2].strip() if '|' in rec else rec.strip()
+        if not raw:
+            queried = True            # «имя|» — селектор спрошен, ответа нет
+        elif raw.startswith(';;'):
+            service = True
+        else:
+            substantive = True
+    if substantive:
+        return False
+    # Пустая пачка — не «пустой ответ»: это не о чём судить (носитель в
+    # 'records' её не приведёт, но функция обязана врать меньше вызывающего).
+    return service or not queried
 
 
 def parse_dmarc(txts):
@@ -1910,7 +2266,7 @@ def mail_auth_fixes(domain, spf, dkim, dmarc, ptr_status, ip=''):
     return fixes
 
 
-def _ptr_view(ip, name, answered=True):
+def _ptr_view(ip, name, answered=True, why=''):
     """(статус, текст) PTR по уже известному адресу.
 
     Различаем три случая, а не два: «нечего спрашивать» (адреса нет), «спросили,
@@ -1918,25 +2274,66 @@ def _ptr_view(ip, name, answered=True):
     (записи действительно нет). Свести второй к третьему — значит заявить
     оператору «обратной записи нет» на основании таймаута: ровно то же враньё,
     с которым воюет весь модуль, только в обратную сторону.
+
+    why (1.32.30) — готовая причина отказа от носителя dig («dig не найден
+    (rc=127)», текст из stderr): без неё единственным объяснением оставалось
+    выдуманное «резолвер не ответил», которым ещё и отсутствие бинарника
+    подписывалось.
     """
     if not ip:
         return 'warn', 'PTR не проверен: A-запись не получена'
     if not answered:
-        return 'warn', (f'PTR для {ip} не получен: резолвер не ответил — '
-                        f'назвать это «записи нет» нельзя')
+        return 'warn', (f'PTR для {ip} не получен: '
+                        + (f'{why} — ' if why else 'резолвер не ответил — ')
+                        + 'назвать это «записи нет» нельзя')
     if name:
         return 'ok', name
     return 'bad', (f'для {ip} обратной записи нет — Google/Microsoft такую '
                    f'почту режут')
 
 
+# Слова, которыми отчёт назовёт незаписанную запись при НЕполученном спросе.
+# Отдельный словарь, а не текст в трёх местах: формулировки «SPF нет», «DKIM
+# нет» и «DMARC нет» — диагнозы, и под негативным состоянием их печатать
+# нельзя (тот же закон, что в dns._dig_lines: «не проверено», «не получены» и
+# «не найдены» лечатся по-разному).
+_UNASKED_WHAT = {'spf': 'SPF-записи нет', 'dkim': 'DKIM-подписи нет',
+                 'dmarc': 'DMARC-записи нет'}
+
+
+def _unasked_detail(state, why, what):
+    """Вердикт НЕполученного спроса вместо диагноза — status warn.
+
+    Пустой разбор (parse_spf([])) честен только при rc=0: «сервер ответил,
+    записей нет». На rc=9 («;; communications error» идёт в STDOUT, 2>/dev/null
+    от этого не спасает — проверено живьём) пустота означает «ответа нет», а
+    прежний разбор подписывал её «TXT-записей у домена нет вообще» и совал
+    оператору совет «добавить TXT»: поставленная по такому совету вторая
+    запись превращает живую зону в PermError (RFC 7208 §3.6). 'unchecked'
+    (rc=127, dig нет) — «не проверено»: спрашивать было не чем.
+    """
+    verb = 'не проверено' if state == 'unchecked' else 'не получены'
+    return {'status': 'warn', 'reason': 'unchecked',
+            'lookups': 0, 'includes': [], 'revoked': False,
+            'detail': f'{verb}: {why}. Это НЕ «{what}» — совет по этой строке '
+                      f"не даём; почините резолвер/dig и перепроверьте"}
+
+
 def summarize_mail_auth(domain, spf_out, dmarc_out, dkim_out, ptr_out,
                         ip='', note='', header=True, ext=None, resolver='',
-                        verify_wanted=False):
+                        verify_wanted=False, states=None, ptr_answered=True,
+                        ptr_why=''):
     """(вердикт, строки) по СЫРЫМ выводам dig — чистая, все ветки в тестах.
 
     ip='' означает «A-записи нет»: PTR в этом случае НЕ проверен, и это warn, а
     не ❌ — мы не знаем про него ничего, врать оператору нельзя.
+
+    states (1.32.30) — состояния локальных спросов от носителя dig: {kind:
+    (state, why)}. Для 'fail'/'unchecked' диагноз по пустому выводу НЕ
+    печатается: вместо «SPF нет» и «добавить TXT» строка «не получены/не
+    проверено» (см. _unasked_detail). 'records'/'none' — обычный разбор: на
+    ОТВЕТИВШЕМ сервере пустой ответ и есть честное «записей нет».
+    ptr_answered/ptr_why — то же для PTR (носом решается в _ptr_view).
 
     ext — ответы «из интернета» (external_auth_answers). Если сверка состоялась
     ('answered'), вердикт, иконки шапки и подсказки считаются по ПУБЛИЧНОЙ
@@ -1949,10 +2346,19 @@ def summarize_mail_auth(domain, spf_out, dmarc_out, dkim_out, ptr_out,
     «сверять нечем»: в обоих случаях ext — None, а следствия разные: во втором
     случае локальные ✅ ничем не подтверждены.
     """
-    local = {'spf': parse_spf(parse_dns_txt(spf_out)),
-             'dkim': parse_dkim(dkim_out, domain),
-             'dmarc': parse_dmarc(parse_dns_txt(dmarc_out))}
-    ptr_status, ptr_text = _ptr_view(ip, parse_ptr(ptr_out))
+    states = states or {}
+
+    def _asked(kind, parsed):
+        state, why = states.get(kind, (None, None))
+        if state in ('fail', 'unchecked'):
+            return _unasked_detail(state, why or '', _UNASKED_WHAT[kind])
+        return parsed
+
+    local = {'spf': _asked('spf', parse_spf(parse_dns_txt(spf_out))),
+             'dkim': _asked('dkim', parse_dkim(dkim_out, domain)),
+             'dmarc': _asked('dmarc', parse_dmarc(parse_dns_txt(dmarc_out)))}
+    ptr_status, ptr_text = _ptr_view(ip, parse_ptr(ptr_out),
+                                     answered=ptr_answered, why=ptr_why)
 
     verified = bool(ext and ext.get('answered'))
     if verified:
@@ -2082,17 +2488,66 @@ def mail_auth_lines(checker, domain, note='', header=True, resolver='',
     'unverified' / ''), чтобы сводка считала масштаб беды из факта, а не из
     текста. Порядок первых трёх (вердикт, строки, ip) не менялся: ip был
     добавлен тем же способом.
+
+    1.32.30: локальные спросы идут через носителя dig (dig_records_info /
+    parse_dig_records), а не через `exec_command(... 2>/dev/null)`: тот решал по
+    пустоте stdout и не видел rc. Замер из dns.py: при недоступном резолвере
+    dig печатает «;; communications error…» в STDOUT при rc=9 — parse_dns_txt
+    принимал это за TXT, а честная пустота при том же rc подписывалась «SPF
+    нет» с советом «добавить TXT» (вторая запись — PermError). Тот же rc=127 —
+    «не чем спросить» — теперь «не проверено». Семантика та же, что во внешнем
+    пути (DIG_RC_ANSWERED решает, «;;»-мусор отсекается). Цена та же: 4-5
+    команд, PTR — только по полученному IPv4.
     """
-    ip = first_ipv4(checker.exec_command(a_query_command(domain))[0])
+    a_info = dig_records_info(checker, 'A', domain)
+    ip = first_ipv4('\n'.join(a_info['records'])) \
+        if a_info['state'] == 'records' else ''
+    spf_info = dig_records_info(checker, 'TXT', domain)
+    dmarc_info = dig_records_info(checker, 'TXT', '_dmarc.' + domain)
+    # DKIM — цикл, а не один спрос: состояние решает rc цикла (первый отказ
+    # dig, см. dkim_query_command), содержимое — носитель parse_dig_records.
+    # Второй слой (1.32.31, ревью): сервисные строки dig («;; Warning» при
+    # rc=0 — замер dns.py) приезжают ПОСЛЕ префикса «имя|», и носитель видит
+    # такую строку содержательной (state='records'); _dkim_recs_unusable
+    # снимает пачку до вердикта — иначе мусор, отфильтрованный parse_dkim,
+    # подписал бы «DKIM-подписи нет» там, где резолвер только предупредил.
+    dkim_out, dkim_err, dkim_rc = checker.run(dkim_query_command(domain))
+    dkim_state, dkim_recs, dkim_why = parse_dig_records(dkim_out, dkim_err,
+                                                        dkim_rc)
+    if dkim_state == 'records' and _dkim_recs_unusable(dkim_recs):
+        why = ''
+        for rec in dkim_recs:
+            tail = rec.partition('|')[2].strip()
+            if tail:
+                why = tail[:200]
+                break
+        dkim_state, dkim_recs = 'fail', []
+        dkim_why = (why or 'сервисные строки dig') + \
+            ': содержательных ответов нет (rc=0)'
+    if ip:
+        ptr_info = dig_records_info(checker, '-x', ip)
+        ptr_out = ('\n'.join(ptr_info['records'])
+                   if ptr_info['state'] == 'records' else '')
+        ptr_answered = ptr_info['state'] in ('records', 'none')
+        ptr_why = ptr_info['why'] or ''
+    else:
+        # Спрашивать не по чему: «не спросили», а не «записи нет» — решает
+        # _ptr_view по пустому ip той же честной строкой.
+        ptr_out, ptr_answered, ptr_why = '', True, ''
     verdict, lines, diff_state = summarize_mail_auth(
         domain,
-        checker.exec_command(spf_query_command(domain))[0],
-        checker.exec_command(dmarc_query_command(domain))[0],
-        checker.exec_command(dkim_query_command(domain))[0],
-        checker.exec_command(ptr_query_command(ip))[0] if ip else '',
+        '\n'.join(spf_info['records']) if spf_info['state'] == 'records' else '',
+        '\n'.join(dmarc_info['records'])
+        if dmarc_info['state'] == 'records' else '',
+        '\n'.join(dkim_recs) if dkim_state == 'records' else '',
+        ptr_out,
         ip=ip, note=note, header=header,
         ext=external_auth_answers(checker, domain, resolver) if resolver else None,
-        resolver=resolver, verify_wanted=verify_wanted)
+        resolver=resolver, verify_wanted=verify_wanted,
+        states={'spf': (spf_info['state'], spf_info['why']),
+                'dmarc': (dmarc_info['state'], dmarc_info['why']),
+                'dkim': (dkim_state, dkim_why)},
+        ptr_answered=ptr_answered, ptr_why=ptr_why)
     return verdict, lines, ip, diff_state
 
 
@@ -2293,8 +2748,8 @@ def domain_detail_report(checker, domain, panel_type=None):
         lines.append("❌ Домен не задан корректно")
         return "\n".join(lines)
 
-    site = next((s for s in discover_sites(checker, panel_type)
-                 if s['domain'] == dom), None)
+    sites, site_gaps = discover_sites_info(checker, panel_type)
+    site = next((s for s in sites if s['domain'] == dom), None)
     if site:
         lines.append(f"Сайт: владелец={site['owner'] or '?'} "
                      f"docroot={site['docroot'] or '?'} "
@@ -2305,32 +2760,75 @@ def domain_detail_report(checker, domain, panel_type=None):
         for log in find_logs(checker, panel_type, dom, 'error')[:2]:
             lines.append(f"Лог ошибок: {log}")
     else:
+        # discover_sites_info, а не discover_sites (1.32.30): при закрытом
+        # каталоге vhost'ов досье печатало окончательное «домен не найден ни в
+        # панели, ни в vhost'ах» — про каталог, в который не заглянули. Оговорка
+        # обязана ехать в ту же строку, где стоит «не найден».
         lines.append("⚠️ Домен не найден ни в списке панели, ни в vhost'ах. "
                      "Проверьте, что A-запись вообще указывает на этот сервер.")
+        if site_gaps:
+            lines.append("   Но «не найден» здесь не значит «нет»: поиск был "
+                         "неполон, вот почему:")
+            for gap in site_gaps:
+                lines.append(f"   {gap}")
 
-    status = parse_site_status(checker.exec_command(site_status_command(dom))[0])
-    icon = http_status_icon(status['http'], status['https'])
-    # Подпись — общим ssl_note, а не «ok / истекает/нет». Команда пробы знает о
-    # сертификате только «ok / не ok», и в эту одну подпись сваливались три
-    # разные беды: «истёк 4 дня назад» (браузер уже ругается), «истекёт через
-    # 9 дней» (чинить на неделе) и «сертификата нет вообще». У оператора досье
-    # и сводки обязаны называть беду одними словами. Проба при этом та же —
-    # второй пробы ради одной строки не добавилось.
-    lines.append(f"\n{icon} Доступность: http={status['http']} "
-                 f"https={status['https']}"
-                 + ssl_note(status, sep=' | '))
+    # run(), а не exec_command(): rc=124 (дедлайн канала) иначе теряется и
+    # зависшая проба закрывает досье ложным «сайт молчит».
+    out_s, _err_s, rc_s = checker.run(site_status_command(dom))
+    status = parse_site_status(out_s, rc=rc_s)
+    if status['state'] == 'hung':
+        lines.append("\n⚠️ Доступность: проба зависла (дедлайн канала) — "
+                     "состояние сайта не проверено; проверьте соединение "
+                     "и повторите")
+    elif status['state'] == 'no_tool':
+        # 1.32.30: без curl кодов нет, а пустота в прежнем разборе становилась
+        # «❌ молчит» — досье враньём закрывало тикет живого сайта.
+        lines.append("\n⚠️ Доступность: curl на сервере нет — состояние сайта "
+                     "не проверено (ни кодов, ни сертификата мы не видели)")
+    else:
+        icon = http_status_icon(status['http'], status['https'])
+        # Подпись — общим ssl_note, а не «ok / истекает/нет». Команда пробы знает о
+        # сертификате только «ok / не ok», и в эту одну подпись сваливались три
+        # разные беды: «истёк 4 дня назад» (браузер уже ругается), «истекёт через
+        # 9 дней» (чинить на неделе) и «сертификата нет вообще». У оператора досье
+        # и сводки обязаны называть беду одними словами. Проба при этом та же —
+        # второй пробы ради одной строки не добавилось.
+        lines.append(f"\n{icon} Доступность: http={status['http']} "
+                     f"https={status['https']}"
+                     + ssl_note(status, sep=' | '))
 
     lines.append("\nDNS (с самого сервера, dig):")
+    # Носитель dig_records_info (1.32.30), а не `exec_command('dig +short …
+    # 2>/dev/null')`: тот разбор решал по пустоте stdout, а живьём rc=9 печатает
+    # «;; communications error…» именно в stdout — строка ошибки резолвера
+    # печаталась ЗНАЧЕНИЕМ записи, и та же пустота при недоступном dig
+    # подписывалась «— нет записей». rtype — внутренний литерал (A/AAAA/MX),
+    # в команде не кавычится (так же, как в dns.py).
     for rtype in ('A', 'AAAA', 'MX'):
-        out, _ = checker.exec_command(f'dig +short {rtype} {q(dom)} 2>/dev/null')
-        values = ' '.join((out or '').split())
-        lines.append(f"  {rtype}: {values or '— нет записей'}")
+        info = dig_records_info(checker, rtype, dom)
+        if info['state'] == 'records':
+            value = ', '.join(info['records'])
+        elif info['state'] == 'none':
+            value = '— нет записей'
+        elif info['state'] == 'fail':
+            value = f"❌ не получены: {info['why']}"
+        else:
+            value = f"⚠️ не проверено: {info['why']}"
+        lines.append(f"  {rtype}: {value}")
 
     mail_domains = discover_mail_domains(checker, panel_type)
     if dom in mail_domains:
-        boxes = discover_mailboxes(checker, panel_type, domain=dom)
+        # discover_mailboxes_info (1.32.30): «ящиков: 0» при нечитаемом
+        # источнике — неверное утверждение; в досье нет общего блока пробелов,
+        # куда можно сослаться, поэтому причина печатается сразу за числом.
+        boxes, box_notes, box_blocked = discover_mailboxes_info(
+            checker, panel_type, domain=dom)
         lines.append(f"\nДомен почтовый (источники: {', '.join(mail_domains[dom])}), "
                      f"ящиков: {len(boxes)}")
+        if box_notes or box_blocked:
+            why = (box_notes[0] if box_notes
+                   else 'часть почтовых источников не прочитана')
+            lines.append(f"   Но число ящиков может быть неполным: {why}")
         for addr, source in boxes[:20]:
             lines.append(f"  {addr}  [{source}]")
         # Аутентификация спрашивается ТОЛЬКО у почтового домена: у чисто веб-
@@ -2381,8 +2879,11 @@ def domain_detail_report(checker, domain, panel_type=None):
 #               где ID числовой и берётся из строки `boxes list`
 # Команды собирают чистые функции (проверяются тестами без SSH): операционные
 # функции ниже лишь валидируют ввод, выполняют команду и показывают ответ
-# панели. Пароль нигде не печатается в отчёте; в ps на сервере он виден —
-# предупреждение входит в отчёт (тот же компромисс, что у mogwai chpasswd).
+# панели. Пароль нигде не печатается в отчёте. В argv пароль НЕ уходит никогда:
+# у mogwai канал секрета только argv (--password=аргумент, env/файл/stdin в
+# документации отсутствует), поэтому создание ящика FASTPANEL ОТКАЗАНО до
+# обращения к панели — см. _mailbox_action; носитель ISPmanager (env-файл 0600)
+# к mogwai не переносится, а выдумывать несуществующий флаг запрещено.
 
 MAILBOX_LOCAL_RE = re.compile(r'^[a-z0-9._%+-]{1,64}$')
 MAILBOX_DOMAIN_RE = re.compile(
@@ -2585,12 +3086,15 @@ def isp_mailbox_delete_command(address):
     return f'{MGRCTL} email.delete elid={q(address)} 2>&1'
 
 
-def fp_mailbox_create_command(local, domain, password):
-    """mogwai emails boxes create — параметры дословно из KB FASTPANEL."""
-    return (f'mogwai emails boxes create --domain={q(domain)} '
-            f'--login={q(local)} --password={q(password)} 2>&1')
-
-
+# Функции fp_mailbox_create_command здесь больше нет. Она собирала
+# `mogwai emails boxes create --password=<секрет>` — единственный канал Mogwai
+# для пароля ящика (argv), а argv на общем сервере виден всем локальным
+# пользователям в ps и оседает в истории shell. Измеренного env/файлового/
+# stdin-канала у mogwai нет (в отличие от mgrctl `-e 'passwd=$ENV'`), и
+# подставить честный носитель не во что. Оставленный сборщик — взведённый
+# пистолет: любой будущий вызов уводит секрет в argv, поэтому создание ящика
+# FASTPANEL отказывается целиком (_mailbox_action), а строку с паролем в argv
+# не собирает уже ничто.
 def fp_mailbox_delete_command(box_id):
     """-b принимает только числовой ID из `mogwai emails boxes list`.
 
@@ -2820,6 +3324,28 @@ def _mailbox_action(checker, address, password, panel_type, mode):
         lines.append("    (mogwai emails boxes умеет только create/delete).")
         lines.append("    Смените пароль в панели: Почта → Ящики → «Изменить».")
         return "\n".join(lines)
+    if panel_type == 'fastpanel' and mode == 'create':
+        # Создавать ящик здесь нельзя, хотя команда в KB есть: единственный
+        # канал пароля у mogwai — argv (--password=аргумент), env/файл/stdin
+        # документацией не предусмотрены, а трюк mgrctl «-e passwd=$ENV» сюда
+        # не переносится (у mogwai своего механизма подстановки нет). Пароль в
+        # argv виден в ps всем локальным пользователям и остаётся в истории
+        # shell — это секрет, которого мы в командную строку не кладём НИКОГДА
+        # (тот же закон, из-за которого ISPmanager переведён на env-файл).
+        # Отказ — ДО любого обращения к панели: guard читает mogwai списки, а
+        # спрашивать их ради операции, которая не уйдёт, — лишние запросы
+        # (тот же порядок, что у отказа выше).
+        lines.append("⛔ Ящик НЕ создан: операция НЕ выполнена, ни одна")
+        lines.append("    команда mogwai на сервер не отправлялась.")
+        lines.append("    Причина: CLI FASTPANEL принимает пароль ящика только")
+        lines.append("    аргументом команды (--password=…), то есть пароль")
+        lines.append("    был бы виден в ps всем локальным пользователям и")
+        lines.append("    остался бы в истории shell. Других каналов передачи")
+        lines.append("    секрета (окружение, файл, stdin) у mogwai нет.")
+        lines.append("    Безопасная альтернатива: заведите ящик в панели")
+        lines.append("    (Почта → Ящики → «Создать» — там пароль не идёт")
+        lines.append("    через argv) либо назначайте пароли политикой панели.")
+        return "\n".join(lines)
 
     parsed, err = parse_mailbox_address(address)
     if parsed is None:
@@ -2879,17 +3405,14 @@ def _mailbox_action(checker, address, password, panel_type, mode):
             # совпадает с примером из документации ISPsystem, значит её можно
             # повторить руками, экспортировав переменную.
             shown = isp_mailbox_env_command(args)
-    else:  # fastpanel (passwd отсеян выше)
-        if mode == 'create':
-            cmd = fp_mailbox_create_command(local, domain, password)
-        else:
-            rows, _rc = mogwai(checker, 'emails boxes list')
-            box_id = find_fp_mailbox_id(parse_mogwai_table(rows), addr)
-            if box_id is None:
-                lines.append(f"⛔ mogwai не вернул числовой ID ящика {addr} — "
-                             "удаление отменено (нужен именно ID из boxes list).")
-                return "\n".join(lines)
-            cmd = fp_mailbox_delete_command(box_id)
+    else:  # fastpanel: create и passwd отсеяны в начале функции — здесь delete
+        rows, _rc = mogwai(checker, 'emails boxes list')
+        box_id = find_fp_mailbox_id(parse_mogwai_table(rows), addr)
+        if box_id is None:
+            lines.append(f"⛔ mogwai не вернул числовой ID ящика {addr} — "
+                         "удаление отменено (нужен именно ID из boxes list).")
+            return "\n".join(lines)
+        cmd = fp_mailbox_delete_command(box_id)
 
     lines.append("$ " + redact_secrets(shown or cmd))
     secret_note = None
@@ -2942,19 +3465,16 @@ def _mailbox_action(checker, address, password, panel_type, mode):
     if mode in ('create', 'passwd'):
         # Предупреждение обязано соответствовать фактическому каналу передачи:
         # наврать «был виден в ps» там, где мы его убрали, — обесценить сам
-        # фикс (оператор перестанет верить отчёту целиком).
+        # фикс (оператор перестанет верить отчёту целиком). FASTPANEL-ной
+        # ветки («пароль был виден в ps») здесь больше нет: create/passwd для
+        # FASTPANEL отсеяны в начале функции, предупреждать не о чем — текст о
+        # канале, которого у операции не было, висял бы как описание чужого
+        # инструмента.
         if panel_type == 'ispmanager':
             lines.append("ℹ️ Пароль передан через временный файл 0600 и окружение")
             lines.append("   процесса — в ps на сервере он не светился.")
             if secret_note is None:
                 lines.append("   Файл удалён сразу после команды панели.")
-        else:
-            # FASTPANEL: mogwai не умеет принимать пароль из окружения или со
-            # stdin — только --password=аргумент. Это ограничение CLI панели,
-            # честно говорим о нём, а не делаем вид, что его нет.
-            lines.append("⚠️ CLI FASTPANEL принимает пароль только аргументом —")
-            lines.append("   он был виден в ps на сервере. При возможности")
-            lines.append("   смените пароль на постоянный через панель.")
     return "\n".join(lines)
 
 

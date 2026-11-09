@@ -21,10 +21,11 @@ from gui_fastpanel import FastpanelMixin, FASTPANEL_MENU
 from gui_bitrix import BitrixMixin, BITRIX_MENU
 from gui_hosting import HostingMixin, HOSTING_MENU
 from gui_files import FilesMixin
+from gui_ssl import SslInstallMixin
 from common import __version__
 
 
-class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin, FastpanelMixin, BitrixMixin, HostingMixin, FilesMixin):
+class DiagnosticApp(ThemesMixin, ProfilesMixin, OutputMixin, RunnerMixin, ChecksMixin, SwapMixin, DnsMixin, AdminMixin, IspmanagerMixin, FastpanelMixin, BitrixMixin, HostingMixin, FilesMixin, SslInstallMixin):
     def __init__(self):
         self.initial_theme = detect_system_theme()
         self.root = tb.Window(themename=self.initial_theme)

@@ -11,6 +11,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from support import FakeSSH, FakeSftpClient
+from common import q
 import files as files_mod
 
 BACKUP_OK = [('mkdir -p', ('created', '', 0)), ('test -f', ('exists', '', 0))]
@@ -341,30 +342,89 @@ class TestConfigFileSearchExplainsGaps:
 
 
 class TestReplaceIpv4ErrorBranch:
-    def test_failed_find_shows_warning(self):
-        # поведение как в исходнике: предупреждение, но операция продолжается
+    def test_failed_find_is_not_success(self):
+        # 1.32.30: прежняя форма печатала «✅ заменён» и при rc!=0 — частичный
+        # провал (права, read-only) читался как полный успех. Теперь ✅ только
+        # при rc=0.
         c = FakeSSH(routes=[('find /etc', ('', "sed: couldn't write", 1)),
                             ('list-unit-files', 'no\n')])
         out = files_mod.replace_ipv4(c, '1.1.1.1', '2.2.2.2')
-        assert '⚠️ Возможны ошибки (rc=1)' in out
+        assert '⚠️ Замена НЕ подтверждена целиком (rc=1' in out
+        assert "sed: couldn't write" in out
+        assert '✅ IPv4 заменён' not in out
+
+    def test_ipv4_now_makes_backup_first(self):
+        # Раньше ipv4-ветка переписывала /etc без всякого резерва (у ipv6 он
+        # был). Право на массовую правку — записанный откат.
+        c = FakeSSH(routes=[('tar czf', ('', '', 0)),
+                            ('find /etc', ('', '', 0)),
+                            ('list-unit-files', 'no\n')])
+        out = files_mod.replace_ipv4(c, '1.1.1.1', '2.2.2.2')
+        assert '✅ Резервная копия /etc' in out
         assert '✅ IPv4 заменён' in out
 
 
 class TestReplaceIpv6BackupFailure:
-    def test_etc_backup_failure_warns(self):
-        c = FakeSSH(routes=[('tar czf', ('', 'tar: /etc: permission denied', 2))])
+    def test_etc_backup_failure_vetoes_operation(self):
+        # 1.32.30: прежний «(продолжаем)» означал «переписываем /etc без
+        # средства отката». Теперь отказ резерва снимает операцию.
+        c = FakeSSH(routes=[('tar czf', ('', 'tar: /etc: permission denied',
+                                         2))])
         out = files_mod.replace_ipv6(c, 'a::a', 'b::b')
-        assert '⚠️ Не удалось создать резервную копию /etc' in out
-        assert '✅ IPv6 заменён' in out
+        assert '❌ Правка снята: резерв /etc не создан (rc=2' in out
+        assert 'tar: /etc: permission denied' in out
+        assert '✅ IPv6 заменён' not in out
+        assert not any('find /etc' in cmd for cmd in c.commands)
 
-    def test_sed_failure_warns_but_operation_continues(self):
-        # та же ветка, что уже закрыта для IPv4: rc!=0 у find/sed —
-        # предупреждение с текстом STDERR, но отчёт не обрывается
+    def test_sed_failure_is_not_success(self):
+        # та же ветка, что для IPv4: rc!=0 у find/sed — «не подтверждено»
+        # с текстом STDERR, а не «✅ заменён».
         c = FakeSSH(routes=[('find /etc', ('', "sed: couldn't edit", 1))])
         out = files_mod.replace_ipv6(c, 'a::a', 'b::b')
-        assert '⚠️ Возможны ошибки (rc=1)' in out
+        assert '⚠️ Замена НЕ подтверждена целиком (rc=1' in out
         assert "sed: couldn't edit" in out
-        assert '✅ IPv6 заменён' in out
+        assert '✅ IPv6 заменён' not in out
+
+
+class TestReplaceIpHardening:
+    """1.32.30 (ревью): право на подстановку даёт алфавит, а не «валидность»."""
+
+    PAYLOAD = "fe80::1%'; touch PWN ; '"
+
+    def test_scope_id_payload_rejected_not_run(self):
+        # Замер на venv проекта: IPv6Address(PAYLOAD) — ВАЛИДЕН (scope ID
+        # принимает произвольный ASCII после '%'). Прежний гейт «валиден ли
+        # IP» пропускал апостроф, рвущий кавычение sed: произвольная команда
+        # на сервере от имени SSH-юзера (обычно root).
+        import ipaddress
+        ipaddress.IPv6Address(self.PAYLOAD)  # замер: это действительно valid
+        c = FakeSSH()
+        out = files_mod.replace_ipv6(c, self.PAYLOAD, 'b::b')
+        assert '❌ Некорректный IPv6-адрес — операция отменена' in out
+        assert c.commands == []  # ни одной команды, включая резерв
+
+    def test_injection_as_new_ip_rejected_too(self):
+        c = FakeSSH()
+        out = files_mod.replace_ipv6(c, 'fe80::1', self.PAYLOAD)
+        assert '❌ Некорректный IPv6-адрес — операция отменена' in out
+        assert c.commands == []
+
+    def test_sed_pattern_escapes_dots_and_boundaries(self):
+        # Точки экранированы; границы слова защищают от подстроки
+        # (1.1.1.1 матчился внутри 211.1.1.15).
+        c = FakeSSH(routes=[('tar czf', ('', '', 0)),
+                            ('find /etc', ('', '', 0)),
+                            ('list-unit-files', 'no\n')])
+        files_mod.replace_ipv4(c, '1.1.1.1', '2.2.2.2')
+        cmd = next(cmd for cmd in c.commands if 'find /etc' in cmd)
+        assert r"s#\<1\.1\.1\.1\>#2.2.2.2#g" in cmd
+
+    def test_ipv6_pattern_boundary_only_where_it_works(self):
+        # Замер sed 4.10: \< перед ':' не матчится никогда, поэтому у паттерна,
+        # начинающегося с ':', границы спереди нет (иначе замена молча не
+        # происходила бы).
+        assert files_mod._sed_ip_pattern('fe80::1') == r'\<fe80::1\>'
+        assert files_mod._sed_ip_pattern('::1') == r'::1\>'
 
 
 class TestRestartServices:
@@ -546,3 +606,163 @@ class TestRestartServicesPresence:
         assert c.find('systemctl reload') is None, c.commands
         assert c.find('systemctl restart') is None, c.commands
         assert c.find('is-active') is None, c.commands
+
+
+class TestPanelDirectoryProbeHonesty:
+    """Панельная ветка (LC_ALL=C find … | head): классификатор знал два
+    текста errno; любой другой отказ молча подавался как «каталог прочитан,
+    файлов нет» (1.32.31, ревью). rc пайпа принадлежит head и нам не
+    принадлежит — свидетель один: непустой stderr."""
+
+    def test_unrecognized_find_error_becomes_unchecked(self):
+        c = FakeSSH(routes=[('LC_ALL=C find',
+                             ('', 'find: /usr/local/fastpanel: Input/output '
+                              'error', 1))])
+        _files, notes = files_mod.get_config_files_info(c, 'fastpanel')
+        assert any('недоступен' in n for n in notes), notes
+
+    def test_find_absent_is_unchecked_not_empty(self):
+        c = FakeSSH(routes=[('LC_ALL=C find',
+                             ('', 'bash: find: command not found', 127))])
+        _files, notes = files_mod.get_config_files_info(c, 'fastpanel')
+        assert any('недоступен' in n for n in notes), notes
+
+    def test_clean_read_stays_silent(self):
+        # Чистый stderr: прочитан пустой каталог — ответа не требуется.
+        c = FakeSSH(routes=[('LC_ALL=C find', ('', '', 0))])
+        _files, notes = files_mod.get_config_files_info(c, 'fastpanel')
+        assert not any('недоступен' in n for n in notes)
+
+
+class TestIpAlphabetIsNotValidity:
+    """Право на подстановку в sed даёт алфавит СТРОКИ, а не «валидность».
+
+    Валидатор пропускает не-строку: ipaddress.IPv4Address(1) — валидный адрес,
+    а `_sed_ip_pattern` брал value[0] (замер на venv 3.15: TypeError 'int'
+    object is not subscriptable — падение посреди разрушительной операции).
+    Короткие формы ('1' = 0.0.0.1) в этом интерпретаторе отбраковывает сам
+    ipaddress — замер: AddressValueError, — и этот замок нельзя ослаблять:
+    прошёл бы '1' в паттерн, sed выжигал бы одиночную цифру во всём /etc.
+    """
+
+    def test_non_string_ip_is_refused_without_a_single_command(self):
+        c = FakeSSH()
+        out = files_mod.replace_ipv4(c, 1, 2)
+        assert '❌ Некорректный IPv4-адрес — операция отменена' in out
+        assert c.commands == []
+
+    def test_non_string_ipv6_is_refused_without_a_single_command(self):
+        c = FakeSSH()
+        out = files_mod.replace_ipv6(c, 1, 2)
+        assert '❌ Некорректный IPv6-адрес — операция отменена' in out
+        assert c.commands == []
+
+    def test_decimal_short_form_never_reaches_sed(self):
+        # Замер ipaddress на venv 3.15: IPv4Address('1') и IPv6Address('1') —
+        # AddressValueError. Если интерпретатор когда-нибудь это ослабит,
+        # алфавит и границы слова обязаны удержать операцию сами.
+        for value in ('1', '01.2.3.4', '1.2'):
+            c = FakeSSH()
+            out = files_mod.replace_ipv4(c, value, '2.2.2.2')
+            assert '❌ Некорректный IPv4-адрес' in out, value
+            assert c.commands == []
+
+    def test_pattern_builder_survives_any_validated_text(self):
+        # _sed_ip_pattern работает со СТРОКОЙ, независимо от того, чем его
+        # покормили до гейта: падения здесь быть не может в принципе.
+        assert files_mod._sed_ip_pattern('fe80::1') == r'\<fe80::1\>'
+
+
+class TestEtcBackupIsASecretCarrier:
+    """Архив /etc — это копия /etc/shadow, ключей и панельных паролей.
+
+    Файл создавался по umask вызывающего (замер на машине venv, GNU tar 1.35:
+    без umask — 0644), то есть «мы сделали откат» было выгрузкой секретов в
+    место, читаемый всеми локальными пользователями сервера. Права обязаны
+    быть у файла с первой секунды (тот же порядок, что у prepare_secret_file),
+    а названы — снимком, а не намерением.
+    """
+
+    ROUTES_OK = [('tar czf', ('ARCHMODE=600\n', '', 0)),
+                 ('find /etc', ('', '', 0)),
+                 ('list-unit-files', 'no\n')]
+
+    def test_archive_is_created_under_umask_077(self):
+        c = FakeSSH(routes=self.ROUTES_OK)
+        files_mod.replace_ipv6(c, 'fe80::1', 'fe80::2')
+        cmd = next(x for x in c.commands if 'tar czf' in x)
+        assert cmd.startswith('umask 077;'), cmd
+        assert 'chmod 600' in cmd
+        # Код возврата отдаём таровский: chmod не имеет права ни отменить
+        # успех резерва, ни объявить провалом чужую беду.
+        assert 'exit $__tar' in cmd
+
+    def test_open_mode_is_named_from_the_snapshot(self):
+        c = FakeSSH(routes=[('tar czf', ('ARCHMODE=644\n', '', 0)),
+                            ('find /etc', ('', '', 0)),
+                            ('list-unit-files', 'no\n')])
+        out = files_mod.replace_ipv4(c, '1.1.1.1', '2.2.2.2')
+        assert 'НЕ защищён от чтения другими пользователями' in out
+        assert '644' in out
+        # Право на правку это даёт (резерв есть), но оператор обязан увидеть,
+        # что копия /etc лежит открытой.
+        assert '✅ IPv4 заменён' in out
+
+    def test_missing_mode_marker_is_admitted_not_invented(self):
+        # «права не сняты» честнее выдуманного 0600: маркера в выводе нет —
+        # значит stat не отработал, и мы этого не знаем.
+        c = FakeSSH(routes=[('tar czf', ('', '', 0)),
+                            ('find /etc', ('', '', 0)),
+                            ('list-unit-files', 'no\n')])
+        out = files_mod.replace_ipv4(c, '1.1.1.1', '2.2.2.2')
+        assert 'НЕ защищён' in out and 'не сняты' in out
+
+    def test_mode_marker_is_not_the_veto_reason(self):
+        # Маркер служебный: причиной отказа печатается строка tar, а не наша
+        # собственная печать.
+        c = FakeSSH(routes=[('tar czf',
+                             ('tar: /etc/shadow: Cannot open: Permission '
+                              'denied\nARCHMODE=600\n', '', 2))])
+        out = files_mod.replace_ipv6(c, 'fe80::1', 'fe80::2')
+        assert '❌ Правка снята: резерв /etc не создан (rc=2' in out
+        assert 'Cannot open' in out
+        assert 'ARCHMODE' not in out
+
+    def test_partial_archive_is_named_partial(self):
+        # Замер GNU tar 1.35: rc=1 — «файл изменился во время чтения», архив
+        # на диске. «Не создан» соврало бы про факт, «готов» соврал бы про
+        # смысл; операция снимается в обоих случаях.
+        c = FakeSSH(routes=[('tar czf', ('tar: /etc/hosts: файл изменился во '
+                                         'время чтения\nARCHMODE=600\n', '', 1))])
+        out = files_mod.replace_ipv4(c, '1.1.1.1', '2.2.2.2')
+        assert 'Резерв /etc неполный' in out
+        assert 'не создан' not in out
+        assert '❌ Правка снята' in out
+        assert not any('find /etc' in cmd for cmd in c.commands), c.commands
+
+    def test_rollback_hint_prints_the_path_copy_paste_ready(self):
+        # Подсказку копипастят в терминал: путь в ней обязан быть тем же
+        # самым путём, что назван выше, и в кавычках ровно там, где их требует
+        # q() (путь бэкапа без спецсимволов кавычек не получает — проверим
+        # саму форму команды, а не наличие апострофа).
+        c = FakeSSH(routes=self.ROUTES_OK)
+        out = files_mod.replace_ipv4(c, '1.1.1.1', '2.2.2.2')
+        line = next(ln for ln in out.splitlines() if 'Резервная копия /etc' in ln)
+        path = line.split(': ', 1)[1].split(' (откат:', 1)[0]
+        assert f'tar xzf {q(path)} -C /' in line, line
+
+
+class TestPanelFindKeepsPathCharacters:
+    """find печатает путь ЦЕЛИКОМ: из строки режем только перевод строки."""
+
+    def test_spaces_and_cyrillic_survive_the_listing(self):
+        # Пробел на краю имени — настоящая часть имени: find печатает его, а
+        # strip() срезал. Редактор открывал бы путь, которого нет, «Сохранить»
+        # создавало бы второй файл рядом с настоящим, а «Удалить» — промахнулось
+        # бы мимо настоящего (тот же закон, что у read_file: путь байт в байт).
+        path = '/etc/nginx/vhosts/мой сайт .conf '
+        c = FakeSSH(routes=[('LC_ALL=C find', (path + '\r\n', '', 0))])
+        files, _notes = files_mod.get_config_files_info(c, 'fastpanel')
+        assert path in files, files
+        # Перевод строки (включая оконный) убран, остальное — на месте.
+        assert all(not f.endswith(('\n', '\r')) for f in files), files

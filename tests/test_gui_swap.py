@@ -117,6 +117,18 @@ class TestCreateSwapDialog:
         assert msg.asks == []          # до подтверждения не дошло
         assert host.simples == []
 
+    def test_non_positive_size_rejected_before_confirmation(self, monkeypatch):
+        # int('-5') и int('0') проходят парсер без ошибки, но команды с таким
+        # размером не существует: `fallocate -l -5M` отказывает по-своему, а
+        # заголовок отчёта уже пообещал «-5 МБ».
+        for answer in ('0', '-5'):
+            _d, msg = _patch(monkeypatch, answers=[answer])
+            host = _Host(FakeSSH())
+            host.create_swap()
+            assert msg.events == [('error', 'Ошибка',
+                                   'Размер должен быть больше нуля')], answer
+            assert msg.asks == [] and host.simples == [], answer
+
     def test_declined_confirmation_runs_no_thread(self, monkeypatch):
         _d, msg = _patch(monkeypatch, answers=['1024'], askyesno_ret=False)
         host = _Host(FakeSSH())
@@ -162,22 +174,35 @@ class TestAddSwapToFstabDialog:
 class TestCreateSwapFile:
     def test_insufficient_space_aborts_before_write(self):
         # доступно 500 МБ, просим 1024 (+100 запас) — команда не уходит
-        c = FakeSSH(routes=[('df -m', '500\n')])
+        c = FakeSSH(routes=[('df -Pm', 'SWAPFREE ok 500\n')])
         out = _Host(c)._do_create_swap(1024)
         assert '❌ Недостаточно свободного места' in out
         assert c.find('fallocate') is None
         assert c.find('mkswap') is None
 
-    def test_non_numeric_free_is_treated_as_zero(self):
-        # df вернул мусор (панель/язык) — isdigit() ложно, free_mb=0
-        c = FakeSSH(routes=[('df -m', '  \n')])
-        out = _Host(c)._do_create_swap(1024)
-        assert '❌ Недостаточно свободного места' in out
-        assert c.find('fallocate') is None
+    def test_unmeasured_space_is_not_claimed_as_no_space(self):
+        # Пустой вывод df (утилита не найдена, вывод сломан) и отказ df (rc≠0)
+        # — два разных мира, и НИ ОДИН из них не «места нет». Прежний код
+        # превращал пустоту в free_mb=0 и печатал «Недостаточно свободного
+        # места (доступно 0 МБ)» там, где место не измерялось вовсе.
+        for answer in ('', '   \n', 'SWAPFREE fail 1\n', 'SWAPFREE ok x\n'):
+            c = FakeSSH(routes=[('df -Pm', answer)])
+            out = _Host(c)._do_create_swap(1024)
+            assert '❌ Свободное место не прочитано' in out, answer
+            assert 'Недостаточно' not in out, answer
+            assert c.find('fallocate') is None, answer
+
+    def test_free_space_question_carries_its_own_verdict(self):
+        # Конвейер `df | awk` отдал бы код возврата awk, поэтому вопрос задаётся
+        # одной командой с маркером: отказ df различим от «df ответил».
+        c = FakeSSH(routes=[('df -Pm', 'SWAPFREE ok 8000\n')])
+        _Host(c)._do_create_swap(1024)
+        probe = c.find('df -Pm')
+        assert probe is not None and 'SWAPFREE' in probe
 
     def test_full_sequence_in_order(self):
         c = FakeSSH(routes=[
-            ('df -m', '4000\n'),
+            ('df -Pm', 'SWAPFREE ok 4000\n'),
             ('mkswap', 'Setting up swapspace version 1, size = 1 GiB\n'),
             ('--show', '/swapfile file 1024M 0B 100%\n'),
         ])
@@ -193,24 +218,80 @@ class TestCreateSwapFile:
         assert 'fallocate -l 1024M /swapfile' in alloc
         assert 'dd if=/dev/zero of=/swapfile bs=1M count=1024' in alloc
         assert c.find('chmod 600 /swapfile') is not None
-        # вывод mkswap и таблица текущих разделов
+        # вывод mkswap и вердикт по факту, а не по списку «как есть»
         assert 'Setting up swapspace' in out
-        assert 'Текущие swap-разделы:' in out
+        assert '✅ /swapfile активен' in out
         assert '/swapfile file 1024M' in out
 
-    def test_stderr_from_commands_is_reported(self):
-        # mkswap падает с сообщением в stderr — оно должно попасть в отчёт
+    def test_failure_stops_the_chain_and_names_the_reason(self):
+        # mkswap падает с сообщением в stderr: причина обязана доехать, а
+        # swapon по незавершённому файлу отправляться не должен (четыре отказа
+        # вместо одного — это отчёт, в котором настоящую причину не найти).
         c = FakeSSH(routes=[
-            ('df -m', '8000\n'),
+            ('df -Pm', 'SWAPFREE ok 8000\n'),
             ('mkswap', ('', 'mkswap: /swapfile: insufficient memory', 1)),
         ])
         out = _Host(c)._do_create_swap(1024)
-        assert 'STDERR: mkswap: /swapfile: insufficient memory' in out
+        assert '❌ команда не выполнена (rc=1): mkswap: /swapfile: insufficient memory' in out
+        assert 'НЕ отправлены' in out
+        assert c.find('swapon /swapfile') is None
 
-    def test_clean_run_has_no_stderr_line(self):
-        c = FakeSSH(routes=[('df -m', '8000\n'), ('--show', '/swapfile file 1024M 0B 100%')])
+    def test_clean_run_has_no_error_line(self):
+        c = FakeSSH(routes=[('df -Pm', 'SWAPFREE ok 8000\n'),
+                            ('--show', '/swapfile file 1024M 0B 100%')])
         out = _Host(c)._do_create_swap(1024)
-        assert 'STDERR' not in out
+        assert '❌' not in out and '❓' not in out
+
+    def test_silent_state_probe_is_not_reported_as_inactive(self):
+        # Ни `--show`, ни `-s` не ответили: это «мы не спросили», а не «swap не
+        # активен» — красное про непроверенное в этой серии запрещено.
+        c = FakeSSH(routes=[
+            ('df -Pm', 'SWAPFREE ok 8000\n'),
+            ('swapon --show', ('', 'swapon: unrecognized option', 1)),
+            ('swapon -s', ''),
+        ])
+        out = _Host(c)._do_create_swap(1024)
+        assert '❓ Состояние swap не проверено' in out
+        assert '❌ /swapfile' not in out
+
+    def test_state_probe_falls_back_to_short_form(self):
+        # util-linux 2.23 (CentOS 7) не знает `--show`: без запасной формы
+        # работающий swap уехал бы в «не проверено».
+        c = FakeSSH(routes=[
+            ('df -Pm', 'SWAPFREE ok 8000\n'),
+            ('swapon --show', ('', 'swapon: unrecognized option', 1)),
+            ('swapon -s', 'Filename\tType\tSize\tUsed\tPriority\n'
+                          '/swapfile\tfile\t1023M\t0B\t-1\n'),
+        ])
+        out = _Host(c)._do_create_swap(1024)
+        assert '✅ /swapfile активен' in out
+
+    def test_state_absent_after_successful_commands_is_named(self):
+        # Все команды прошли, но файла в списке нет: честное ❌ со списком.
+        c = FakeSSH(routes=[('df -Pm', 'SWAPFREE ok 8000\n'),
+                            ('--show', 'NAME TYPE SIZE USED PRIO\n')])
+        out = _Host(c)._do_create_swap(1024)
+        assert '❌ /swapfile в списке активных не найден' in out
+
+
+class TestSwapParsers:
+    def test_parse_swap_free_worlds(self):
+        assert gs.parse_swap_free('SWAPFREE ok 4096\n') == ('ok', 4096)
+        assert gs.parse_swap_free('SWAPFREE fail 1\n') == ('fail', None)
+        assert gs.parse_swap_free('') == ('unchecked', None)
+        assert gs.parse_swap_free('df: /: cannot stat\n') == ('unchecked', None)
+        # «ok» без числа — не право называть число: прежний isdigit() дал бы 0
+        assert gs.parse_swap_free('SWAPFREE ok\n') == ('fail', None)
+
+    def test_parse_swapon_worlds(self):
+        assert gs.parse_swapon('/swapfile file 1024M 0B 100%') is True
+        assert gs.parse_swapon('/dev/vda2 partition 2047M 0B -1') is False
+        assert gs.parse_swapon('') is None
+        assert gs.parse_swapon('NAME TYPE SIZE USED PRIO\n') is False
+        # таблица с заголовком и файлом на второй строке
+        assert gs.parse_swapon('NAME TYPE SIZE USED PRIO\n/swapfile file 1G 0B -1'
+                               ) is True
+
 
 
 # ==================== запись в fstab ====================

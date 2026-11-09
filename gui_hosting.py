@@ -19,6 +19,7 @@ from diagnostic import (
     hosting_inventory_report, site_health_report, ssl_expiry_report,
     mail_overview_report, mail_auth_report, dns_zones_report,
     domain_detail_report, mailbox_create, mailbox_passwd, mailbox_delete,
+    ssl_install_plain, disk_speed_test, network_speed_test,
 )
 
 # Состав меню: (подпись пункта, имя метода класса), None — разделитель, либо
@@ -36,6 +37,9 @@ HOSTING_MENU = [
     ("DNS-зоны на сервере", "run_host_zones"),
     None,
     ("Досье домена (всё об одном)", "run_host_domain"),
+    ("Установить SSL (nginx/apache)", "run_host_ssl_install"),
+    ("Тест скорости диска (dd, 128 МБ)", "run_host_speed_disk"),
+    ("Тест скорости сети (задержка + канал)", "run_host_speed_net"),
     ("Почтовые ящики ▸", [
         ("Создать ящик", "run_host_mb_create"),
         None,
@@ -123,6 +127,64 @@ class HostingMixin:
             return
         self._run_in_thread(domain_detail_report, self.host_menu_btn,
                             self.checker, domain.strip(), self.panel_type)
+
+    # ---------- УСТАНОВКА SSL И ТЕСТЫ СКОРОСТИ ----------
+
+    def run_host_ssl_install(self):
+        # Диалог собирает материал, решает бэкенд (PEM, пара cert<->key по
+        # openssl, домен как компонент пути — ssl_install.py). Установка пишет
+        # файлы в /etc/ssl и перезагружает веб-сервер при пройденном
+        # configtest — поэтому подтверждение ДО запуска.
+        if not self.checker:
+            return
+        material = self._open_ssl_install_dialog('plain')
+        if material is None:
+            return
+        sec = material['sections']
+        domain = material['domain']
+        if not messagebox.askyesno(
+                "Подтверждение",
+                f"Установить сертификат для {domain}?\n"
+                "fullchain.pem и privkey.pem (0600) будут записаны в "
+                "/etc/ssl/diagtool/; nginx/apache перезагрузятся только "
+                "при пройденной проверке конфигурации.\n"
+                "Vhost'ы не трогаются: отчёт назовёт директивы, которые "
+                "надо добавить.",
+                parent=self.root):
+            return
+        self._run_in_thread(ssl_install_plain, self.host_menu_btn,
+                            self.checker, domain, sec['fullchain'],
+                            sec['key'])
+
+    def run_host_speed_disk(self):
+        # dd пишет 128 МБ в /tmp и снимает файл после замера; на забитом
+        # или крошечном /tmp это событие — подтверждение спрашивается.
+        if not self.checker:
+            return
+        if not messagebox.askyesno(
+                "Подтверждение",
+                "Записать 128 МБ в /tmp (dd с fsync), измерить скорость "
+                "записи и удалить файл? На медленном диске прогон идёт "
+                "десятки секунд; «Стоп» прерывает, файл убирается в любом "
+                "случае.",
+                parent=self.root):
+            return
+        self._run_in_thread(disk_speed_test, self.host_menu_btn, self.checker)
+
+    def run_host_speed_net(self):
+        # ping (4 пакета) + скачивание до 50 МБ с Cloudflare: трафик на VPS
+        # бывает тарифицируемым — цена названа в подтверждении.
+        if not self.checker:
+            return
+        if not messagebox.askyesno(
+                "Подтверждение",
+                "Замерить сеть: задержка (ping 1.1.1.1) и входящий канал "
+                "(скачивание до 50 МБ с speed.cloudflare.com, считается "
+                "в трафик)?",
+                parent=self.root):
+            return
+        self._run_in_thread(network_speed_test, self.host_menu_btn,
+                            self.checker)
 
     # ---------- ОПЕРАЦИИ С ПОЧТОВЫМИ ЯЩИКАМИ ----------
     # Порядок один для всех трёх: сначала диалоги, потом фон. _run_in_thread

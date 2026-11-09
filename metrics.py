@@ -1,10 +1,12 @@
 """Определение панели, системные метрики и базовые отчёты."""
 import ipaddress
+import re
+from uuid import uuid4
 
 from common import (LOG_PATHS, DOMAIN_PATHS, get_domain_from_config, q,
                     command_probe_info, path_entry_state,
                     parse_marker_sections, parse_unit_state,
-                    UNIT_NO_ANSWER)
+                    remove_remote_path, UNIT_NO_ANSWER)
 
 
 # ==================== ОПРЕДЕЛЕНИЕ ПАНЕЛИ ====================
@@ -250,6 +252,57 @@ def disk_memory_report(checker):
     return f"=== ДИСКИ И ПАМЯТЬ ===\nДиски (df -h):\n{out_h}\n\nInodes (df -i):\n{out_i}\n\nПамять (free -m):\n{out_f}"
 
 
+# Источник исходящего трафика спрашивается СЫРОЙ командой, а не конвейером
+# `ip route get 1.1.1.1 2>/dev/null | grep -oP "src \S+" | cut -d" " -f2`:
+# * 2>/dev/null глушило причину (RTNETLINK отвечает в stderr: «Network is
+#   unreachable» — это ответ, а не молчание);
+# * `grep -oP` — GNU-расширение: BusyBox grep отвечает «invalid option», а
+#   код возврата конвейера принадлежит cut, то есть «не спросили» выглядело
+#   бы как «адреса нет» — тот же закон 1.32.26 про решение по коду;
+# * то, что вернул конвейер, никак не проверялось на «это адрес» — выводом
+#   «IP-адреса источника» могла стать любая строка.
+# Без IPv4-маршрута спрашивается IPv6: на v6-only-сетях источник живёт там.
+ROUTE_GET_V4_CMD = 'ip route get 1.1.1.1'
+ROUTE_GET_V6_CMD = 'ip route get 2001:4860:4860::8888'
+
+
+# Адреса, которые не могут быть настоящим исходящим адресом сервера в
+# публичном интернете: RFC1918, CGNAT 100.64/10 (реальная практика хостинга),
+# loopback/link-local и IPv6-ULA. Намеренно НЕ ipaddress.is_private: она
+# считает «приватными» и служебно-документальные сети (TEST-NET и
+# подобные), которых в природе как egress не бывает, — детектор ловил бы их,
+# как ловят стендовые адреса в тестах, и путал служебное с операционным.
+_EGRESS_INTERNAL_NETS = tuple(ipaddress.ip_network(p) for p in (
+    '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16',
+    '172.16.0.0/12', '192.168.0.0/16', '::1/128', 'fc00::/7', 'fe80::/10',
+))
+
+
+def _is_internal_addr(addr):
+    """True для адресов «изнутри сети»: ответ внешнего сервиса с таким
+    адресом означает split-horizon DNS или прозрачный прокси, а src с таким
+    адресом — честный NAT-мир."""
+    return any(addr in net for net in _EGRESS_INTERNAL_NETS)
+
+
+def parse_route_get(out):
+    """(src | '', dev | '') из строки `ip route get`.
+
+    src обязан быть адресом (as_ip_address), а не первым токеном после «src»:
+    вывод чужой машины — данные, а не доверенный результат. dev нужен сам по
+    себе: маршрут «default dev eth0 scope link» шлюза «via» не имеет, прежний
+    разбор оставлял default_iface=None и отчёт печатал «(интерфейс None)».
+    """
+    src = dev = ''
+    tokens = (out or '').split()
+    for i, tok in enumerate(tokens):
+        if not src and tok == 'src' and i + 1 < len(tokens):
+            src = as_ip_address(tokens[i + 1])
+        elif not dev and tok == 'dev' and i + 1 < len(tokens):
+            dev = tokens[i + 1]
+    return src, dev
+
+
 def network_report(checker):
     out_a, _ = checker.exec_command('ip a')
     out_r, _ = checker.exec_command('ip r')
@@ -264,11 +317,27 @@ def network_report(checker):
                 default_iface = parts[4]
                 break
 
-    out_get, _ = checker.exec_command('ip route get 1.1.1.1 2>/dev/null | grep -oP "src \\S+" | cut -d" " -f2')
-    src_ip = out_get.strip()
+    out_get, err_get, rc_get = checker.run(ROUTE_GET_V4_CMD)
+    src_ip, src_dev = parse_route_get(out_get)
+    src_note = ''
+    if not src_ip:
+        out6, err6, rc6 = checker.run(ROUTE_GET_V6_CMD)
+        src_ip, src_dev = parse_route_get(out6)
+        if not src_ip:
+            # Отсутствие источника — тоже ответ оператора, а не тишина:
+            # молчаливая потеря строки неотличима от «так и надо».
+            why = next((ln.strip() for ln in (err_get or '').splitlines()
+                        if ln.strip()), '') or \
+                next((ln.strip() for ln in (err6 or '').splitlines()
+                      if ln.strip()), '')
+            src_note = ('IP-адрес источника не определён: ip route get (v4 и v6) '
+                        'не дал адреса src (rc=%s/%s)' % (rc_get, rc6)
+                        + (': ' + why[:160] if why else ''))
 
     ext = probe_external_ip(checker)
     external_ip = ext['address']
+
+    iface_src = src_dev or default_iface
 
     lines = []
     lines.append("=== СЕТЕВЫЕ ИНТЕРФЕЙСЫ (ip a) ===")
@@ -279,11 +348,61 @@ def network_report(checker):
     if default_iface:
         lines.append(f"\nИнтерфейс по умолчанию: {default_iface} (шлюз {default_gw})")
     if src_ip:
-        lines.append(f"IP-адрес источника для исходящего трафика: {src_ip} (интерфейс {default_iface})")
+        lines.append(f"IP-адрес источника для исходящего трафика: {src_ip}"
+                     + (f" (интерфейс {iface_src})" if iface_src else ''))
+    elif src_note:
+        lines.append(src_note)
     if external_ip:
         lines.append(f"Внешний (плавающий) IP: {external_ip}")
-        if src_ip:
-            lines.append(f"  (трафик идёт через NAT: приватный IP {src_ip} на интерфейсе {default_iface} -> плавающий IP {external_ip})")
+        try:
+            ext_addr = ipaddress.ip_address(external_ip)
+        except ValueError:
+            ext_addr = None
+        if ext_addr is not None and _is_internal_addr(ext_addr):
+            # Сервис вернул адрес из приватного диапазона: домен ifconfig.me
+            # резолвится внутри сети или по пути прозрачный прокси. Печатать
+            # такое как «плавающий IP» без предупреждения — обещать оператору
+            # поиск адреса, которого в публичном интернете нет.
+            lines.append('  ⚠️ это приватный адрес, а не публичный: DNS сервиса '
+                         'отвечает изнутри сети или по пути прозрачный прокси — '
+                         'плавающим этот адрес не является')
+        if src_ip and external_ip != src_ip:
+            try:
+                src_addr = ipaddress.ip_address(src_ip)
+            except ValueError:
+                src_addr = None
+            if (src_addr is not None and ext_addr is not None
+                    and src_addr.version != ext_addr.version):
+                # Dual-stack: NAT по v4 + публичный v6. curl предпочёл v6 и
+                # вернул 2001:…, а ip route get (v4) дал src 10.x — адреса из
+                # РАЗНЫХ стеков. Стрелка «приватный 10.x -> плавающий 2001:…»
+                # фабриковала бы NAT, которого в этом стеке нет.
+                lines.append(f"  (адрес источника {src_ip} (v{src_addr.version}) и "
+                             f"ответ сервиса {external_ip} (v{ext_addr.version}) — "
+                             "разные адресные семьи: не сравниваются, NAT по этой "
+                             "паре не определить)")
+            elif src_addr is not None and _is_internal_addr(src_addr):
+                iface_txt = (f' на интерфейсе {iface_src}' if iface_src else '')
+                lines.append(f"  (трафик идёт через NAT: приватный IP {src_ip}{iface_txt} -> плавающий IP {external_ip})")
+            else:
+                # Источник публичный, но НЕ совпал с ответом сервиса: утверждать
+                # «приватный IP ... -> плавающий» прежний код мог и про публичный
+                # src. Различаются два мира (NAT/шлюз против нескольких публичных
+                # адресов у сервера), и двумя числами они не разводятся.
+                lines.append(f"  (адрес источника {src_ip} публичный, но отличается "
+                             f"от ответа {external_ip}: либо по пути замена адреса "
+                             "(шлюз/NAT провайдера), либо у сервера несколько "
+                             "публичных адресов — по этим данным не различить)")
+        elif src_ip and external_ip == src_ip:
+            # Прежний код печатал «трафик идёт через NAT» при ЛЮБОМ src_ip,
+            # то есть утверждал NAT и там, где сервер сам владеет публичным
+            # адресом (источник совпал с ответом ifconfig.me).
+            iface_txt = (f'интерфейса {iface_src}, ' if iface_src else '')
+            lines.append(f"  (внешний адрес — собственный адрес "
+                         f"{iface_txt}NAT в пути нет)")
+        lines.append('')
+        lines.append(interface_bind_note(checker, external_ip,
+                                   iface_src))
     else:
         lines.append("\n" + external_ip_note(ext))
 
@@ -325,10 +444,24 @@ def network_report(checker):
 # ПЕРВОГО ответа (текст ошибки сервера и есть находка), внешнему IP нужен
 # именно валидный адрес, поэтому обход идёт до первой строки, которой хватит
 # быть адресом, а причины остальных отказов сохраняются для строки отрицания.
+# Таймаут на каждой пробе, и двумя слоями. ServerChecker._exec читает канал до
+# EOF (ssh_client.py stream.read без дедлайна), так что зависшее соединение с
+# ifconfig.me вешало бы рабочий поток GUI до нажатия «Стоп»; конвенция проекта
+# — внешний обёртка `timeout N` (discovery.py, webcheck.py). Родной флаг
+# утилиты (--max-time / -T / +time=) кладёт первый слой: утилита сама выходит
+# с rc=28/таймаут и ПЕЧАТАЕТ причину, тогда как `timeout` убивает процесс с
+# rc=124 и без внятного stderr — обёртка страхует зависание самой утилиты.
+# Короткие флаги wget (-T -t), а не длинные (--timeout --tries): fallback-мир
+# «curl нет» — это минимальные образы с BusyBox, где длинных опций нет.
 EXTERNAL_IP_SOURCES = (
-    ('curl', 'curl -sS ifconfig.me'),
-    ('wget', 'wget -qO- ifconfig.me'),
-    ('dig', 'dig +short myip.opendns.com @resolver1.opendns.com'),
+    # https, а не голый http: MITM по пути подменил бы «внешний IP» и тем
+    # самим сфабриковал вывод NAT/привязки в network_report. TLS-сертификат
+    # сервиса — якорь доверия; dig остался UDP-дугом сознательно (третий
+    # fallback, его честность — отдельный разговор про DNSSEC).
+    ('curl', 'timeout 12 curl -sS --max-time 8 https://ifconfig.me'),
+    ('wget', 'timeout 12 wget -qO- -T 5 -t 1 https://ifconfig.me'),
+    ('dig', 'timeout 10 dig +short +time=2 +tries=1 myip.opendns.com '
+            '@resolver1.opendns.com'),
 )
 
 
@@ -365,6 +498,13 @@ def parse_external_ip_probe(out, err, rc):
     err_t = (err or '').strip()
     if rc == 127 or rc == 126:
         return 'absent', '', first_line(err_t or out_t) or ('rc=%s' % rc)
+    if rc == 124:
+        # Убийство обёрткой `timeout`: процесс не успел ответить. Это отказ с
+        # причиной «точка недоступна», а не «утилиты нет»; убитый процесс
+        # stderr написать не успел, поэтому текст даём сами, иначе оператор
+        # увидел бы голое «rc=124».
+        return 'failed', '', ('ответ не получен: проверка прервана '
+                              'таймаутом (rc=124)')
     if rc == 0:
         if not out_t:
             return 'unchecked', '', 'пустой ответ (rc=0)'
@@ -395,7 +535,15 @@ def probe_external_ip(checker):
             break
         if state == 'absent':
             absent.append(name)
-            notes.append('%s не найдена' % name)
+            note = '%s не найдена' % name
+            # Команда обёрнута в `timeout`, и rc=127 принадлежит ОБОЛОЧКЕ
+            # обёртки: на машине без coreutils-`timeout` отчёт сказал бы «curl
+            # не найдена» при установленном curl. Если stderr не назвал саму
+            # утилиту — причина обязана доехать, иначе оператор поедет ставить
+            # не тот пакет.
+            if why and name not in why:
+                note += ' (%s)' % why
+            notes.append(note)
         elif why and why.startswith(name):
             notes.append(why)
         else:
@@ -412,9 +560,15 @@ def external_ip_note(probe):
     мире «всё установлено, сети нет» она отправляла оператора ставить пакеты.
     '''
     if probe['all_absent']:
+        # Причины обязаны доехать и здесь: без бинарника `timeout` все три
+        # rc=127 принадлежат ОБОЛОЧКЕ, а не утилитам, — голое «установите
+        # curl/wget/dig» отправило бы оператора ставить установленные пакеты,
+        # тогда как notes уже кричат «timeout: command not found».
+        detail = '; '.join(probe['notes']) if probe['notes'] else ''
         return ('Внешний IP не удалось определить: ни одна утилита не найдена ('
                 + ', '.join(name for name, _cmd in EXTERNAL_IP_SOURCES)
-                + ') — установите любую из них')
+                + ') — установите любую из них'
+                + (': ' + detail if detail else ''))
     reasons = probe['notes']
     if not reasons:
         # Пустой список причин — это тоже отрицание, и оно обязано
@@ -422,6 +576,170 @@ def external_ip_note(probe):
         # перечислением (замер живьём 1.32.26).
         reasons = ['утилиты не дали ответа']
     return ('Внешний IP не удалось определить: ' + '; '.join(reasons))
+
+
+# ==================== ПРИВЯЗКА ПЛАВАЮЩЕГО IP К ИНТЕРФЕЙСУ (1.32.30) ==========
+# Внешний IP из ifconfig.me — это ответ ДРУГОЙ машины: где живёт сам адрес,
+# знает только сервер. `ip -o addr` — один запрос, одна строка на адрес:
+# с -o переносов внутри записи нет, и разбор не зависит от ширины терминала
+# (без -o continuation-строки с valid_lft лезут в разбор отдельными
+# записями).
+IP_ADDR_CMD = 'ip -o addr'
+# Второй источник тех же адресов, когда бинарника `ip` нет вовсе (минимальные
+# образы и очень старые системы, где остались только net-tools): честный ответ
+# лучше честного «не проверено», а спросить больше нечего.
+IFCONFIG_CMD = 'ifconfig -a'
+
+
+def parse_interface_addresses(out):
+    """{адрес: [(имя_интерфейса, scope), ...]} из вывода `ip -o addr`.
+
+    Строка формата `2: eth0    inet 10.0.0.5/24 brd ... scope global eth0\\`:
+    имя — второй токен, адрес — токен после inet/inet6 (префикс срезан),
+    scope — токен после слова scope. Неадресуемые токены пропускаются, а не
+    роняют разбор: вывод чужой машины подтверждать ipaddress дороже, чем
+    молча пропустить мусор.
+    """
+    mapping = {}
+    for line in (out or '').splitlines():
+        tokens = line.split()
+        if len(tokens) < 4:
+            continue
+        iface = tokens[1]
+        for j, tok in enumerate(tokens):
+            if tok not in ('inet', 'inet6') or j + 1 >= len(tokens):
+                continue
+            raw = tokens[j + 1].split('/', 1)[0]
+            # fe80::1%eth0 — зона в скоуп-айди не адрес; сверять будем тело.
+            body = raw.split('%', 1)[0]
+            try:
+                addr = str(ipaddress.ip_address(body))
+            except ValueError:
+                continue
+            scope = ''
+            if 'scope' in tokens and tokens.index('scope') + 1 < len(tokens):
+                scope = tokens[tokens.index('scope') + 1]
+            entry = (iface, scope)
+            if entry not in mapping.setdefault(addr, []):
+                mapping[addr].append(entry)
+    return mapping
+
+
+IFCONFIG_BLOCK_RE = re.compile(r'^([A-Za-z0-9._-]+?):(\s|$)')
+
+
+def parse_ifconfig_addresses(out):
+    """{адрес: [(имя, ''), ...]} из вывода `ifconfig -a` — второй источник.
+
+    Две эпохи net-tools: старая печатает заголовок «eth0      Link encap:...»
+    и адрес «inet addr:10.0.0.5  Mask:...», новая — заголовок «eth0: flags=»
+    и адрес «inet 10.0.0.5 netmask ...»; то же для inet6 (ещё и зона
+    «fe80::1%eth0»). Алиас eth0:0 — отдельным блоком, адрес записывается на
+    родительский интерфейс: так же делает разбор `ip -o addr`, где алиас —
+    secondary-запись того же eth0. Scope у ifconfig нет, поле остаётся
+    пустым — решение о привязке на нём не строится.
+    """
+    mapping = {}
+    iface = ''
+    for line in (out or '').splitlines():
+        if line[:1] not in (' ', '\t', ''):
+            head = IFCONFIG_BLOCK_RE.match(line)
+            if head:
+                iface = head.group(1)
+            elif 'Link encap' in line:
+                # Старые net-tools: «eth0      Link encap:Ethernet» — имени с
+                # двоеточия нет, берётся первый токен строки-заголовка.
+                iface = line.split()[0]
+        if not iface:
+            continue
+        tokens = line.split()
+        for i, tok in enumerate(tokens):
+            raw = ''
+            if tok in ('inet', 'inet6') and i + 1 < len(tokens):
+                raw = tokens[i + 1]
+                # Старые net-tools печатают inet6 с оторванным маркером:
+                # «inet6 addr: fe80::1/64» — адрес стоит ПОСЛЕ tok'ена 'addr:'.
+                if raw == 'addr:' and i + 2 < len(tokens):
+                    raw = tokens[i + 2]
+            elif tok.startswith('addr:'):
+                raw = tok[len('addr:'):]
+            if not raw:
+                continue
+            raw = raw.split('addr:', 1)[-1]
+            body = raw.split('/', 1)[0].split('%', 1)[0]
+            try:
+                addr = str(ipaddress.ip_address(body))
+            except ValueError:
+                continue
+            entry = (iface, '')
+            if entry not in mapping.setdefault(addr, []):
+                mapping[addr].append(entry)
+    return mapping
+
+
+def interface_bind_note(checker, external_ip, default_iface=None):
+    """Где живёт внешний адрес: интерфейс, NAT провайдера или «не спросили».
+
+    Три мира, и третий — не два первых:
+    * адрес на интерфейсе (или нескольких) — плавающий назначен серверу;
+    * адреса нет ни на одном интерфейсе — адрес реализован ВНЕ сервера
+      (provider NAT / DNAT / балансировщик), на сервере его «нет и быть не
+      должно» — это ответ, а не отказ;
+    * список адресов не прочитан (rc!=0 или rc=0 без единой записи) —
+      о привязке ничего не известно. Прежняя логика «пусто -> NAT» выла бы
+      третий мир за второй: `ip` без прав, bus-мёртвый netlink и пустой
+      вывод дают тот же ноль адресов, что и настоящая отсутствующая привязка.
+
+    Когда бинарника `ip` нет (rc=127/126 — доказательство отсутствия, а не
+    отказа спрашивать), адреса спрашиваются у `ifconfig -a`: на старых и
+    минимальных машинах это второй честный источник, и «не проверено» там,
+    где ответ был доступен, — тоже ложь (зеркальный мир внешнего IP, где
+    curl меняется wget).
+    """
+    out, err, rc = checker.run(IP_ADDR_CMD)
+    tool = '`ip -o addr`'
+    ip_absent = rc in (127, 126)
+    if ip_absent:
+        tool = '`ifconfig -a`'
+        out, err, rc = checker.run(IFCONFIG_CMD)
+    if rc != 0:
+        why = next((ln.strip() for ln in (err or '').splitlines() if ln.strip()),
+                   f'код возврата {rc}')[:160]
+        return (f'⚠️ Привязка {external_ip} к интерфейсу не проверена: '
+                + ('бинарника `ip` нет, и ' if ip_absent else '')
+                + f'{tool} не ответила (rc={rc}): {why} — это «не '
+                  'проверено», а не «адреса нет на интерфейсах»')
+    mapping = (parse_ifconfig_addresses(out) if ip_absent
+               else parse_interface_addresses(out))
+    if not mapping:
+        return (f'⚠️ Привязка {external_ip} к интерфейсу не проверена: '
+                + ('бинарника `ip` нет, и ' if ip_absent else '')
+                + f'{tool} вернула 0 без единого адреса — это «не '
+                  'проверено», а не «адреса нет на интерфейсах»')
+    # Ключи mapping нормализованы ipaddress (IPv6 — lowercase сжатый). Внешний
+    # адрес в штатном пути пришёл уже нормализованным (as_ip_address), но
+    # функция публичная: сырой «2001:DB8::1» или полная форма IPv6 не совпали
+    # бы с ключом и прочитались как «адрес вне сервера» — ложь о NAT.
+    try:
+        probe_addr = str(ipaddress.ip_address(str(external_ip).strip()))
+    except ValueError:
+        return (f'⚠️ Привязка {external_ip} к интерфейсу не проверена: «{external_ip}» '
+                'не является адресом — это «не проверено», а не «адреса нет»')
+    entries = mapping.get(probe_addr)
+    if entries:
+        where = ', '.join(f'{iface} (scope {scope})' if scope else iface
+                          for iface, scope in entries)
+        return (f'✅ Плавающий IP {external_ip} назначен интерфейсу: {where}'
+                + ('' if len(entries) == 1 else
+                   ' — адрес на нескольких интерфейсах'))
+    iface_count = len({iface for addrs in mapping.values()
+                       for iface, _scope in addrs})
+    return (f'ℹ️ Адрес {external_ip} не назначен ни одному интерфейсу сервера '
+            f'(просмотрено {iface_count}) — адрес реализован вне сервера: '
+            'provider NAT / DNAT / балансировщик. На самом сервере его и не '
+            'может быть: искать ifcfg-строку с ним бесполезно.'
+            + (f' Исходящий трафик идёт через {default_iface}.'
+               if default_iface else ''))
 
 
 # ==================== ВЕБ-КОНФИГУРАЦИЯ ====================
@@ -583,4 +901,428 @@ def web_config_report(checker):
             lines.append(f"{svc}: {output}")
     else:
         lines.append("Веб-сервер (nginx/apache) не обнаружен или не удалось проверить конфиг.")
+    return "\n".join(lines)
+
+
+# ==================== ТЕСТ СКОРОСТИ ДИСКА (1.32.31) ====================
+# Зачем отдельная проба: get_metrics() показывает df/free/uptime, но не цену
+# записи. «Сервер тормозит» на RAID с севшим диском и на загруженном I/O
+# выглядит одинаково по метрикам — различает их фактическая скорость.
+#
+# Почему ЗАПИСЬ, а не чтение: первое же чтение оставляет файл в page cache, и
+# второй прогон меряет оперативную память, а не диск (цифра врёт в десятки раз).
+# conv=fsync заставляет dd дождаться реального сброса на носитель: без него
+# замер останавливается на контроллере кеша и показывает скорость RAM.
+#
+# Файл — путь со случайным суффиксом на прогон. Фиксированное имя было бы
+# гонкой с широким окном: между съёмом остатка и `dd` лежит отдельный SSH-запрос
+# (`df -k`), то есть десятки миллисекунд, а dd работает рутом и льёт 128 МБ
+# нулей — symlink, посаженный в это окно локальным пользователем, обнулил бы
+# ЛЮБОЙ файл системы. Съём остатка ДО замера остаётся (от прошлого прогона мог
+# остаться наш же файл), но защищаться им больше нечем не заменяется. Уборка —
+# каналом cleanup с проверкой факта `[ -e ]`, как секреты серии: отмена посреди
+# замера не должна оставить 128 МБ в /tmp.
+SPEED_TMP_BASE = '/tmp/.techsupp_speed'
+SPEED_MB = 128
+
+
+def speed_tmp_path():
+    """Имя тестового файла на один прогон: /tmp/.techsupp_speed.<12 hex>.bin."""
+    return '%s.%s.bin' % (SPEED_TMP_BASE, uuid4().hex[:12])
+
+
+# Съём остатков прошлых прогонов. ГЛОБ идёт в команду неэкранированным —
+# сознательно: это константа модуля, а не ввод оператора, и в кавычках она
+# перестала бы быть глобом. `ls` после `rm` — проверка факта, а не кода
+# возврата: rm не ругается даже на то, чего нет. Пустой stdout означает «в
+# префиксе ничего не осталось».
+SWEEP_SPEED_CMD = ('rm -f ' + SPEED_TMP_BASE + '.*.bin 2>/dev/null; '
+                   'ls -1 ' + SPEED_TMP_BASE + '.*.bin 2>/dev/null')
+
+
+# `timeout` — конвенция проекта для команд без собственного дедлайна: dd не
+# умеет ограничивать себя, а висящий на умершенном I/O носитель процесс
+# держал бы канал (и поток GUI) до «Стоп». Убийство даёт rc=124 — парсер
+# читает его как «не измерено», файл снимает уборка.
+# env ОБЯЗАТЕЛЕН: shell разбирает присваивание LC_ALL=C только перед самим
+# командным словом, а здесь первое слово — `timeout`; без env он принял бы
+# «LC_ALL=C» за имя программы и вышел бы rc=126/127 (замер живьём, coreutils
+# 9.11: `timeout 5 LC_ALL=C echo ok` → «не удалось выполнить команду»).
+DD_WRITE_TPL = ("timeout 120 env LC_ALL=C dd if=/dev/zero of={p} bs=1M "
+                "count={n} conv=fsync 2>&1")
+# Чтение мимо page cache (O_DIRECT) — для ручного повтора; продукт Writes-only
+# (чтение после записи меряет кеш, а не диск). iflag=direct не всякая ФС
+# держит — потому это подсказка оператору, а не второй обязательный прогон.
+DD_READ_TPL = ("timeout 120 env LC_ALL=C dd if={p} of=/dev/null bs=1M "
+               "iflag=direct")
+
+
+def dd_write_cmd(path, size_mb=SPEED_MB):
+    """Команда замера записи для файла конкретного прогона."""
+    return DD_WRITE_TPL.format(p=q(path), n=size_mb)
+
+
+def dd_read_cmd(path):
+    """Команда чтения мимо кеша для файла конкретного прогона."""
+    return DD_READ_TPL.format(p=q(path))
+
+
+# Тип ФС под /tmp спрашивается ДО замера: на systemd-дистрибутивах /tmp по
+# умолчанию tmpfs, dd пишет в память, conv=fsync там ничего не ждёт — и в
+# отчёт едет скорость RAM с вердиктом про NVMe. `stat -f -c %T` есть и у GNU,
+# и у BusyBox; `df -PT` — fallback (колонка Type вторая, -P запрещает перенос
+# длинного имени устройства). Пустой ответ — «тип не определён», предупреж-
+# дения тогда нет: выдумывать тип ФС нельзя, как и цифру.
+RAM_FILESYSTEMS = ('tmpfs', 'ramfs')
+STAT_FSTYPE_CMD = 'stat -f -c %T /tmp'
+DF_FSTYPE_CMD = 'df -PT /tmp'
+
+
+def parse_fstype(out_stat, rc_stat, out_df, rc_df):
+    """Имя ФС /tmp (в нижнем регистре) или '' — «не спрашивали/не удалось»."""
+    if rc_stat == 0 and (out_stat or '').strip():
+        return (out_stat or '').strip().splitlines()[-1].strip().lower()
+    if rc_df == 0:
+        for line in reversed((out_df or '').splitlines()):
+            tokens = line.split()
+            # -PT даёт 7 колонок; шапка тоже семь, её выдаёт слово Type.
+            if len(tokens) >= 7 and tokens[1].lower() != 'type':
+                return tokens[1].lower()
+    return ''
+
+
+# Сколько места требовать под тест: сам файл плюс запас (другой процесс пишет
+# параллельно, ext4 резервирует 5% под root).
+DF_FREE_CMD = 'df -k -P /tmp'
+DF_HEADROOM_MB = 32
+
+# dd печатает статистику в stderr (мы слили её в stdout через 2>&1). Формат
+# хвоста: '... copied, 0.394 s, 341 MB/s'. Единицы SI (B,kB,MB,GB) или IEC
+# (KiB,MiB,GiB). LC_ALL=C фиксирует десятичную точку и латиницу; без него на
+# локали с запятой число разбирается неверно.
+DD_SPEED_RE = re.compile(r'([0-9]+(?:\.[0-9]+)?)\s*([kKMGT]?i?B)/s')
+_BYTE_UNITS = {
+    'B': 1.0, 'kB': 1e3, 'KB': 1e3, 'MB': 1e6, 'GB': 1e9, 'TB': 1e12,
+    # 'KB' — то же значение, что 'kB': старые сборки wget/busybox печатают
+    # прогресс заглавной K; отказ «неизвестная единица» на законном выводе
+    # был бы честнее только на бумаге.
+    'KiB': 1024.0, 'MiB': 1024.0 ** 2, 'GiB': 1024.0 ** 3,
+    'TiB': 1024.0 ** 4,
+}
+
+
+def parse_dd_speed(out, err, rc):
+    """(MB/с | None, признание|None) по отчёту dd.
+
+    Решает код: rc!=0 — тест не завершён (conv=fsync не поддержан, кончилось
+    место, отмена оборвала канал => rc=-1), и это «не измерено», а не «ноль».
+    rc=0 без строки скорости — тоже «не измерено»: выдумывать цифру по
+    неполному выводу нельзя (закон серии про пустой вывод).
+    """
+    text = (out or '') + (err or '')
+    if rc == 124:
+        # Убийство обёрткой `timeout`: зависший носитель. Частичные статистики
+        # dd печатать бессмысленно — цифра по оборванному замеру врёт бы.
+        return None, ('dd не уложился в таймаут (rc=124) — диск, '
+                      'вероятно, завис; замер прерван')
+    if rc != 0:
+        why = next((ln.strip() for ln in text.splitlines() if ln.strip()),
+                   '')[:160]
+        return None, 'dd вернул rc=%s%s' % (
+            rc, (': ' + why) if why else '')
+    found = DD_SPEED_RE.findall(text)
+    if not found:
+        return None, 'dd не вернул строку скорости (rc=0)'
+    value, unit = found[-1]
+    factor = _BYTE_UNITS.get(unit)
+    if not factor:
+        return None, 'неизвестная единица скорости dd: %s' % unit
+    mb = (float(value) * factor) / 1e6
+    if mb <= 0:
+        # rc=0 и ноль — это отказ подсистемы (например, дырявый FS, съевший
+        # запись), а не результат: «0.0 MB/s» в графе «скорость» оператор
+        # прочитает как измеренную скорость канала записи.
+        return None, 'dd сообщил нулевую скорость (rc=0) — это отказ, а не результат'
+    return mb, None
+
+
+def parse_df_free_mb(out, rc):
+    """Свободно МБ на файловой системе df -k, либо None («не спросили»).
+
+    POSIX-колонка 4 — Available в 1024-байтовых блоках; df длинное имя
+    устройства переносит на вторую строку (5 полей), поэтому ищется последняя
+    строка не короче 6 полей. None — это «препроверка не состоялась»: её
+    отказ НЕ даёт права отменять тест (сам dd честно упадёт с причиной), но и
+    права писать цифру без цифры тоже нет.
+    """
+    if rc != 0:
+        return None
+    for line in reversed((out or '').splitlines()):
+        tokens = line.split()
+        if len(tokens) >= 6:
+            try:
+                return int(tokens[3]) // 1024
+            except ValueError:
+                return None
+    return None
+
+
+def disk_speed_test(checker):
+    """Замер скорости записи: dd пишет SPEED_MB МБ с fsync, файл убирается."""
+    lines = ["=== ТЕСТ СКОРОСТИ ДИСКА (dd: запись %d МБ, conv=fsync) ==="
+             % SPEED_MB]
+    target = speed_tmp_path()
+    write_cmd = dd_write_cmd(target)
+    read_cmd = dd_read_cmd(target)
+    # Снять возможный остаток прошлых прогонов ДО записи: по чужому файлу или
+    # symlink идти dd нельзя.
+    out_sweep, _err_sweep, _rc_sweep = checker.run(SWEEP_SPEED_CMD)
+    left = (out_sweep or '').strip()
+    if left:
+        lines.append('❌ старую тестовую запись не снять: '
+                     + ', '.join(left.splitlines()[:3])
+                     + ' — тест отменён')
+        return "\n".join(lines)
+
+    # Место спрашивается ПОСЛЕ съёма остатка (иначе сами себе съели) и ДО
+    # записи: на забитом диске dd дописал бы до отказа и бросил бы файл, а
+    # честный отказ «No space left» оператор прочитал бы только через минуту
+    # гонки. Неотвечающий df (rc!=0, мусор в выводе) — не право отменять:
+    # тогда пусть честно падает сам dd.
+    out_df, _err_df, rc_df = checker.run(DF_FREE_CMD)
+    free_mb = parse_df_free_mb(out_df, rc_df)
+    if free_mb is not None and free_mb < SPEED_MB + DF_HEADROOM_MB:
+        lines.append(f'❌ тест отменён ДО записи: в /tmp свободно {free_mb} МБ, '
+                     f'нужно не менее {SPEED_MB + DF_HEADROOM_MB} МБ '
+                     f'(файл {SPEED_MB} МБ плюс запас) — освободите место')
+        return "\n".join(lines)
+
+    # Тип ФС — до замера: предостережение обязано стоять НАД цифрой, чтобы
+    # оператор читал «tmpfs» раньше, чем увидит «NVMe — отлично».
+    out_fs, _err_fs, rc_fs = checker.run(STAT_FSTYPE_CMD)
+    out_dft, _err_t, rc_dft = checker.run(DF_FSTYPE_CMD)
+    fs_type = parse_fstype(out_fs, rc_fs, out_dft, rc_dft)
+    if fs_type in RAM_FILESYSTEMS:
+        lines.append('⚠️ /tmp живёт в оперативной памяти (' + fs_type +
+                     '): цифра ниже — скорость RAM, а не диска')
+
+    out, err, rc = checker.run(write_cmd)
+    mb, note = parse_dd_speed(out, err, rc)
+    if mb is None:
+        lines.append('❌ Скорость записи не измерена: ' + note)
+        tail = '\n'.join(l for l in ((out or '') + (err or '')).splitlines()
+                         if l.strip())
+        if tail:
+            lines.append('  отклик dd: ' + tail[-240:])
+    elif fs_type in RAM_FILESYSTEMS:
+        # Вердикт про NVMe/SSD/HDD тут был бы ложью: сравнивать не с чем.
+        lines.append('✅ Скорость записи: %.1f MB/s '
+                     '(tmpfs — не интерпретируется как скорость диска)' % mb)
+    else:
+        lines.append('✅ Скорость записи: %.1f MB/s (%s)' % (
+            mb, _speed_verdict(mb)))
+
+    # Уборка — всегда, каналом cleanup: отмена или неудача замера не право
+    # оставить SPEED_MB МБ в /tmp. Причина обязана дойти до оператора.
+    ok, why = remove_remote_path(checker, target, recursive=False)
+    if not ok:
+        lines.append('⚠️ тестовый файл не удалён: ' + why
+                     + ' — удалите вручную: rm -f ' + target)
+    lines.append('')
+    lines.append('Команды для ручного повтора (тот же прогон без утилиты):')
+    lines.append('  ' + write_cmd)
+    lines.append('  ' + read_cmd)
+    lines.append('    (тестовый файл уже снят уборкой — сначала повторите '
+                 'запись; чтение мимо кеша, если ФС не поддерживает '
+                 'O_DIRECT — без iflag=direct цифра будет скоростью page cache)')
+    return "\n".join(lines)
+
+
+def _speed_verdict(mb_per_s):
+    """Бытовая оценка скорости записи для человека, а не голое число."""
+    if mb_per_s >= 200:
+        return 'NVMe/SSD — отлично'
+    if mb_per_s >= 80:
+        return 'быстрый SSD'
+    if mb_per_s >= 30:
+        return 'SSD ниже ожидаемого или диск загружен'
+    if mb_per_s >= 8:
+        return 'похоже на HDD'
+    return 'очень медленно — проверьте диск (degraded RAID? I/O wait?)'
+
+
+# ==================== ТЕСТ СКОРОСТИ СЕТИ (1.32.31) ====================
+# Два разных вопроса, две пробы:
+#   * ЗАДЕРЖКА (ping): «тормоза» в SSH и отклике — это latency и потерянные
+#     пакеты, их не видно в скорости канала;
+#   * ПРОПУСКНАЯ СПОСОБНОСТЬ (скачивание): «медленные загрузки» — это bitrate.
+# ping решает потерями и средним RTT; curl — %{speed_download} (байт/с),
+# который НЕ зависит от локали (в отличие от прогресс-строк wget). Утилиты
+# спрашиваются раздельно, как внешний IP: отсутствие ping — не «нет сети», а
+# «не спросили задержку», и не снимает замер пропускной способности.
+# LC_ALL=C обязателен и пингу: в локализованном выводе iputils строка потерь
+# печатается переведённой («потерь»), а разделитель дробной части в RTT —
+# запятая, и регулярки разбора не совпадают; молчание regex отчёт прочитал бы
+# как «RTT-строки не было». `timeout` — общий конвенционный предохранитель
+# (зависание на маршрутизаторе держало бы канал до «Стоп»).
+PING_CMD = 'timeout 20 env LC_ALL=C ping -c 4 -W 3 1.1.1.1'
+NET_TEST_URL = 'https://speed.cloudflare.com/__down?bytes=50000000'
+# curl: -f — чтобы 403/5xx НЕ считались успешным скачиванием (без -f curl
+# выходит rc=0 с телом страницы отказа, и speed_download меряет скорость
+# бан-страницы — «канал» из байтов ошибки); -L — редирект тоже канал, а без
+# -L его байты (несколько килобайт 301) выдавались бы за скорость; -sS —
+# причина без прогресс-мусора; --max-time 30 — потолок гонки, а `timeout 45`
+# — страховка на случай зависания самой утилиты (rc=124 vs собственный
+# rc=28 с числом-нижнеграницей на stdout).
+# wget: короткие -T/-t — длинные --timeout/--tries отсутствуют в BusyBox
+# wget, а fallback-мир «curl нет» — это именно минимальные образы.
+NET_DOWNLOAD_SOURCES = (
+    ('curl', "timeout 45 env LC_ALL=C curl -sSfL -o /dev/null "
+             "-w '%{speed_download}' --max-time 30 " + q(NET_TEST_URL)),
+    # wget — второй, когда curl нет: скорость берётся из прогресс-строки
+    # '12.3 MB/s' (единицы те же, что разбирает DD_SPEED_RE).
+    ('wget', 'timeout 45 env LC_ALL=C wget -T 25 -t 1 -O /dev/null '
+             + q(NET_TEST_URL) + ' 2>&1'),
+)
+# Строка итога ping (iputils): 'rtt min/avg/max/mdev = 11.1/12.3/... ms';
+# старые версии пишут 'round-trip ... = ...'. Ищем числа после '=' и берём
+# второе (avg), не завязываясь на префиксе.
+PING_AVG_RE = re.compile(r'=\s*([0-9]+(?:\.[0-9]+)?)/([0-9]+(?:\.[0-9]+)?)')
+PING_LOSS_RE = re.compile(r'([\d.]+)%\s*packet loss')
+
+
+def parse_ping_latency(out, err, rc):
+    """(avg_ms | None, note): (avg задержки, потеря ли) по отклику ping.
+
+    rc=1 при 100% потерь — это измеренное «хост не отвечает», а не отказ
+    инструмента: отличие от rc=127 (ping не установлен) принципиально.
+    Строка потерь читается ДО ветки rc!=0: при 100% потерь RTT-строки нет, и
+    без этого порядка единственный содержательный ответ хоста
+    («0 received, 100% packet loss») тонул бы в «первой непустой строке»
+    вывода, которой обычно является шапка «PING 1.1.1.1 … bytes of data».
+    """
+    text = (out or '') + (err or '')
+    if rc == 127 or rc == 126:
+        return None, 'ping не найден (rc=%s) — задержка не проверена' % rc
+    if rc == 124:
+        return None, ('ping не уложился в таймаут (rc=124) — '
+                      'задержка не измерена')
+    loss = PING_LOSS_RE.search(text)
+    if loss and float(loss.group(1)) >= 100:
+        # Бывший текст 'потеряно 100%% пакетов' печатался как есть: строковый
+        # литерал не проходил через оператор %, и оператор видел двойной
+        # процент.
+        return None, ('потеряно 100% пакетов — хост не отвечает '
+                      'или ICMP фильтруется')
+    avg = PING_AVG_RE.search(text)
+    if avg:
+        val = float(avg.group(2))
+        return val, (('потери %s%% пакетов' % loss.group(1))
+                     if loss and float(loss.group(1)) > 0 else None)
+    if rc != 0:
+        why = next((ln.strip() for ln in text.splitlines() if ln.strip()),
+                   '')[:160]
+        return None, 'ping вернул rc=%s%s — задержка не измерена' % (
+            rc, (': ' + why) if why else '')
+    return None, 'ping не вернул строку RTT (rc=0)'
+
+
+def parse_download_speed(out, err, rc, source):
+    """(MB/с | None, note): битрейт скачивания из ответа источника.
+
+    curl отдаёт %{speed_download} как чистое число байт/с в stdout (локале не
+    подвержен); wget — единицы в прогресс-строке. Решает код: rc!=0 — канал не
+    прошёл (нет сети, 4xx/5xx — с -f они коды, а не «успех», отмена =>
+    таймаут), это «не измерено». Два исключения из того же закона честности:
+    rc=28 (лимит --max-time) с числом на stdout — это нижняя граница канала
+    за 30 секунд, а не провал: цифра доезжает с пометкой; ноль при rc=0 —
+    сервис отдал 0 байт, «0 МБ/с» результатом быть не может.
+    """
+    if rc == 127 or rc == 126:
+        return None, '%s не найден (rc=%s)' % (source, rc)
+    body = (out or '').strip()
+    if rc in (28, 124) and source == 'curl':
+        # curl при --max-time печатает speed_download оборванного переноса —
+        # сколько канал реально тянул все 30 секунд. Отказаться от этого числа
+        # значило бы «не измерено» там, где канал ответил; выдать его без
+        # пометки — соврать про потолок. rc=124 (убит обёрткой `timeout` уже
+        # после curl-ного лимита — завис сам вывод/канал) — тот же мир: число
+        # на stdout есть, и оно нижняя граница, а не «нет результата».
+        try:
+            val = float(body)
+        except ValueError:
+            val = 0.0
+        if val > 0:
+            return val / 1e6, ('скачивание прервано лимитом — это нижняя '
+                               'граница канала, не вся его скорость')
+    if rc == 124:
+        return None, ('%s не уложился в таймаут (rc=124) — канал '
+                      'не измерен' % source)
+    if rc != 0:
+        text = (out or '') + (err or '')
+        why = next((ln.strip() for ln in text.splitlines() if ln.strip()),
+                   '')[:160]
+        return None, '%s вернул rc=%s%s' % (source, rc,
+                                            (': ' + why) if why else '')
+    if source == 'curl':
+        try:
+            val = float(body)
+        except ValueError:
+            return None, 'curl не вернул число скорости (rc=0)'
+        if val <= 0:
+            return None, ('curl сообщил нулевую скорость (rc=0) — сервер отдал '
+                          'пустой ответ, это не результат пропускной способности')
+        return val / 1e6, None
+    found = DD_SPEED_RE.findall(body)
+    if not found:
+        return None, 'wget не вернул строку скорости (rc=0)'
+    value, unit = found[-1]
+    factor = _BYTE_UNITS.get(unit)
+    if not factor:
+        return None, 'wget вернул неизвестную единицу: %s' % unit
+    mbps = (float(value) * factor) / 1e6
+    if mbps <= 0:
+        return None, 'wget сообщил нулевую скорость (rc=0) — это не результат'
+    return mbps, None
+
+
+def network_speed_test(checker):
+    """Задержка (ping) + пропускная способность (скачивание), каждая проба
+    независима: отсутствие одной не глушит другую."""
+    lines = ["=== ТЕСТ СКОРОСТИ СЕТИ (задержка + входящий канал) ==="]
+
+    out, err, rc = checker.run(PING_CMD)
+    ms, note = parse_ping_latency(out, err, rc)
+    if ms is None:
+        lines.append('⚠️ Задержка: ' + note)
+    else:
+        verdict = ('отлично' if ms < 20 else 'нормально' if ms < 80
+                   else 'высокая' if ms < 150 else 'очень высокая')
+        line = '✅ Задержка (avg): %.1f мс — %s' % (ms, verdict)
+        if note:
+            line += ' (⚠️ ' + note + ')'
+        lines.append(line)
+
+    mbps = None
+    dl_note = ''
+    for source, cmd in NET_DOWNLOAD_SOURCES:
+        out, err, rc = checker.run(cmd)
+        mbps, note = parse_download_speed(out, err, rc, source)
+        if mbps is not None:
+            break
+        dl_note += (dl_note and '; ') + note
+    if mbps is None:
+        lines.append('⚠️ Входящий канал не измерен: ' + dl_note)
+    else:
+        # note у успеха — пометка к цифре (например «нижняя граница» после
+        # rc=28); выбросить её значило бы выдать половину за целое.
+        line = '✅ Входящая скорость: %.1f MB/s ≈ %.0f Мбит/с' % (
+            mbps, mbps * 8)
+        if note:
+            line += ' (⚠️ ' + note + ')'
+        lines.append(line)
+    lines.append('')
+    lines.append('Команды для ручного повтора:')
+    lines.append('  ' + PING_CMD)
+    lines.append('  ' + NET_DOWNLOAD_SOURCES[0][1])
     return "\n".join(lines)

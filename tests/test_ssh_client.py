@@ -2,9 +2,18 @@
 
 paramiko подменяется заглушкой — реального SSH нет. Проверка идёт по тому,
 что именно передаётся в paramiko.SSHClient и как разбираются его исключения.
+
+Канал эмулируется ровно семантикой paramiko 5.0 (channel.py): данные забираются
+через recv()/recv_stderr() только когда recv_ready() истинен; конец команды —
+exit_status_ready() при пустых буферах; close() взводит exit_status_ready, а
+recv_exit_status без присланного статуса даёт -1. Потолок канала проверяется
+маленьким параметром timeout и подменой времени — реальных 600 секунд никто не
+ждёт.
 """
 import os
 import sys
+import threading
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -17,23 +26,56 @@ import ssh_client as sc
 
 # ==================== заглушка paramiko ====================
 class _Stream:
+    """Носитель .channel, как ChannelFile у paramiko; читает продукт сам канал."""
+
     def __init__(self, data=b'', channel=None):
         self._data = data
         self.channel = channel
 
-    def read(self):
-        return self._data
-
 
 class _Channel:
-    def __init__(self, exit_status=0, raise_status=False):
+    """Двойник paramiko.Channel ровно под цикл чтения _exec.
+
+    exit_status=None означает «статус ещё не прислан» — тогда recv_exit_status
+    отдаёт -1 (как paramiko после close без exit-status). hang=True моделирует
+    мёртвый сокет: канал не готов НИКОГДА, даже после close() — так потолок
+    обязан сработать независимо от того, помогло ли закрытие.
+    """
+
+    def __init__(self, out=b'', err=b'', exit_status=0, raise_status=False,
+                 hang=False):
+        self._out = [out] if out else []
+        self._err = [err] if err else []
         self.exit_status = exit_status
         self.raise_status = raise_status
+        self.hang = hang
         self.closed = 0
+
+    def recv_ready(self):
+        return bool(self._out)
+
+    def recv(self, nbytes):
+        return self._out.pop(0) if self._out else b''
+
+    def recv_stderr_ready(self):
+        return bool(self._err)
+
+    def recv_stderr(self, nbytes):
+        return self._err.pop(0) if self._err else b''
+
+    def exit_status_ready(self):
+        if self.hang:
+            return False
+        if self.closed:
+            return True
+        return (self.exit_status is not None
+                and not self._out and not self._err)
 
     def recv_exit_status(self):
         if self.raise_status:
             raise RuntimeError('channel closed')
+        if self.exit_status is None:
+            return -1
         return self.exit_status
 
     def close(self):
@@ -61,7 +103,8 @@ class FakeSSHClient:
         self.loaded_host_keys = []
         self.closed = 0
         self.transport = None
-        self.exec_result = None
+        self.exec_channel = None
+        self.exec_kwargs = None
         FakeSSHClient.instances.append(self)
 
     def load_system_host_keys(self):
@@ -82,11 +125,13 @@ class FakeSSHClient:
     def get_transport(self):
         return self.transport
 
-    def exec_command(self, cmd):
+    def exec_command(self, cmd, **kwargs):
         self.last_cmd = cmd
-        channel = self.exec_channel
-        return (None, _Stream(self.exec_result[0], channel),
-                _Stream(self.exec_result[1], channel))
+        # paramiko 5.0 принимает timeout именно здесь (ограничивает
+        # open_session) — продукт обязан его передавать, проверяем ниже.
+        self.exec_kwargs = kwargs
+        return (None, _Stream(channel=self.exec_channel),
+                _Stream(channel=self.exec_channel))
 
     def close(self):
         self.closed += 1
@@ -116,6 +161,37 @@ def _patch_paramiko(monkeypatch):
 
 def _checker(**kw):
     return sc.ServerChecker('h.example', 22, 'root', password='secret', **kw)
+
+
+def _connected(out=b'', err=b'', exit_status=0, raise_status=False,
+               hang=False):
+    """Подключенный checker с каналом-двойником; возвращает (c, client, ch)."""
+    c = _checker()
+    c.connect()
+    # именно последний клиент: один тест может подключить несколько checker'ов,
+    # канал вешается на того, кому соответствует returned c
+    client = FakeSSHClient.instances[-1]
+    channel = _Channel(out=out, err=err, exit_status=exit_status,
+                       raise_status=raise_status, hang=hang)
+    client.exec_channel = channel
+    return c, client, channel
+
+
+class _FakeClock:
+    """Виртуальные часы: monotonic() стоит, sleep() двигает время вперёд.
+
+    Нужны, чтобы проверить потолок DEFAULT_COMMAND_TIMEOUT (600 с) без
+    реального десятиминутного сна: время подменяем, поведение — настоящее.
+    """
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
 
 
 # ==================== connect ====================
@@ -198,32 +274,23 @@ class TestIsAlive:
 
 # ==================== выполнение команд ====================
 class TestExec:
-    def _connected(self, out=b'', err=b'', exit_status=0, raise_status=False):
-        c = _checker()
-        c.connect()
-        client = FakeSSHClient.instances[0]
-        channel = _Channel(exit_status=exit_status, raise_status=raise_status)
-        client.exec_channel = channel
-        client.exec_result = (out, err)
-        return c, client, channel
-
     def test_run_returns_triple(self):
-        c, _, ch = self._connected(out=b'ok\n', err=b'warn\n', exit_status=3)
+        c, _, _ = _connected(out=b'ok\n', err=b'warn\n', exit_status=3)
         assert c.run('ls') == ('ok\n', 'warn\n', 3)
 
     def test_exec_command_pair(self):
-        c, _, _ = self._connected(out=b'a', err=b'b')
+        c, _, _ = _connected(out=b'a', err=b'b')
         assert c.exec_command('ls') == ('a', 'b')
 
     def test_non_utf8_bytes_are_dropped_not_crash(self):
         # decode(errors='ignore'): невалидные байты ОТБРАСЫВАЮТСЯ (не заменяются
         # на U+FFFD), валидная часть сохраняется, исключения нет.
-        c, _, _ = self._connected(out=b'ok\n\xff\xfe')
+        c, _, _ = _connected(out=b'ok\n\xff\xfe')
         out, err, rc = c.run('ls')
         assert out == 'ok\n' and rc == 0
 
     def test_exit_status_error_becomes_minus_one(self):
-        c, _, _ = self._connected(out=b'x', raise_status=True)
+        c, _, _ = _connected(out=b'x', raise_status=True)
         assert c.run('ls') == ('x', '', -1)
 
     def test_no_connection_raises(self):
@@ -231,12 +298,131 @@ class TestExec:
             _checker().run('ls')
 
     def test_cancel_blocks_next_command(self):
-        c, _, _ = self._connected(out=b'x')
+        c, _, _ = _connected(out=b'x')
         c.cancel()
         with pytest.raises(Exception, match='Операция отменена'):
             c.run('ls')
         c.reset_cancel()
         assert c.run('ls')[0] == 'x'
+
+    def test_ceiling_passed_to_session_open(self):
+        # потолок обязан уходить и в exec_command (paramiko ограничивает им
+        # открытие сессии: без него на мёртвом transport висишь до канала)
+        c, client, _ = _connected(out=b'x')
+        c.run('ls', timeout=42)
+        assert client.exec_kwargs == {'timeout': 42}
+        c.run('ls')
+        assert client.exec_kwargs == {'timeout': sc.DEFAULT_COMMAND_TIMEOUT}
+
+
+# ==================== потолок канала ====================
+class TestChannelDeadline:
+    """Зависший канал обязан заканчиваться сам, за конечное и различимое время.
+
+    Раньше зависание = «читаем до EOF»: умерший носитель, молчащий резолвер или
+    сдохший сокет держали поток GUI до «Стоп». Теперь у канала есть потолок, и
+    его истечение НЕЛЬЗЯ спутать с «команда отработала с пустым выводом».
+    """
+
+    def test_hang_returns_124_in_bounded_time(self, monkeypatch):
+        monkeypatch.setattr(sc, '_POLL_INTERVAL', 0.02)
+        c, _, ch = _connected(hang=True)
+        started = time.monotonic()
+        out, err, rc = c.run('dd if=/dev/sda of=/dev/null', timeout=0.2)
+        elapsed = time.monotonic() - started
+        assert rc == sc.COMMAND_DEADLINE_RC == 124
+        assert 'deadline exceeded after 0.2s' in err
+        assert out == ''
+        assert ch.closed >= 1          # зависший канал закрыт, не брошен
+        assert elapsed < 5             # конечное время, а не «до Стоп»
+
+    def test_default_ceiling_is_the_module_constant(self, monkeypatch):
+        # 600 с никто ждать не будет: время подменено, код — настоящий
+        clock = _FakeClock()
+        monkeypatch.setattr(sc.time, 'monotonic', clock.monotonic)
+        monkeypatch.setattr(sc.time, 'sleep', clock.sleep)
+        c, _, ch = _connected(hang=True)
+        out, err, rc = c.run('ls')     # без явного timeout
+        assert sc.DEFAULT_COMMAND_TIMEOUT == 600
+        assert rc == 124
+        assert 'deadline exceeded after 600s' in err
+        assert clock.now >= sc.DEFAULT_COMMAND_TIMEOUT
+
+    def test_partial_output_survives_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(sc, '_POLL_INTERVAL', 0.02)
+        c, _, _ = _connected(out=b'part of the log\n', hang=True)
+        out, err, rc = c.run('long_cmd', timeout=0.2)
+        # частичный вывод честнее пустого: оператор увидит, где встало
+        assert out == 'part of the log\n'
+        assert rc == 124 and 'deadline exceeded' in err
+
+    def test_timeout_is_distinguishable_from_clean_empty_run(self):
+        # контракт различимости: «пусто и rc=0» — команда отработала;
+        # зависший канал обязан выглядеть иначе, иначе парсеры соврут
+        c_ok, _, _ = _connected()
+        clean = c_ok.run('true')
+        assert clean == ('', '', 0)
+        c_hang, _, _ = _connected(hang=True)
+        hung = c_hang.run('hangs', timeout=0.05)
+        assert hung[2] == 124 and hung[1] != ''
+        assert hung != clean
+
+    def test_zero_timeout_never_waits_on_hung_channel(self):
+        c, _, ch = _connected(hang=True)
+        out, err, rc = c.run('hangs', timeout=0)
+        assert rc == 124 and ch.closed >= 1
+
+    def test_finished_command_ignores_tiny_timeout(self):
+        # потолок проверяется ПОСЛЕ признака готовности: команда, успевшая
+        # ответить, не наказывается таймаутом на ровном месте
+        c, _, ch = _connected(out=b'done\n', exit_status=0)
+        assert c.run('ls', timeout=0.001) == ('done\n', '', 0)
+        assert ch.closed == 0          # живой канал не закрываем
+
+
+# ==================== отмена во время чтения ====================
+class TestCancelDuringRead:
+    def test_cancel_during_hung_read_returns_minus_one(self):
+        # прежнее поведение сохранено: отмена НЕ бросок посреди run(), а
+        # возврат с rc=-1 (статус не приходил) — но теперь она ещё и конечна
+        c, _, ch = _connected(exit_status=None)
+        box = {}
+
+        def worker():
+            try:
+                box['res'] = c.run('sleep 999', timeout=30)
+            except Exception as exc:                     # noqa: BLE001
+                box['exc'] = exc
+
+        t = threading.Thread(target=worker)
+        t.start()
+        for _ in range(200):          # ждём, пока _exec возьмёт канал в работу
+            if c._current_channel is not None:
+                break
+            time.sleep(0.01)
+        assert c._current_channel is not None
+        c.cancel()
+        t.join(5)
+        assert not t.is_alive()
+        assert 'exc' not in box, box.get('exc')
+        assert box['res'][2] == -1
+        assert ch.closed >= 1
+        assert c._current_channel is None   # канал снят, cancel() больше не за что
+
+    def test_cancel_in_gap_between_open_and_binding(self):
+        # cancel() вызван в зазоре, когда _current_channel ещё не присвоен:
+        # отмена обязана обнаружить по событию сама и закрыть канал
+        c, client, ch = _connected(exit_status=None)
+        real_exec = client.exec_command
+
+        def racy(cmd, **kwargs):
+            c.cancel_event.set()       # как cancel(), не заставший канала
+            return real_exec(cmd, **kwargs)
+
+        client.exec_command = racy
+        out, err, rc = c.run('sleep 999', timeout=30)
+        assert rc == -1
+        assert ch.closed >= 1
 
 
 # ==================== cancel / close ====================
@@ -246,7 +432,6 @@ class TestCancelClose:
         c.connect()
         client = FakeSSHClient.instances[0]
         client.exec_channel = _Channel()
-        client.exec_result = (b'', b'')
         c._current_channel = client.exec_channel
         c.cancel()
         assert client.exec_channel.closed == 1
@@ -266,7 +451,7 @@ class TestCancelClose:
 
 # ==================== ветки «всё сломалось и молча живём» ====================
 #
-# В ssh_client четыре `except Exception: pass`. Каждая — не декорация: без неё
+# В ssh_client несколько `except Exception: pass`. Каждая — не декорация: без неё
 # обрыв TCP или мёртвый канал роняет прогон посреди диагностики (а _busy в GUI
 # зависает навсегда). Именно их и не видно в coverage, пока двойники не начнут
 # бросать. Проверяем, что бросок из paramiko/TCP не выходит наружу и состояние
@@ -310,36 +495,31 @@ class TestSwallowedErrors:
         client = FakeSSHClient.instances[0]
         assert client.policies == ['_Policy']   # политику это не отменило
 
-    def test_stream_read_failure_yields_empty_output_but_keeps_rc(self):
-        # оба потока бросают на read (обрыв посреди команды): вывод пустой,
-        # но канал живой — rc обязан прийти с канала (recv_exit_status), а
-        # наружу бросок не идёт
-        class _ReadBoomStream:
-            def __init__(self, channel):
-                self.channel = channel
+    def test_channel_recv_failure_yields_partial_but_keeps_rc(self):
+        # канал бросает на готовности (обрыв посреди команды): вывод пустой,
+        # но статус обязан прийти с канала (recv_exit_status), а наружу
+        # бросок не идёт — та же гарантия, что была у потоковых read()
+        class _RecvBoom(_Channel):
+            def recv_ready(self):
+                raise OSError('connection reset')
 
-            def read(self):
+            def recv_stderr_ready(self):
                 raise OSError('connection reset')
 
         c = _checker()
         c.connect()
         client = FakeSSHClient.instances[0]
-        channel = _Channel(exit_status=7)
-        client.exec_command = lambda cmd: (
-            None, _ReadBoomStream(channel), _ReadBoomStream(channel))
+        client.exec_channel = _RecvBoom(exit_status=7)
         assert c.run('ls') == ('', '', 7)
 
-    def test_dead_channel_after_read_gives_rc_minus_one(self):
-        # и сам канал мёртв (recv_exit_status бросает) — rc = -1, не исключение
+    def test_dead_channel_gives_rc_minus_one(self):
+        # и сам канал мёртв (stdout.channel=None, любой вызов бросает) —
+        # rc = -1, не исключение
         c = _checker()
         c.connect()
         client = FakeSSHClient.instances[0]
-        dead = _Channel(raise_status=True)
-        client.exec_command = lambda cmd: (None, _Boom(), _Boom())
-        # у _Boom.channel == None -> recv_exit_status бросает AttributeError,
-        # что ровно и воспроизводит «канал умер»: обработчик обязан дать -1
+        client.exec_command = lambda cmd, **kw: (None, _Boom(), _Boom())
         assert c.run('ls') == ('', '', -1)
-        assert dead  # канал в тесте не использовался, лишь бы не мешал
 
     def test_close_failure_still_clears_client(self):
         # client.close() бросает — клиент всё равно обязан быть сброшен в None,
@@ -366,16 +546,13 @@ class TestCleanupChannel:
     """
 
     @staticmethod
-    def _connected(out=b'ok\n', err=b''):
-        c = _checker()
-        c.connect()
-        client = FakeSSHClient.instances[-1]
-        client.exec_channel = _Channel()
-        client.exec_result = (out, err)
-        return c
+    def _connected(out=b'ok\n', err=b'', exit_status=0, hang=False):
+        c, _, ch = _connected(out=out, err=err, exit_status=exit_status,
+                              hang=hang)
+        return c, ch
 
     def test_run_blocked_but_cleanup_passes(self):
-        c = self._connected()
+        c, _ = self._connected()
         c.cancel()
         with pytest.raises(Exception, match='Операция отменена'):
             c.run('ls')
@@ -384,7 +561,7 @@ class TestCleanupChannel:
     def test_cleanup_after_cancel_still_reads_real_output(self):
         # Ответ уборки важен: remove_remote_path смотрит в него (STILL_THERE),
         # поэтому cleanup не имеет права возвращать заглушку
-        c = self._connected(out=b'STILL_THERE\n')
+        c, _ = self._connected(out=b'STILL_THERE\n')
         c.cancel()
         assert 'STILL_THERE' in c.cleanup('rm -f /tmp/secret')[0]
 
@@ -397,7 +574,27 @@ class TestCleanupChannel:
             c.cleanup('rm -f /tmp/secret')
 
     def test_reset_cancel_restores_run(self):
-        c = self._connected(out=b'x')
+        c, _ = self._connected(out=b'x')
         c.cancel()
         c.reset_cancel()
         assert c.run('ls')[0] == 'x'
+
+    def test_cleanup_honours_channel_ceiling_after_cancel(self, monkeypatch):
+        # Потолок действует и на уборку: cancel() её не отменяет, но зависший
+        # сокет не имеет права вешать поток уборки навсегда. rc=124 != 0 —
+        # вызывающий честно сообщит, что секрет мог пережить операцию.
+        monkeypatch.setattr(sc, '_POLL_INTERVAL', 0.02)
+        c, ch = self._connected(exit_status=None, hang=True)
+        c.cancel()
+        out, err, rc = c.cleanup('rm -f /tmp/secret', timeout=0.2)
+        assert rc == 124
+        assert 'deadline exceeded after 0.2s' in err
+        assert ch.closed >= 1
+
+    def test_cleanup_ceiling_ignores_cancel_event(self, monkeypatch):
+        # cleanup обязан ДЕЙСТВОВАТЬ при поднятом отменённом флаге: дойти до
+        # сервера и получить ответ, а не свернуться по cancel_event
+        monkeypatch.setattr(sc, '_POLL_INTERVAL', 0.02)
+        c, _ = self._connected(out=b'CLEANED\n')
+        c.cancel()
+        assert c.cleanup('rm -f /tmp/secret', timeout=5) == ('CLEANED\n', '', 0)

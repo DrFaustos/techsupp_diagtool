@@ -18,6 +18,7 @@ from diagnostic import (
     bitrix_php_report, bitrix_cron_report, bitrix_cron_install,
     bitrix_cache_report, bitrix_mail_report, bitrix_mail_send_test,
     bitrix_perms_report, bitrix_perms_fix,
+    ssl_install_bitrix,
 )
 
 # Состав меню: (подпись пункта, имя метода класса). None — разделитель:
@@ -36,6 +37,7 @@ BITRIX_MENU = [
     ("Права файлов сайта (проверка)", "run_bx_perms"),
     None,
     ("Перевыпустить сертификаты (dehydrated)", "run_bx_ssl_renew"),
+    ("Установить сертификат (crt/chain/key)", "run_bx_ssl_install"),
     ("MySQL: применить тюнинг", "run_bx_mysql_tune"),
     ("Права на базу: выдать недостающие", "run_bx_db_grants_fix"),
     ("Почта: отправить тестовое письмо", "run_bx_mail_test"),
@@ -192,6 +194,34 @@ class BitrixMixin:
             parent=self.root
         ):
             self._run_in_thread(bitrix_ssl_renew, self.bx_menu_btn, self.checker)
+
+    def run_bx_ssl_install(self):
+        # Приносной сертификат (выданный где угодно) в раскладку dehydrated:
+        # crt/chain/key. РЕШЕНИЕ — за бэкендом ssl_install.py (PEM, пара
+        # cert<->key, домен как компонент пути); диалог только собирает.
+        # Подтверждение — из-за перезаписи файлов и возможной войны с LE
+        # -заданием: отчёт сам предупреждает, но оператор жмёт кнопку заранее.
+        if not self.checker:
+            return
+        material = self._open_ssl_install_dialog('bitrix')
+        if material is None:
+            return
+        sec = material['sections']
+        domain = material['domain']
+        if not messagebox.askyesno(
+            "Подтверждение",
+            f"Положить сертификат для {domain} в раскладку dehydrated "
+            "(cert/chain/privkey/fullchain в "
+            "/home/bitrix/dehydrated/certs/<домен>/)?\n"
+            "⚠️ Существующие файлы будут перезаписаны (с резервом). Если по "
+            "этому домену живёт задание Let's Encrypt — следующий перевыпуск "
+            "затрёт установленный сертификат; отчёт об этом напомнит.",
+            parent=self.root
+        ):
+            return
+        self._run_in_thread(ssl_install_bitrix, self.bx_menu_btn,
+                            self.checker, domain, sec['crt'], sec['chain'],
+                            sec['key'])
 
     def run_bx_mysql_tune(self):
         if not self.checker:

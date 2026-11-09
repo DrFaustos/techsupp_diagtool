@@ -184,6 +184,40 @@ class FakeSSH:
             lines.append(mark)
         return ('\n'.join(lines) + '\n', err, rc)
 
+    def _shell_rm(self, cmd):
+        """rm сносит файлы из фейловой ФС так же, как это делает shell.
+
+        Когда тест утверждает store.store == {}, он утверждает, что секрет
+        исчез С СЕРВЕРА: SFTP-запись кладёт файл в store, а продукт убирает
+        его shell-командой rm. Не сноси двойник этот файл, ключ «переживал»
+        уборку — но только внутри двойника, и инвариант «временные PEM
+        убраны на любом пути» стал бы не проверяем (молчаливый двойник —
+        тот же закон, что записан выше для FFRC и раскрытия пачки).
+
+        Работает только когда routes команду НЕ взяли: роут — сценарий теста
+        (например, STILL_THERE для ветки «уборка не удалась»), и он важнее
+        имитации. Разбирается первый сегмент до ';' — форма rm из
+        remove_remote_path/prepare_secret_file; многоточие форм не нужно:
+        продукт ходит в ФС только этими командами.
+        """
+        store = getattr(self.client, 'store', None)
+        if not isinstance(store, dict) or not cmd.startswith('rm -'):
+            return
+        try:
+            parts = shlex.split(cmd.split(';', 1)[0])
+        except ValueError:
+            return
+        if not parts or parts[0] != 'rm':
+            return
+        for arg in parts[1:]:
+            if not arg.startswith('-'):
+                content = store.pop(arg, None)
+                if content is not None:
+                    # «Корзина»: что ЛЕЖАЛО в файле на момент съёма. Тесты
+                    # секреты проверяют здесь — это сильнее прежнего
+                    # store[путь]: доказывает и состав, и саму уборку.
+                    self.client.deleted[arg] = content
+
     def _answer(self, cmd):
         # Раскрытие пачки — ПЕРВЫМ делом, до маршрутизации: на сервере первым
         # работает shell, а не наша логика. Иначе роут с широкой иглой ('grep')
@@ -198,6 +232,10 @@ class FakeSSH:
                         return res.pop(0)
                     return res[0]
                 return res
+        # Ни одна игла не взяла команду: на сервере она всё равно исполнилась.
+        # Для rm это значит «файл с сервера снят» — иначе двойник оставил бы
+        # секрет в store вопреки честной уборке (см. _shell_rm).
+        self._shell_rm(cmd)
         return self.default
 
     def run(self, cmd):
@@ -272,7 +310,28 @@ class FakeSftpConn:
         self.closed = 0
 
     def open(self, path, mode='r'):
+        # Режимы исполняются, а не игнорируются (молчаливый двойник — закон
+        # этого файла): paramiko переводит 'x' в CREATE|EXCL, и сервер отвечает
+        # SSH_FX_FILE_ALREADY_EXISTS, когда путь занят; 'w'truncate'ит при
+        # открытии. Прежний open без режимов пропускал в продукте и 'x' без
+        # WRITE-бита, и молчаливое затирание — тесты этого не видели.
+        if 'x' in mode and path in self.store:
+            # SSH_FX_FILE_ALREADY_EXISTS (4) — код первым аргументом, как
+            # бросает paramiko: fmanager различает миры именно по коду.
+            raise IOError(4, 'Already exists: %s' % path)
+        if 'w' in mode:
+            self.store[path] = ''
         return _RecordFile(self.store, path)
+
+    def stat(self, path):
+        # Контракт paramiko (sftp_client.stat): IOError, когда пути нет —
+        # ИМЕННО с кодом SSH_FX_NO_SUCH_FILE (2) первым аргументом: fmanager
+        # решает «нет» по коду, прочий код для него — «не проверено» (1.32.31).
+        # Файлы-существование в fmanager проверяются именно stat'ом
+        # (ревью 1.32.30: create/rename не имели права затирать молча).
+        if path not in self.store:
+            raise IOError(2, 'No such file: %s' % path)
+        return len(self.store[path])  # содержательный объект заглушке не нужен
 
     def close(self):
         self.closed += 1
@@ -283,6 +342,7 @@ class FakeSftpClient:
 
     def __init__(self):
         self.store = {}
+        self.deleted = {}   # содержимое, снятое shell-командой rm (_shell_rm)
         self.conns = []
 
     def open_sftp(self):

@@ -454,7 +454,9 @@ class TestFastpanelRestartWeb:
     def test_broken_config_blocks_restart(self):
         # Главная защита операции: при неуспешном nginx -t ничего не перезапускаем.
         c = FakeSSH(routes=[
-            ('nginx -t', 'nginx: configuration test FAILED\n'),
+            # rc=1: именно КОД решает гейт (ревью 1.32.30); прежняя форма
+            # решала по слову и этот же вывод считала провалом вслепую.
+            ('nginx -t', ('nginx: configuration test FAILED\n', '', 1)),
             ('list-units', TestPhpFpmUnits.UNIT_LIST),
         ])
         out = panels_mod.fastpanel_restart_web(c)
@@ -688,7 +690,112 @@ class TestIspmanagerRestart:
                             ('sysinfo', 'connection failed: error')])
         out = panels_mod.ispmanager_restart(c)
         assert '❌ Ошибка (rc=1): connection refused' in out
-        assert '⚠️ Панель возможно не запустилась' in out
+        assert '⚠️ Панель, возможно, не запустилась' in out
+
+    def test_empty_sysinfo_is_unchecked_not_working(self):
+        # 1.32.30 (ревью): прежняя проверка решала по ОТСУТСТВИЮ слова 'error',
+        # и пустой ответ (панель лежит, сокет мёртв) читался «✅ Панель
+        # работает». Пустота при rc=0 — это «не проверено», а не диагноз.
+        c = FakeSSH(routes=[('mgrctl -m ispmgr exit', ('', '', 0)),
+                            ('sysinfo', ('', '', 0))])
+        out = panels_mod.ispmanager_restart(c)
+        assert '✅ Панель работает' not in out
+        assert 'не проверено' in out
+
+    def test_missing_mgrctl_is_unchecked_not_panel_down(self):
+        # rc=127 — утилиту не спросить: это пробел измерения, а не «панель
+        # не поднялась» (закон 1.32.13 для кодов возврата).
+        c = FakeSSH(routes=[
+            ('mgrctl -m ispmgr exit', ('', '', 0)),
+            ('sysinfo', ('bash: /usr/local/mgr5/sbin/mgrctl: No such file '
+                         'or directory', '', 127)),
+        ])
+        out = panels_mod.ispmanager_restart(c)
+        assert '✅ Панель работает' not in out
+        assert 'не проверено' in out and 'rc=127' in out
+
+    def test_harmless_error_field_is_not_a_warning(self):
+        # 1.32.31: живая панель — прежняя проверка решала по слову 'error' во
+        # ВСЁМ выводе sysinfo, и безобидные поля errordocs=1, errorlog=...
+        # давали «⚠️ Панель, возможно, не запустилась» после успешного
+        # перезапуска. Ошибку различает структура: строка статуса в начале
+        # строки, а не подстрока где попало.
+        c = FakeSSH(routes=[('mgrctl -m ispmgr exit', ('', '', 0)),
+                            ('sysinfo', 'kernel=linux\n'
+                             'errordocs=1\nerrorlog=/var/log/error.log\n'
+                             'last_error=0')])
+        out = panels_mod.ispmanager_restart(c)
+        assert '✅ Панель работает' in out
+        assert '⚠️' not in out
+
+    def test_error_status_line_decides_verdict_by_structure(self):
+        # Форма ошибки mgrctl измерена: 'ERROR=текст' с начала строки при
+        # rc=0 (тот же факт в discovery._mgrctl_says_error). Это отказ панели,
+        # и он обязан остаться в ВЕРДИКТЕ, а не уехать в заметку.
+        c = FakeSSH(routes=[('mgrctl -m ispmgr exit', ('', '', 0)),
+                            ('sysinfo', ('ERROR=license check failed',
+                                         '', 0))])
+        out = panels_mod.ispmanager_restart(c)
+        assert '✅ Панель работает' not in out
+        assert ('⚠️ Панель, возможно, не запустилась (строка статуса '
+                'ошибки)') in out
+        assert 'ERROR=license check failed' in out
+
+    def test_error_word_in_free_text_is_note_not_verdict(self):
+        # Тот же ответ, что в test_failure_reports_rc_and_warns_when_panel_down,
+        # но команда перезапуска прошла: вердикт решает rc=0 (панель
+        # ответила), а 'error' вне поля key=value — отдельная ⚠️-заметка.
+        # Разделение «вердикт / заметка» и есть лечение ложного ⚠️: оно не
+        # молчит о слове, но и не выдаёт его за отказ.
+        c = FakeSSH(routes=[('mgrctl -m ispmgr exit', ('', '', 0)),
+                            ('sysinfo', 'connection failed: error')])
+        out = panels_mod.ispmanager_restart(c)
+        assert '✅ Панель работает' in out
+        assert 'заметка, а не вердикт' in out
+
+
+class TestIspSysinfoView:
+    # Вердикт — по коду возврата, слово error — по структуре ответа
+    # (1.32.31). Чистый разбор, чтобы все ветки проверялись без транспорта.
+
+    def test_unchecked_when_mgrctl_did_not_start(self):
+        verdict, note = panels_mod.isp_sysinfo_view(
+            'bash: /usr/local/mgr5/sbin/mgrctl: No such file or directory',
+            127)
+        assert 'не проверено' in verdict and 'rc=127' in verdict
+        assert note is None
+
+    def test_unchecked_on_empty_answer(self):
+        # Пустой ответ при rc=0 — сокет мёртв, спросить не удалось (1.32.30).
+        verdict, note = panels_mod.isp_sysinfo_view('', 0)
+        assert 'не проверено' in verdict and note is None
+
+    def test_nonzero_rc_is_probably_down(self):
+        verdict, note = panels_mod.isp_sysinfo_view('boom', 2)
+        assert 'вероятно, не поднялась' in verdict and 'rc=2' in verdict
+        assert note is None
+
+    def test_status_line_both_measured_forms(self):
+        for answer in ('ERROR=license check failed', 'ERROR: blocked'):
+            verdict, note = panels_mod.isp_sysinfo_view(answer, 0)
+            assert '✅' not in verdict, answer
+            assert 'строка статуса ошибки' in verdict, answer
+            assert note is None
+
+    def test_error_inside_field_is_silent(self):
+        # Поле key=value с 'error' в имени или значении — данные, не отказ.
+        for answer in ('errordocs=1', 'errorlog=/var/log/error.log',
+                       'last_error=0', 'motd=panel is error-free today=1'):
+            verdict, note = panels_mod.isp_sysinfo_view(answer, 0)
+            assert verdict.startswith('✅'), answer
+            assert note is None, answer
+
+    def test_error_in_free_text_is_separate_note(self):
+        verdict, note = panels_mod.isp_sysinfo_view(
+            'kernel=linux\nweird line with error here', 0)
+        assert verdict.startswith('✅')
+        assert note and 'заметка, а не вердикт' in note
+        assert 'weird line with error here' in note
 
 
 # ========== ЗАВЕРШЕНИЕ CORE: цель по пути, а не по имени (1.32.13) =========
@@ -773,16 +880,48 @@ class TestIspmanagerKillCore:
 
 
 class TestIspmanagerDisable:
-    def test_disable_blocks_binary_and_kills_daemons(self):
-        c = FakeSSH()
+    def test_disable_blocks_binary_and_verifies_absence(self):
+        # 1.32.30 (ревью): прежняя форма не проверяла ни одну команду и
+        # била killall по имени. Теперь: chmod по rc, завершение по pid из
+        # перечитанного списка; «✅ отключена» — только когда процессы прочитаны
+        # и их нет (здесь — пустой прочитанный ps).
+        c = FakeSSH(routes=[('ps -eo', rows())])
         out = panels_mod.ispmanager_disable(c)
         assert '✅ Панель отключена' in out
         assert '⚠️ Для включения выполните: chmod +x' in out
         assert c.find('chmod -x /usr/local/mgr5/bin/core') is not None
-        # disable остаётся за границей слайса: здесь имя точное (killall core
-        # чужой coredns не бьёт — замер), поэтому форма сохранена намеренно.
-        assert c.find('killall core') is not None
-        assert c.find('killall ihttpd') is not None
+        assert c.find('ps -eo') is not None
+        for sent in c.commands:
+            assert 'killall' not in sent, sent
+            assert 'pkill' not in sent, sent
+
+    def test_disable_kills_by_pid_not_name(self):
+        # Последовательность ответов на 'ps -eo': сначала два демона панели,
+        # дальше — пустой прочитанный список (после убийства).
+        seq = rows('  4242 /usr/local/mgr5/bin/core',
+                   '  4243 /usr/local/mgr5/bin/ihttpd')
+        c = FakeSSH(routes=[('ps -eo', [seq, rows(), rows()])])
+        out = panels_mod.ispmanager_disable(c)
+        assert '✅ Панель отключена' in out
+        killed = [s for s in c.commands if 'kill' in s]
+        assert killed
+        assert all(('4242' in s or '4243' in s) for s in killed), killed
+        assert all('core' not in s and 'ihttpd' not in s for s in killed)
+
+    def test_unreadable_process_list_is_not_disabled(self):
+        # ps не ответила (rc=127): «отключена» печатать нельзя — процессы
+        # могли остаться живыми.
+        c = FakeSSH(routes=[('ps -eo', ('', 'bash: ps: command not found',
+                                        127))])
+        out = panels_mod.ispmanager_disable(c)
+        assert '✅ Панель отключена' not in out
+        assert 'НЕ подтверждено' in out
+
+    def test_chmod_failure_halts_before_kill(self):
+        c = FakeSSH(routes=[('chmod -x', ('', 'Operation not permitted', 1))])
+        out = panels_mod.ispmanager_disable(c)
+        assert '❌' in out
+        assert not any('kill' in s for s in c.commands)
 
 class TestFastpanelRestartWebNoFpm:
     def test_missing_php_fpm_units_reported(self):
@@ -1854,6 +1993,18 @@ class TestFastpanelResetPassword:
         c = FakeSSH(default=('', 'mogwai: only root', 1))
         out = panels_mod.fastpanel_reset_password(c, 'LongEnough1')
         assert '❌ Не удалось (rc=1): mogwai: only root' in out
+
+    def test_failure_output_never_echoes_the_password(self):
+        # 1.32.30 (ревью): mogwai рвёт пароль аргументом и при неудаче
+        # эхом возвращает строку команды; прежняя форма печатала вывод
+        # как есть — секрет уезжал в лог отчёта. Теперь в отчёт едет
+        # только маска.
+        secret = 'Sup3r-Secret-Pass'
+        c = FakeSSH(default=('', 'mogwai: chpasswd failed for input '
+                             '"--password=%s"' % secret, 1))
+        out = panels_mod.fastpanel_reset_password(c, secret)
+        assert secret not in out
+        assert '***' in out and '❌ Не удалось' in out
 
 
 # ==================== fastpanel_unit: «НЕ ПРОВЕРЕНО» ≠ «ЮНИТА НЕТ» ==========

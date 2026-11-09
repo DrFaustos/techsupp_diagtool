@@ -7,6 +7,8 @@ import os
 import socket
 import sys
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -238,6 +240,20 @@ class TestParseDigRecords:
         assert cmd == "dig +short A 'example.com; rm -rf /'"
         for blind in ('2>/dev/null', '2>&1', '|', '&&', '||'):
             assert blind not in cmd, cmd
+
+    def test_record_type_outside_the_literal_set_is_refused(self):
+        # Тип записи — единственное место команды без кавычек (кавычка ломает
+        # форму «+short A»). Сегодня все вызовы передают литералы A/AAAA/MX/NS/
+        # TXT/-x, но держится это памятью автора следующего вызова, а не кодом:
+        # домен защищён q(), тип — не был ничем.
+        for bad in ('A; rm -rf /', 'A NS', '-x; id', 'A\nMX', '', None,
+                    'A' * 30, '--co=evil'):
+            with pytest.raises(ValueError):
+                dns_mod.dig_records_cmd(bad, 'example.com')
+        # Боевые литералы обязаны проходить — иначе замок стреляет по продукту.
+        for good in ('A', 'AAAA', 'MX', 'NS', 'TXT', 'PTR', 'SOA', '-x'):
+            assert dns_mod.dig_records_cmd(good, 'example.com').startswith(
+                'dig +short ' + good + ' ')
 
 
 # ==================== dns_report_local (socket) ====================
